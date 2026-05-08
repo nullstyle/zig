@@ -27,16 +27,16 @@ vtable: *const VTable,
 
 pub const Threaded = @import("Io/Threaded.zig");
 
-pub const fiber = @import("Io/fiber.zig");
+pub const fiber = @import("Io/Evented/fiber.zig");
 pub const Evented = if (fiber.supported) switch (builtin.os.tag) {
     .linux => Uring,
     .dragonfly, .freebsd, .netbsd, .openbsd => Kqueue,
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Dispatch,
     else => void,
 } else void; // context-switching code not implemented yet
-pub const Dispatch = @import("Io/Dispatch.zig");
-pub const Kqueue = @import("Io/Kqueue.zig");
-pub const Uring = @import("Io/Uring.zig");
+pub const Dispatch = @import("Io/Evented/Dispatch.zig");
+pub const Kqueue = @import("Io/Evented/Kqueue.zig");
+pub const Uring = @import("Io/Evented/Uring.zig");
 
 pub const Reader = @import("Io/Reader.zig");
 pub const Writer = @import("Io/Writer.zig");

@@ -1,7 +1,7 @@
 const Kqueue = @This();
 const builtin = @import("builtin");
 
-const std = @import("../std.zig");
+const std = @import("../../std.zig");
 const Io = std.Io;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
