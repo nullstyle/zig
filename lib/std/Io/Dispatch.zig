@@ -1,47 +1,49 @@
-const addressFromPosix = Io.Threaded.addressFromPosix;
-const addressToPosix = Io.Threaded.addressToPosix;
-const addressUnixToPosix = Io.Threaded.addressUnixToPosix;
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
-const Argv0 = Io.Threaded.Argv0;
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 const c = std.c;
-const ChdirError = Io.Threaded.ChdirError;
-const clockToPosix = Io.Threaded.clockToPosix;
-const closeFd = Io.Threaded.closeFd;
-const Csprng = Io.Threaded.Csprng;
-const default_PATH = Io.Threaded.default_PATH;
 const Dir = Io.Dir;
-const Environ = Io.Threaded.Environ;
-const errnoBug = Io.Threaded.errnoBug;
 const Evented = @This();
-const fallbackSeed = Io.Threaded.fallbackSeed;
 const File = Io.File;
 const Io = std.Io;
 const iovec = std.posix.iovec;
 const iovec_const = std.posix.iovec_const;
 const log = std.log.scoped(.dispatch);
-const max_iovecs_len = Io.Threaded.max_iovecs_len;
-const nanosecondsFromPosix = Io.Threaded.nanosecondsFromPosix;
 const net = Io.net;
-const pathToPosix = Io.Threaded.pathToPosix;
 const posix = std.posix;
-const PosixAddress = Io.Threaded.PosixAddress;
-const posixAddressFamily = Io.Threaded.posixAddressFamily;
-const posixSocketModeProtocol = Io.Threaded.posixSocketModeProtocol;
+const posix_adapter = @import("posix.zig");
 const process = std.process;
-const recoverableOsBugDetected = Io.Threaded.recoverableOsBugDetected;
-const setTimestampToPosix = Io.Threaded.setTimestampToPosix;
-const splat_buffer_size = Io.Threaded.splat_buffer_size;
-const statFromPosix = Io.Threaded.statFromPosix;
-const statusToTerm = Io.Threaded.statusToTerm;
 const std = @import("std");
-const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
-const UnixAddress = Io.Threaded.UnixAddress;
-const UseSendfile = Io.Threaded.UseSendfile;
-const UseFcopyfile = Io.Threaded.UseFcopyfile;
+
+const addressFromPosix = posix_adapter.addressFromPosix;
+const addressToPosix = posix_adapter.addressToPosix;
+const addressUnixToPosix = posix_adapter.addressUnixToPosix;
+const Argv0 = posix_adapter.Argv0;
+const ChdirError = posix_adapter.ChdirError;
+const clockToPosix = posix_adapter.clockToPosix;
+const closeFd = posix_adapter.closeFd;
+const Csprng = posix_adapter.Csprng;
+const default_PATH = posix_adapter.default_PATH;
+const Environ = posix_adapter.Environ;
+const errnoBug = posix_adapter.errnoBug;
+const fallbackSeed = posix_adapter.fallbackSeed;
+const max_iovecs_len = posix_adapter.max_iovecs_len;
+const nanosecondsFromPosix = posix_adapter.nanosecondsFromPosix;
+const pathToPosix = posix_adapter.pathToPosix;
+const PosixAddress = posix_adapter.PosixAddress;
+const posixAddressFamily = posix_adapter.posixAddressFamily;
+const posixSocketModeProtocol = posix_adapter.posixSocketModeProtocol;
+const recoverableOsBugDetected = posix_adapter.recoverableOsBugDetected;
+const setTimestampToPosix = posix_adapter.setTimestampToPosix;
+const splat_buffer_size = posix_adapter.splat_buffer_size;
+const statFromPosix = posix_adapter.statFromPosix;
+const statusToTerm = posix_adapter.statusToTerm;
+const timestampFromPosix = posix_adapter.timestampFromPosix;
+const UnixAddress = posix_adapter.UnixAddress;
+const UseSendfile = posix_adapter.UseSendfile;
+const UseFcopyfile = posix_adapter.UseFcopyfile;
 
 /// Empirically saw >4KB being used by the llvm aarch64 backend.
 const main_loop_stack_size = 8 * 1024;
@@ -6099,7 +6101,7 @@ fn netLookupFallible(
 
     if (net.IpAddress.parseIp6(name, options.port)) |addr| {
         if (options.family == .ip4) return error.UnknownHostName;
-        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+        if (posix_adapter.copyCanon(options.canonical_name_buffer, name)) |canon| {
             try resolved.putAll(ev_io, &.{
                 .{ .address = addr },
                 .{ .canonical_name = canon },
@@ -6112,7 +6114,7 @@ fn netLookupFallible(
 
     if (net.IpAddress.parseIp4(name, options.port)) |addr| {
         if (options.family == .ip6) return error.UnknownHostName;
-        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+        if (posix_adapter.copyCanon(options.canonical_name_buffer, name)) |canon| {
             try resolved.putAll(ev_io, &.{
                 .{ .address = addr },
                 .{ .canonical_name = canon },
@@ -6225,7 +6227,7 @@ fn netLookupDnsSdProtocol(
         else => return error.NameServerFailure,
     };
     if (ctx.got_canon) return;
-    if (Io.Threaded.copyCanon(options.canonical_name_buffer, name_c)) |canon| {
+    if (posix_adapter.copyCanon(options.canonical_name_buffer, name_c)) |canon| {
         try resolved.putOne(ev_io, .{ .canonical_name = canon });
     }
     return;
@@ -6293,14 +6295,14 @@ fn dnsSdReply(
         },
         else => unreachable,
     }
-    const ip = Io.Threaded.addressFromPosix(&storage);
+    const ip = addressFromPosix(&storage);
     ctx.resolved.putOne(ev_io, .{ .address = ip }) catch |err| {
         if (ctx.queue_err == null) ctx.queue_err = err;
         return;
     };
 
     if (!ctx.got_canon) if (hostname) |h| {
-        if (Io.Threaded.copyCanon(ctx.canon_buf, std.mem.sliceTo(h, 0))) |canon| {
+        if (posix_adapter.copyCanon(ctx.canon_buf, std.mem.sliceTo(h, 0))) |canon| {
             ctx.resolved.putOne(ev_io, .{ .canonical_name = canon }) catch |err| {
                 if (ctx.queue_err == null) ctx.queue_err = err;
                 return;
