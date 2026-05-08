@@ -588,7 +588,9 @@ pub fn deinit(ev: *Evented) void {
     ev.stderr_mutex.deinit();
     for (&ev.futexes) |*futex| futex.deinit();
     ev.exit_semaphore.as_object().release();
-    ev.backing_allocator.free(ev.main_loop_stack[0..main_loop_stack_size]);
+    const main_loop_stack: []align(builtin.target.stackAlignment()) u8 =
+        ev.main_loop_stack[0..main_loop_stack_size];
+    ev.backing_allocator.free(main_loop_stack);
     ev.queue.as_object().release();
 }
 
@@ -646,6 +648,7 @@ const SwitchMessage = struct {
         futex_wait: *Futex.Waiter,
         futex_wake: *Futex.Waker,
         sleep_wait: *SleepWaiter,
+        wait_ready: *WaitReadyWaiter,
         after: c.dispatch.time_t,
         destroy,
         exit,
@@ -703,6 +706,16 @@ const SwitchMessage = struct {
                     .blocked => waiter.cancelable = .blocked,
                 }
                 queue.async(waiter, &SleepWaiter.start);
+            },
+            .wait_ready => |waiter| {
+                waiter.sleeper =
+                    .init(ev.queue, @alignCast(@fieldParentPtr("context", message.contexts.old)));
+                const queue = waiter.cancelable.queue;
+                switch (waiter.sleeper.fiber.cancel_protection.check()) {
+                    .unblocked => {},
+                    .blocked => waiter.cancelable = .blocked,
+                }
+                queue.async(waiter, &WaitReadyWaiter.start);
             },
             .after => |when| {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
@@ -4825,6 +4838,84 @@ const SleepWaiter = struct {
     }
 };
 
+/// Cancellable wait for a socket file descriptor to become readable or writable,
+/// optionally with a timeout.
+///
+/// All callbacks (start, ready, timedOut, canceled, wake) run on a single
+/// per-wait serial queue so they can never run concurrently. Mid-wait
+/// cancellation works by dispatching `canceled` (via the standard Cancelable
+/// mechanism), which cancels the dispatch sources; each source's cancel
+/// handler `wake` decrements `pending_cancels` and only the final one actually
+/// wakes the fiber, ensuring a single wake regardless of which path won.
+const WaitReadyWaiter = struct {
+    sleeper: Sleeper = undefined,
+    cancelable: Cancelable,
+    source: c.dispatch.source_t,
+    timer: ?c.dispatch.source_t,
+    /// Number of cancel handlers that must run before waking the fiber: 1 when
+    /// `timer` is null, 2 when set. Decremented by `wake`; only the final call
+    /// actually wakes.
+    pending_cancels: u8,
+    data: usize = 0,
+    timed_out: bool = false,
+
+    fn start(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.cancelable.enter(waiter.sleeper.fiber) catch |err| switch (err) {
+            error.CancelRequested => {
+                waiter.source.cancel();
+                if (waiter.timer) |t| t.cancel();
+                return;
+            },
+        };
+        if (waiter.timer) |t| t.as_object().activate();
+        waiter.source.as_object().activate();
+    }
+
+    fn ready(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.data = waiter.source.get_data();
+        waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
+            error.CancelRequested => return,
+        };
+        waiter.source.cancel();
+        if (waiter.timer) |t| t.cancel();
+    }
+
+    fn timedOut(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
+            error.CancelRequested => return,
+        };
+        waiter.timed_out = true;
+        waiter.source.cancel();
+        if (waiter.timer) |t| t.cancel();
+    }
+
+    fn canceled(context: ?*anyopaque) callconv(.c) void {
+        const cancelable: *Cancelable = @ptrCast(@alignCast(context));
+        const waiter: *WaitReadyWaiter = @fieldParentPtr("cancelable", cancelable);
+        cancelable.requested(waiter.sleeper.fiber);
+        waiter.source.cancel();
+        if (waiter.timer) |t| t.cancel();
+    }
+
+    /// Cancel handler shared by `source` and `timer`. Decrements
+    /// `pending_cancels`; the final invocation releases both sources and wakes
+    /// the fiber. Does NOT clobber `waiter.*`, because the user fiber reads
+    /// `waiter.data`, `waiter.timed_out`, and `waiter.cancelable` after
+    /// resuming.
+    fn wake(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        // Runs on the per-wait serial queue, so plain decrement is safe.
+        waiter.pending_cancels -= 1;
+        if (waiter.pending_cancels > 0) return;
+        waiter.source.as_object().release();
+        if (waiter.timer) |t| t.as_object().release();
+        Sleeper.wake(&waiter.sleeper);
+    }
+};
+
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const queue = c.dispatch.queue_create_with_target(
@@ -4934,7 +5025,7 @@ fn netListenIp(
     try posixBind(ev, socket_fd, &storage.any, addr_len);
 
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.listen(socket_fd, options.kernel_backlog))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -4958,7 +5049,7 @@ fn netAccept(
     var storage: PosixAddress = undefined;
     var addr_len: c.socklen_t = @sizeOf(PosixAddress);
     const fd = while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         const rc = c.accept(listen_handle, &storage.any, &addr_len);
         switch (c.errno(rc)) {
             .SUCCESS => {
@@ -5013,14 +5104,13 @@ fn netConnectIp(
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
-    if (options.timeout != .none) @panic("TODO implement netConnectIp with timeout");
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = posixAddressFamily(address);
     const socket_fd = try openSocket(ev, family, .{ .mode = options.mode, .protocol = options.protocol });
     errdefer closeFd(socket_fd);
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
-    try posixConnect(ev, socket_fd, &storage.any, addr_len);
+    try posixConnect(ev, socket_fd, &storage.any, addr_len, options.timeout);
     try posixGetSockName(ev, socket_fd, &storage.any, &addr_len);
     return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
@@ -5046,7 +5136,7 @@ fn netListenUnix(
     try posixBindUnix(ev, socket_fd, &storage.any, addr_len);
 
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.listen(socket_fd, options.kernel_backlog))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -5092,7 +5182,7 @@ fn netSocketCreatePair(
 
     var sockets: [2]c.fd_t = undefined;
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.socketpair(family, mode, protocol, &sockets))) {
             .SUCCESS => {
                 errdefer {
@@ -5167,7 +5257,7 @@ fn netSendOne(
         .flags = 0,
     };
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         const n = netSendOneSyscall(handle, &msg, posix_flags) catch |err| switch (err) {
             error.WouldBlock => {
                 try ev.netWaitWritable(handle);
@@ -5224,7 +5314,7 @@ fn netWrite(
 ) net.Stream.Writer.Error!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         return netWriteLimit(handle, header, data, splat, .unlimited) catch |err| switch (err) {
             error.WouldBlock => {
                 try ev.netWaitWritable(handle);
@@ -5376,7 +5466,7 @@ fn netWriteFile(
     const max_count = std.math.maxInt(i32);
     const flags = 0;
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         var len: c.off_t = @min(file_limit, max_count);
         const wait: bool = wait: {
             while (true) switch (c.errno(c.sendfile(in_fd, out_fd, offset, &len, hdtr, flags))) {
@@ -5416,33 +5506,59 @@ fn netWriteFile(
 }
 
 fn netWaitWritable(ev: *Evented, handle: net.Socket.Handle) (Io.Cancelable || error{SystemResources})!void {
-    const source = c.dispatch.source_create(
-        .WRITE,
-        @bitCast(@as(isize, handle)),
-        .none,
-        ev.queue,
-    ) orelse return error.SystemResources;
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    source.as_object().release();
-    try ev.checkCancel();
+    _ = try netWaitReady(ev, .WRITE, handle, .none);
 }
 
 fn netWaitReadable(ev: *Evented, handle: net.Socket.Handle) (Io.Cancelable || error{SystemResources})!usize {
-    const source = c.dispatch.source_create(
-        .READ,
-        @bitCast(@as(isize, handle)),
-        .none,
+    return (try netWaitReady(ev, .READ, handle, .none)).data;
+}
+
+const NetWaitReadyResult = struct { data: usize, timed_out: bool };
+const NetWaitReadyError = Io.Cancelable || error{SystemResources};
+
+fn netWaitReady(
+    ev: *Evented,
+    source_type: c.dispatch.source_type_t,
+    handle: net.Socket.Handle,
+    timeout: Io.Timeout,
+) NetWaitReadyError!NetWaitReadyResult {
+    const queue = c.dispatch.queue_create_with_target(
+        "org.ziglang.std.Io.Dispatch.netWait",
+        .SERIAL(),
         ev.queue,
     ) orelse return error.SystemResources;
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    const limit = source.get_data();
-    source.as_object().release();
-    try ev.checkCancel();
-    return limit;
+    defer queue.as_object().release();
+    const source = c.dispatch.source_create(
+        source_type,
+        @bitCast(@as(isize, handle)),
+        .none,
+        queue,
+    ) orelse return error.SystemResources;
+    const timer: ?c.dispatch.source_t = switch (timeout) {
+        .none => null,
+        else => c.dispatch.source_create(.TIMER, 0, .none, queue) orelse {
+            source.as_object().release();
+            return error.SystemResources;
+        },
+    };
+    var waiter: WaitReadyWaiter = .{
+        .cancelable = .{ .queue = queue, .cancel = &WaitReadyWaiter.canceled },
+        .source = source,
+        .timer = timer,
+        .pending_cancels = if (timer == null) 1 else 2,
+    };
+    source.as_object().set_context(&waiter);
+    source.set_event_handler(&WaitReadyWaiter.ready);
+    source.set_cancel_handler(&WaitReadyWaiter.wake);
+    if (timer) |t| {
+        t.as_object().set_context(&waiter);
+        t.set_event_handler(&WaitReadyWaiter.timedOut);
+        t.set_cancel_handler(&WaitReadyWaiter.wake);
+        t.set_timer(ev.timeFromTimeout(timeout), c.dispatch.TIME_FOREVER, ev.leeway);
+    }
+    ev.yield(.{ .wait_ready = &waiter });
+    try waiter.cancelable.acknowledge(waiter.sleeper.fiber);
+    return .{ .data = waiter.data, .timed_out = waiter.timed_out };
 }
 
 fn netReceive(
@@ -5459,7 +5575,7 @@ fn netReceive(
         c.MSG.NOSIGNAL |
         c.MSG.DONTWAIT;
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         var data_i: usize = 0;
         for (message_buffer, 0..) |*msg, msg_i| {
             const remaining = data_buffer[data_i..];
@@ -5538,7 +5654,7 @@ fn netReceiveOne(
 
 fn netRead(ev: *Evented, socket_handle: net.Socket.Handle, data: []const []u8) net.Stream.Reader.Error!usize {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         return netReadLimit(socket_handle, data, .unlimited) catch |err| switch (err) {
             error.WouldBlock => {
                 _ = try ev.netWaitReadable(socket_handle);
@@ -5599,7 +5715,7 @@ fn netShutdown(
     };
 
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.shutdown(handle, posix_how))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5612,31 +5728,11 @@ fn netShutdown(
 }
 
 fn waitReadable(ev: *Evented, fd: c.fd_t) error{ Canceled, SystemResources }!void {
-    const source = c.dispatch.source_create(
-        .READ,
-        @bitCast(@as(isize, fd)),
-        .none,
-        ev.queue,
-    ) orelse return error.SystemResources;
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    source.as_object().release();
-    try ev.checkCancel();
+    _ = try netWaitReady(ev, .READ, fd, .none);
 }
 
 fn waitWritable(ev: *Evented, fd: c.fd_t) error{ Canceled, SystemResources }!void {
-    const source = c.dispatch.source_create(
-        .WRITE,
-        @bitCast(@as(isize, fd)),
-        .none,
-        ev.queue,
-    ) orelse return error.SystemResources;
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    source.as_object().release();
-    try ev.checkCancel();
+    _ = try netWaitReady(ev, .WRITE, fd, .none);
 }
 
 fn openSocket(
@@ -5657,7 +5753,7 @@ fn openSocket(
 }!c.fd_t {
     const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
     const socket_fd = while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         const rc = c.socket(family, mode, protocol);
         switch (c.errno(rc)) {
             .SUCCESS => {
@@ -5691,7 +5787,7 @@ fn openSocket(
 
 fn setCloexec(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.fcntl(fd, c.F.SETFD, @as(usize, c.FD_CLOEXEC)))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5702,7 +5798,7 @@ fn setCloexec(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
 
 fn setNonblocking(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
     var fl_flags: usize = while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         const rc = c.fcntl(fd, c.F.GETFL, @as(usize, 0));
         switch (c.errno(rc)) {
             .SUCCESS => break @intCast(rc),
@@ -5712,7 +5808,7 @@ fn setNonblocking(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
     };
     fl_flags |= @as(usize, 1 << @bitOffsetOf(c.O, "NONBLOCK"));
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.fcntl(fd, c.F.SETFL, fl_flags))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5728,7 +5824,7 @@ fn posixBind(
     addr_len: c.socklen_t,
 ) net.IpAddress.BindError!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.bind(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5752,7 +5848,7 @@ fn posixBindUnix(
     addr_len: c.socklen_t,
 ) net.UnixAddress.ListenError!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.bind(fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5783,14 +5879,16 @@ fn posixConnect(
     socket_fd: c.fd_t,
     addr: *const c.sockaddr,
     addr_len: c.socklen_t,
+    timeout: Io.Timeout,
 ) net.IpAddress.ConnectError!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.connect(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
             .AGAIN, .INPROGRESS => {
-                try waitWritable(ev, socket_fd);
+                const r = try netWaitReady(ev, .WRITE, socket_fd, timeout);
+                if (r.timed_out) return error.Timeout;
                 return getSocketError(ev, socket_fd);
             },
             .ADDRNOTAVAIL => return error.AddressUnavailable,
@@ -5823,13 +5921,14 @@ fn posixConnectUnix(
     addr_len: c.socklen_t,
 ) net.UnixAddress.ConnectError!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.connect(fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
             .AGAIN, .INPROGRESS => {
                 try waitWritable(ev, fd);
                 getSocketError(ev, fd) catch |err| switch (err) {
+                    // IP-specific connect failures don't apply to AF_UNIX; treat as transient.
                     error.AddressUnavailable,
                     error.AddressFamilyUnsupported,
                     error.ConnectionPending,
@@ -5839,8 +5938,19 @@ fn posixConnectUnix(
                     error.NetworkUnreachable,
                     error.Timeout,
                     error.NetworkDown,
+                    error.ProtocolUnsupportedByAddressFamily,
+                    error.OptionUnsupported,
                     => return error.WouldBlock,
-                    else => |e| return e,
+                    error.AccessDenied,
+                    error.Canceled,
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    error.ProtocolUnsupportedBySystem,
+                    error.SocketModeUnsupported,
+                    error.WouldBlock,
+                    error.Unexpected,
+                    => |e| return e,
                 };
                 return;
             },
@@ -5871,7 +5981,7 @@ fn posixGetSockName(
     addr_len: *c.socklen_t,
 ) error{ SystemResources, Canceled, Unexpected }!void {
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.getsockname(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5894,7 +6004,7 @@ fn setSocketOption(
 ) error{ Canceled, Unexpected }!void {
     const o: []const u8 = @ptrCast(&option);
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.setsockopt(fd, level, opt_name, o.ptr, @intCast(o.len)))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -5911,7 +6021,7 @@ fn getSocketError(ev: *Evented, fd: c.fd_t) net.IpAddress.ConnectError!void {
     var err_int: c_int = 0;
     var err_len: c.socklen_t = @sizeOf(c_int);
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (c.errno(c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &err_int, &err_len))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -5944,7 +6054,7 @@ fn netInterfaceNameResolve(
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    try ev.checkCancel();
+    try checkCancel(ev);
     const index = c.if_nametoindex(&name.bytes);
     if (index == 0) return error.InterfaceNotFound;
     return .{ .index = @bitCast(index) };
@@ -5955,7 +6065,7 @@ fn netInterfaceName(
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    try ev.checkCancel();
+    try checkCancel(ev);
     var name: net.Interface.Name = undefined;
     if (if_indextoname(interface.index, &name.bytes) == null) return error.InterfaceNotFound;
     return name;
@@ -6060,7 +6170,7 @@ fn netLookupFallible(
     };
     var res: ?*posix.addrinfo = null;
     while (true) {
-        try ev.checkCancel();
+        try checkCancel(ev);
         switch (posix.system.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &res)) {
             @as(posix.system.EAI, @enumFromInt(0)) => break,
             .SYSTEM => switch (posix.errno(-1)) {
