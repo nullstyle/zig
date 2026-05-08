@@ -6149,65 +6149,202 @@ fn netLookupFallible(
         return;
     }
 
-    // TODO use CFHostStartInfoResolution / CFHostCancelInfoResolution for true async DNS.
     var name_buffer: [net.HostName.max_len:0]u8 = undefined;
     @memcpy(name_buffer[0..name.len], name);
     name_buffer[name.len] = 0;
     const name_c = name_buffer[0..name.len :0];
-
-    var port_buffer: [8]u8 = undefined;
-    const port_c = std.fmt.bufPrintSentinel(&port_buffer, "{d}", .{options.port}, 0) catch unreachable;
-
-    const hints: posix.addrinfo = .{
-        .flags = .{ .CANONNAME = options.canonical_name_buffer != null, .NUMERICSERV = true },
-        .family = posix.AF.UNSPEC,
-        .socktype = posix.SOCK.STREAM,
-        .protocol = posix.IPPROTO.TCP,
-        .canonname = null,
-        .addr = null,
-        .addrlen = 0,
-        .next = null,
-    };
-    var res: ?*posix.addrinfo = null;
-    while (true) {
-        try checkCancel(ev);
-        switch (posix.system.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &res)) {
-            @as(posix.system.EAI, @enumFromInt(0)) => break,
-            .SYSTEM => switch (posix.errno(-1)) {
-                .INTR => continue,
-                else => |e| return posix.unexpectedErrno(e),
-            },
-            else => |e| switch (e) {
-                .ADDRFAMILY => return error.AddressFamilyUnsupported,
-                .AGAIN => return error.NameServerFailure,
-                .FAIL => return error.NameServerFailure,
-                .FAMILY => return error.AddressFamilyUnsupported,
-                .MEMORY => return error.SystemResources,
-                .NODATA => return error.UnknownHostName,
-                .NONAME => return error.UnknownHostName,
-                else => return error.Unexpected,
-            },
-        }
-    }
-    defer if (res) |some| posix.system.freeaddrinfo(some);
-
-    var it = res;
-    var canon_name: ?[*:0]const u8 = null;
-    while (it) |info| : (it = info.next) {
-        const addr = info.addr orelse continue;
-        try resolved.putOne(ev_io, .{
-            .address = Io.Threaded.addressFromPosix(@alignCast(@fieldParentPtr("any", addr))),
-        });
-        if (info.canonname) |n| {
-            if (canon_name == null) canon_name = n;
-        }
-    }
-    if (canon_name) |n| {
-        if (Io.Threaded.copyCanon(options.canonical_name_buffer, std.mem.sliceTo(n, 0))) |canon| {
-            try resolved.putOne(ev_io, .{ .canonical_name = canon });
-        }
-    }
+    return netLookupDnsSd(ev, name_c, resolved, options);
 }
+
+/// Async DNS resolution using mDNSResponder's DNSServiceGetAddrInfo. The
+/// service-ref's FD is polled with a cancellable dispatch source wait, so the
+/// libdispatch worker thread is never blocked waiting on the resolver and the
+/// caller can be cancelled mid-lookup.
+fn netLookupDnsSd(
+    ev: *Evented,
+    name_c: [:0]const u8,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    const protocol: u32 = switch (options.family orelse {
+        return netLookupDnsSdProtocol(ev, name_c, resolved, options, kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6);
+    }) {
+        .ip4 => kDNSServiceProtocol_IPv4,
+        .ip6 => kDNSServiceProtocol_IPv6,
+    };
+    return netLookupDnsSdProtocol(ev, name_c, resolved, options, protocol);
+}
+
+fn netLookupDnsSdProtocol(
+    ev: *Evented,
+    name_c: [:0]const u8,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+    protocol: u32,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    const ev_io = ev.io();
+    var ctx: DnsSdContext = .{
+        .ev = ev,
+        .resolved = resolved,
+        .port = options.port,
+        .canon_buf = options.canonical_name_buffer,
+        .err = null,
+        .got_canon = false,
+    };
+    var sd_ref: DNSServiceRef = undefined;
+    switch (DNSServiceGetAddrInfo(
+        &sd_ref,
+        kDNSServiceFlagsTimeout,
+        0,
+        protocol,
+        name_c.ptr,
+        &dnsSdReply,
+        &ctx,
+    )) {
+        kDNSServiceErr_NoError => {},
+        kDNSServiceErr_NoMemory => return error.SystemResources,
+        kDNSServiceErr_BadParam => return error.UnknownHostName,
+        else => return error.Unexpected,
+    }
+    defer DNSServiceRefDeallocate(sd_ref);
+    const fd: c.fd_t = @intCast(DNSServiceRefSockFD(sd_ref));
+    if (fd < 0) return error.Unexpected;
+
+    while (!ctx.done) {
+        _ = try netWaitReady(ev, .READ, fd, .none);
+        switch (DNSServiceProcessResult(sd_ref)) {
+            kDNSServiceErr_NoError => {},
+            kDNSServiceErr_ServiceNotRunning => return error.NameServerFailure,
+            else => return error.Unexpected,
+        }
+        if (ctx.queue_err) |err| return err;
+    }
+    if (ctx.err) |err| switch (err) {
+        kDNSServiceErr_Timeout, kDNSServiceErr_NoSuchRecord => return error.UnknownHostName,
+        kDNSServiceErr_NoMemory => return error.SystemResources,
+        else => return error.NameServerFailure,
+    };
+    if (ctx.got_canon) return;
+    if (Io.Threaded.copyCanon(options.canonical_name_buffer, name_c)) |canon| {
+        try resolved.putOne(ev_io, .{ .canonical_name = canon });
+    }
+    return;
+}
+
+const DnsSdContext = struct {
+    ev: *Evented,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    port: u16,
+    canon_buf: ?*[net.HostName.max_len]u8,
+    /// First DNS-SD error reported via the callback, if any.
+    err: ?i32,
+    /// Latched if writing to `resolved` fails (e.g. the queue is closed).
+    queue_err: ?(net.HostName.LookupError || Io.QueueClosedError) = null,
+    got_canon: bool,
+    /// Set true by the callback when no further results are coming.
+    done: bool = false,
+};
+
+/// Callback invoked synchronously by `DNSServiceProcessResult`. Each call
+/// delivers at most one address (or an error). `MoreComing` signals that more
+/// callbacks are pending for this batch; without it, the lookup is complete.
+fn dnsSdReply(
+    sd_ref: DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    error_code: i32,
+    hostname: ?[*:0]const u8,
+    address: ?*const c.sockaddr,
+    ttl: u32,
+    context: ?*anyopaque,
+) callconv(.c) void {
+    _ = sd_ref;
+    _ = interface_index;
+    _ = ttl;
+    const ctx: *DnsSdContext = @ptrCast(@alignCast(context));
+    if ((flags & kDNSServiceFlagsMoreComing) == 0) ctx.done = true;
+    if (error_code != kDNSServiceErr_NoError) {
+        if (ctx.err == null) ctx.err = error_code;
+        return;
+    }
+    const sockaddr = address orelse return;
+    const ev_io = ctx.ev.io();
+    const family = sockaddr.family;
+    if (family != posix.AF.INET and family != posix.AF.INET6) return;
+
+    // Fix up the port — DNSServiceGetAddrInfo returns sockaddrs with port 0.
+    var storage: PosixAddress = undefined;
+    switch (family) {
+        posix.AF.INET => {
+            const in: *const c.sockaddr.in = @ptrCast(@alignCast(sockaddr));
+            storage.in = .{
+                .port = std.mem.nativeToBig(u16, ctx.port),
+                .addr = in.addr,
+            };
+        },
+        posix.AF.INET6 => {
+            const in6: *const c.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
+            storage.in6 = .{
+                .port = std.mem.nativeToBig(u16, ctx.port),
+                .flowinfo = in6.flowinfo,
+                .addr = in6.addr,
+                .scope_id = in6.scope_id,
+            };
+        },
+        else => unreachable,
+    }
+    const ip = Io.Threaded.addressFromPosix(&storage);
+    ctx.resolved.putOne(ev_io, .{ .address = ip }) catch |err| {
+        if (ctx.queue_err == null) ctx.queue_err = err;
+        return;
+    };
+
+    if (!ctx.got_canon) if (hostname) |h| {
+        if (Io.Threaded.copyCanon(ctx.canon_buf, std.mem.sliceTo(h, 0))) |canon| {
+            ctx.resolved.putOne(ev_io, .{ .canonical_name = canon }) catch |err| {
+                if (ctx.queue_err == null) ctx.queue_err = err;
+                return;
+            };
+            ctx.got_canon = true;
+        }
+    };
+}
+
+const DNSServiceRef = *opaque {};
+const DNSServiceGetAddrInfoReply = *const fn (
+    sd_ref: DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    error_code: i32,
+    hostname: ?[*:0]const u8,
+    address: ?*const c.sockaddr,
+    ttl: u32,
+    context: ?*anyopaque,
+) callconv(.c) void;
+
+extern "c" fn DNSServiceGetAddrInfo(
+    sd_ref: *DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    protocol: u32,
+    hostname: [*:0]const u8,
+    callback: DNSServiceGetAddrInfoReply,
+    context: ?*anyopaque,
+) i32;
+extern "c" fn DNSServiceRefSockFD(sd_ref: DNSServiceRef) c_int;
+extern "c" fn DNSServiceProcessResult(sd_ref: DNSServiceRef) i32;
+extern "c" fn DNSServiceRefDeallocate(sd_ref: DNSServiceRef) void;
+
+const kDNSServiceFlagsMoreComing: u32 = 0x1;
+const kDNSServiceFlagsTimeout: u32 = 0x10000;
+const kDNSServiceProtocol_IPv4: u32 = 0x01;
+const kDNSServiceProtocol_IPv6: u32 = 0x02;
+const kDNSServiceErr_NoError: i32 = 0;
+const kDNSServiceErr_NoMemory: i32 = -65539;
+const kDNSServiceErr_BadParam: i32 = -65540;
+const kDNSServiceErr_NoSuchRecord: i32 = -65554;
+const kDNSServiceErr_ServiceNotRunning: i32 = -65563;
+const kDNSServiceErr_Timeout: i32 = -65568;
 
 fn readAll(ev: *Evented, file: File, buffer: []u8) File.ReadStreamingError!void {
     var index: usize = 0;
