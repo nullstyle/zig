@@ -1,3 +1,6 @@
+const addressFromPosix = Io.Threaded.addressFromPosix;
+const addressToPosix = Io.Threaded.addressToPosix;
+const addressUnixToPosix = Io.Threaded.addressUnixToPosix;
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
 const Argv0 = Io.Threaded.Argv0;
@@ -23,6 +26,10 @@ const max_iovecs_len = Io.Threaded.max_iovecs_len;
 const nanosecondsFromPosix = Io.Threaded.nanosecondsFromPosix;
 const net = Io.net;
 const pathToPosix = Io.Threaded.pathToPosix;
+const posix = std.posix;
+const PosixAddress = Io.Threaded.PosixAddress;
+const posixAddressFamily = Io.Threaded.posixAddressFamily;
+const posixSocketModeProtocol = Io.Threaded.posixSocketModeProtocol;
 const process = std.process;
 const recoverableOsBugDetected = Io.Threaded.recoverableOsBugDetected;
 const setTimestampToPosix = Io.Threaded.setTimestampToPosix;
@@ -32,6 +39,7 @@ const statusToTerm = Io.Threaded.statusToTerm;
 const std = @import("std");
 const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
+const UnixAddress = Io.Threaded.UnixAddress;
 const UseSendfile = Io.Threaded.UseSendfile;
 const UseFcopyfile = Io.Threaded.UseFcopyfile;
 
@@ -451,21 +459,21 @@ pub fn io(ev: *Evented) Io {
             .random = random,
             .randomSecure = randomSecure,
 
-            .netListenIp = netListenIpUnavailable,
-            .netAccept = netAcceptUnavailable,
-            .netBindIp = netBindIpUnavailable,
-            .netConnectIp = netConnectIpUnavailable,
-            .netListenUnix = netListenUnixUnavailable,
-            .netConnectUnix = netConnectUnixUnavailable,
-            .netSocketCreatePair = netSocketCreatePairUnavailable,
-            .netSend = netSendUnavailable,
-            .netWrite = netWriteUnavailable,
-            .netWriteFile = netWriteFileUnavailable,
+            .netListenIp = netListenIp,
+            .netAccept = netAccept,
+            .netBindIp = netBindIp,
+            .netConnectIp = netConnectIp,
+            .netListenUnix = netListenUnix,
+            .netConnectUnix = netConnectUnix,
+            .netSocketCreatePair = netSocketCreatePair,
+            .netSend = netSend,
+            .netWrite = netWrite,
+            .netWriteFile = netWriteFile,
             .netClose = netClose,
-            .netShutdown = netShutdownUnavailable,
-            .netInterfaceNameResolve = netInterfaceNameResolveUnavailable,
-            .netInterfaceName = netInterfaceNameUnavailable,
-            .netLookup = netLookupUnavailable,
+            .netShutdown = netShutdown,
+            .netInterfaceNameResolve = netInterfaceNameResolve,
+            .netInterfaceName = netInterfaceName,
+            .netLookup = netLookup,
         },
     };
 }
@@ -1711,8 +1719,18 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             },
         },
         .device_io_control => |*o| return .{ .device_io_control = try deviceIoControl(o) },
-        .net_receive => @panic("TODO implement net_receive operation"),
-        .net_read => @panic("TODO implement net_read operation"),
+        .net_receive => |*o| return .{ .net_receive = try ev.netReceive(
+            o.socket_handle,
+            o.message_buffer,
+            o.data_buffer,
+            o.flags,
+        ) },
+        .net_read => |o| return .{
+            .net_read = ev.netRead(o.socket_handle, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
     }
 }
 
@@ -2021,6 +2039,17 @@ const BatchOperationUserdata = extern struct {
                 return operation.data_ptr[0..operation.data_len];
             }
         },
+        net_receive: extern struct {
+            message_buffer_ptr: [*]net.IncomingMessage,
+            message_buffer_len: usize,
+            data_buffer_ptr: [*]u8,
+            data_buffer_len: usize,
+            posix_flags: u32,
+        },
+        net_read: extern struct {
+            data_ptr: [*]const []u8,
+            data_len: usize,
+        },
     },
 
     const Erased = Io.Operation.Storage.Pending.Userdata;
@@ -2133,8 +2162,77 @@ fn batchDrainSubmitted(
                     break :result null;
                 },
                 .device_io_control => {},
-                .net_receive => @panic("TODO implement batched net_receive"),
-                .net_read => @panic("TODO implement batched net_read"),
+                .net_receive => |operation| {
+                    if (operation.message_buffer.len == 0)
+                        break :result .{ .net_receive = .{ null, 0 } };
+                    const source = c.dispatch.source_create(
+                        .READ,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_receive = .{ error.SystemResources, 0 } };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_receive,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    const flags = operation.flags;
+                    const posix_flags: u32 =
+                        @as(u32, if (flags.oob) c.MSG.OOB else 0) |
+                        @as(u32, if (flags.peek) c.MSG.PEEK else 0) |
+                        @as(u32, if (flags.trunc) c.MSG.TRUNC else 0) |
+                        c.MSG.NOSIGNAL |
+                        c.MSG.DONTWAIT;
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_receive = .{
+                            .message_buffer_ptr = operation.message_buffer.ptr,
+                            .message_buffer_len = operation.message_buffer.len,
+                            .data_buffer_ptr = operation.data_buffer.ptr,
+                            .data_buffer_len = operation.data_buffer.len,
+                            .posix_flags = posix_flags,
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
+                .net_read => |operation| {
+                    const data = for (operation.data, 0..) |buffer, data_index| {
+                        if (buffer.len > 0) break operation.data[data_index..];
+                    } else break :result .{ .net_read = 0 };
+                    const source = c.dispatch.source_create(
+                        .READ,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_read = error.SystemResources };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_read,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_read = .{
+                            .data_ptr = data.ptr,
+                            .data_len = data.len,
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
             };
             if (concurrency) return error.ConcurrencyUnavailable;
             break :result try operate(ev, storage.submission.operation);
@@ -2193,8 +2291,37 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
             } };
         },
         .device_io_control => unreachable,
-        .net_receive => @panic("TODO implement batched net_receive"),
-        .net_read => @panic("TODO implement batched net_read"),
+        .net_receive => {
+            const operation = &operation_userdata.operation.net_receive;
+            const socket_handle: net.Socket.Handle = @intCast(source.get_handle());
+            const message_buffer = operation.message_buffer_ptr[0..operation.message_buffer_len];
+            const data_buffer = operation.data_buffer_ptr[0..operation.data_buffer_len];
+            var data_i: usize = 0;
+            const r: struct { ?net.Socket.ReceiveError, usize } = for (message_buffer, 0..) |*msg, msg_i| {
+                const remaining = data_buffer[data_i..];
+                netReceiveOne(socket_handle, msg, remaining, operation.posix_flags) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (msg_i != 0) break .{ null, msg_i };
+                        return;
+                    },
+                    else => |e| break .{ e, msg_i },
+                };
+                data_i += msg.data.len;
+            } else .{ null, message_buffer.len };
+            break :result .{ .net_receive = r };
+        },
+        .net_read => {
+            const operation = &operation_userdata.operation.net_read;
+            break :result .{ .net_read = netReadLimit(
+                @intCast(source.get_handle()),
+                operation.data_ptr[0..operation.data_len],
+                .limited(source.get_data()),
+            ) catch |err| switch (err) {
+                error.Canceled => return Thread.current().currentFiber().cancel_protection.recancel(),
+                error.WouldBlock => return,
+                else => |e| e,
+            } };
+        },
     };
 
     switch (pending.node.prev) {
@@ -4786,100 +4913,309 @@ fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
     if (buffer.len > 0) c.arc4random_buf(buffer.ptr, buffer.len);
 }
 
-fn netListenIpUnavailable(
+fn netListenIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = posixAddressFamily(address);
+    const socket_fd = try openSocket(ev, family, .{ .mode = options.mode, .protocol = options.protocol });
+    errdefer closeFd(socket_fd);
+
+    if (options.reuse_address) {
+        try setSocketOption(ev, socket_fd, c.SOL.SOCKET, c.SO.REUSEADDR, 1);
+        if (@hasDecl(c.SO, "REUSEPORT"))
+            try setSocketOption(ev, socket_fd, c.SOL.SOCKET, c.SO.REUSEPORT, 1);
+    }
+
+    var storage: PosixAddress = undefined;
+    var addr_len = addressToPosix(address, &storage);
+    try posixBind(ev, socket_fd, &storage.any, addr_len);
+
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.listen(socket_fd, options.kernel_backlog))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+
+    try posixGetSockName(ev, socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netAcceptUnavailable(
+fn netAccept(
     userdata: ?*anyopaque,
     listen_handle: net.Socket.Handle,
     options: net.Server.AcceptOptions,
 ) net.Server.AcceptError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = listen_handle;
     _ = options;
-    return error.NetworkDown;
+    var storage: PosixAddress = undefined;
+    var addr_len: c.socklen_t = @sizeOf(PosixAddress);
+    const fd = while (true) {
+        try ev.checkCancel();
+        const rc = c.accept(listen_handle, &storage.any, &addr_len);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                const fd: c.fd_t = @intCast(rc);
+                errdefer closeFd(fd);
+                try setCloexec(ev, fd);
+                try setNonblocking(ev, fd);
+                break fd;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                try waitReadable(ev, listen_handle);
+                continue;
+            },
+            .BADF => |err| return errnoBug(err),
+            .CONNABORTED => return error.ConnectionAborted,
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => return error.SocketNotListening,
+            .NOTSOCK => |err| return errnoBug(err),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .OPNOTSUPP => |err| return errnoBug(err),
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    return .{ .handle = fd, .address = addressFromPosix(&storage) };
 }
 
-fn netBindIpUnavailable(
+fn netBindIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = posixAddressFamily(address);
+    const socket_fd = try openSocket(ev, family, options);
+    errdefer closeFd(socket_fd);
+    var storage: PosixAddress = undefined;
+    var addr_len = addressToPosix(address, &storage);
+    try posixBind(ev, socket_fd, &storage.any, addr_len);
+    if (options.allow_broadcast) try setSocketOption(ev, socket_fd, c.SOL.SOCKET, c.SO.BROADCAST, 1);
+    try posixGetSockName(ev, socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netConnectIpUnavailable(
+fn netConnectIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
+    if (options.timeout != .none) @panic("TODO implement netConnectIp with timeout");
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = posixAddressFamily(address);
+    const socket_fd = try openSocket(ev, family, .{ .mode = options.mode, .protocol = options.protocol });
+    errdefer closeFd(socket_fd);
+    var storage: PosixAddress = undefined;
+    var addr_len = addressToPosix(address, &storage);
+    try posixConnect(ev, socket_fd, &storage.any, addr_len);
+    try posixGetSockName(ev, socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netListenUnixUnavailable(
+fn netListenUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
+    if (!net.has_unix_sockets) return error.AddressFamilyUnsupported;
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.AddressFamilyUnsupported;
+    const socket_fd = openSocket(ev, c.AF.UNIX, .{ .mode = .stream }) catch |err| switch (err) {
+        error.ProtocolUnsupportedBySystem => return error.AddressFamilyUnsupported,
+        error.ProtocolUnsupportedByAddressFamily => return error.AddressFamilyUnsupported,
+        error.SocketModeUnsupported => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer closeFd(socket_fd);
+
+    var storage: UnixAddress = undefined;
+    const addr_len = addressUnixToPosix(address, &storage);
+    try posixBindUnix(ev, socket_fd, &storage.any, addr_len);
+
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.listen(socket_fd, options.kernel_backlog))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+
+    return socket_fd;
 }
 
-fn netConnectUnixUnavailable(
+fn netConnectUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
+    if (!net.has_unix_sockets) return error.AddressFamilyUnsupported;
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    return error.AddressFamilyUnsupported;
+    const socket_fd = openSocket(ev, c.AF.UNIX, .{ .mode = .stream }) catch |err| switch (err) {
+        error.ProtocolUnsupportedByAddressFamily => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer closeFd(socket_fd);
+    var storage: UnixAddress = undefined;
+    const addr_len = addressUnixToPosix(address, &storage);
+    try posixConnectUnix(ev, socket_fd, &storage.any, addr_len);
+    return socket_fd;
 }
 
-fn netSocketCreatePairUnavailable(
+fn netSocketCreatePair(
     userdata: ?*anyopaque,
     options: net.Socket.CreatePairOptions,
 ) net.Socket.CreatePairError![2]net.Socket {
-    _ = userdata;
-    _ = options;
-    return error.OperationUnsupported;
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    if (@TypeOf(c.socketpair) == void) return error.OperationUnsupported;
+
+    const family: c.sa_family_t = switch (options.family) {
+        .ip4 => c.AF.INET,
+        .ip6 => c.AF.INET6,
+    };
+    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
+
+    var sockets: [2]c.fd_t = undefined;
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.socketpair(family, mode, protocol, &sockets))) {
+            .SUCCESS => {
+                errdefer {
+                    closeFd(sockets[0]);
+                    closeFd(sockets[1]);
+                }
+                try setCloexec(ev, sockets[0]);
+                try setCloexec(ev, sockets[1]);
+                try setNonblocking(ev, sockets[0]);
+                try setNonblocking(ev, sockets[1]);
+                var storages: [2]PosixAddress = undefined;
+                var addr_lens: [2]c.socklen_t = .{ @sizeOf(PosixAddress), @sizeOf(PosixAddress) };
+                try posixGetSockName(ev, sockets[0], &storages[0].any, &addr_lens[0]);
+                try posixGetSockName(ev, sockets[1], &storages[1].any, &addr_lens[1]);
+                return .{
+                    .{ .handle = sockets[0], .address = addressFromPosix(&storages[0]) },
+                    .{ .handle = sockets[1], .address = addressFromPosix(&storages[1]) },
+                };
+            },
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
-fn netSendUnavailable(
+fn netSend(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
     messages: []net.OutgoingMessage,
     flags: net.SendFlags,
 ) struct { ?net.Socket.SendError, usize } {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = handle;
-    _ = messages;
-    _ = flags;
-    return .{ error.NetworkDown, 0 };
+    const posix_flags: u32 =
+        @as(u32, if (@hasDecl(c.MSG, "CONFIRM") and flags.confirm) c.MSG.CONFIRM else 0) |
+        @as(u32, if (@hasDecl(c.MSG, "DONTROUTE") and flags.dont_route) c.MSG.DONTROUTE else 0) |
+        @as(u32, if (@hasDecl(c.MSG, "EOR") and flags.eor) c.MSG.EOR else 0) |
+        @as(u32, if (@hasDecl(c.MSG, "OOB") and flags.oob) c.MSG.OOB else 0) |
+        @as(u32, if (@hasDecl(c.MSG, "FASTOPEN") and flags.fastopen) c.MSG.FASTOPEN else 0) |
+        c.MSG.NOSIGNAL;
+    var i: usize = 0;
+    while (messages.len - i != 0) {
+        ev.netSendOne(handle, &messages[i], posix_flags) catch |err| return .{ err, i };
+        i += 1;
+    }
+    return .{ null, i };
 }
 
-fn netWriteUnavailable(
+fn netSendOne(
+    ev: *Evented,
+    handle: net.Socket.Handle,
+    message: *net.OutgoingMessage,
+    posix_flags: u32,
+) net.Socket.SendError!void {
+    var addr: PosixAddress = undefined;
+    var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
+    const msg: c.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = addressToPosix(message.address, &addr),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        .control = if (message.control.len == 0) null else message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    while (true) {
+        try ev.checkCancel();
+        const n = netSendOneSyscall(handle, &msg, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => {
+                try ev.netWaitWritable(handle);
+                continue;
+            },
+            else => |e| return e,
+        };
+        message.data_len = n;
+        return;
+    }
+}
+
+fn netSendOneSyscall(
+    handle: net.Socket.Handle,
+    msg: *const c.msghdr_const,
+    posix_flags: u32,
+) (net.Socket.SendError || error{WouldBlock})!usize {
+    while (true) {
+        const rc = c.sendmsg(handle, msg, posix_flags);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .ACCES => return error.AccessDenied,
+            .ALREADY => return error.FastOpenAlreadyInProgress,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .MSGSIZE => return error.MessageOversize,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PIPE => return error.SocketUnconnected,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOTCONN => return error.SocketUnconnected,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err),
+            .DESTADDRREQ => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .OPNOTSUPP => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netWrite(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
     header: []const u8,
@@ -4887,15 +5223,99 @@ fn netWriteUnavailable(
     splat: usize,
 ) net.Stream.Writer.Error!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = handle;
-    _ = header;
-    _ = data;
-    _ = splat;
-    return error.NetworkDown;
+    while (true) {
+        try ev.checkCancel();
+        return netWriteLimit(handle, header, data, splat, .unlimited) catch |err| switch (err) {
+            error.WouldBlock => {
+                try ev.netWaitWritable(handle);
+                continue;
+            },
+            else => |e| return e,
+        };
+    }
 }
 
-fn netWriteFileUnavailable(
+fn netWriteLimit(
+    handle: net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    limit: Io.Limit,
+) (net.Stream.Writer.Error || error{WouldBlock})!usize {
+    if (limit == .nothing) return 0;
+    var iovecs: [max_iovecs_len]iovec_const = undefined;
+    var iovlen: iovlen_t = 0;
+    var remaining = limit;
+    addBuf(true, &iovecs, &iovlen, &remaining, header);
+    for (data[0 .. data.len - 1]) |bytes| addBuf(true, &iovecs, &iovlen, &remaining, bytes);
+    const pattern = data[data.len - 1];
+    var backup_buffer: [splat_buffer_size]u8 = undefined;
+    if (iovecs.len - iovlen != 0 and remaining != .nothing) switch (splat) {
+        0 => {},
+        1 => addBuf(true, &iovecs, &iovlen, &remaining, pattern),
+        else => switch (pattern.len) {
+            0 => {},
+            1 => {
+                const splat_buffer = &backup_buffer;
+                const memset_len = @min(splat_buffer.len, splat);
+                const buf = splat_buffer[0..memset_len];
+                @memset(buf, pattern[0]);
+                addBuf(true, &iovecs, &iovlen, &remaining, buf);
+                var remaining_splat = splat - buf.len;
+                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0 and remaining != .nothing) {
+                    assert(buf.len == splat_buffer.len);
+                    addBuf(true, &iovecs, &iovlen, &remaining, splat_buffer);
+                    remaining_splat -= splat_buffer.len;
+                }
+                addBuf(true, &iovecs, &iovlen, &remaining, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
+            },
+            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
+                if (remaining == .nothing) break;
+                addBuf(true, &iovecs, &iovlen, &remaining, pattern);
+            },
+        },
+    };
+    if (iovlen == 0) return 0;
+    const msg: c.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovecs,
+        .iovlen = iovlen,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    while (true) {
+        const rc = c.sendmsg(handle, &msg, c.MSG.NOSIGNAL);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .ALREADY => return error.FastOpenAlreadyInProgress,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PIPE => return error.SocketUnconnected,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOTCONN => return error.SocketUnconnected,
+            .NETDOWN => return error.NetworkDown,
+            .ACCES => |err| return errnoBug(err),
+            .BADF => |err| return errnoBug(err),
+            .DESTADDRREQ => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .MSGSIZE => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .OPNOTSUPP => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netWriteFile(
     userdata: ?*anyopaque,
     socket_handle: net.Socket.Handle,
     header: []const u8,
@@ -4903,12 +5323,260 @@ fn netWriteFileUnavailable(
     limit: Io.Limit,
 ) net.Stream.Writer.WriteFileError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = socket_handle;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    return error.NetworkDown;
+    const reader_buffered = file_reader.interface.buffered();
+    if (reader_buffered.len >= @intFromEnum(limit)) {
+        const n = netWrite(ev, socket_handle, header, &.{limit.slice(reader_buffered)}, 1) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Unexpected => |e| return e,
+            else => return error.NetworkDown,
+        };
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    const file_limit = @intFromEnum(limit) - reader_buffered.len;
+    const out_fd = socket_handle;
+    const in_fd = file_reader.file.handle;
+
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (reader_buffered.len != 0) {
+                const n = netWrite(ev, socket_handle, header, &.{limit.slice(reader_buffered)}, 1) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => return error.NetworkDown,
+                };
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return 0;
+        }
+    }
+
+    if (@atomicLoad(UseSendfile, &ev.use_sendfile, .monotonic) == .disabled) return 0;
+    const offset = std.math.cast(c.off_t, file_reader.pos) orelse return 0;
+    var hdtr_data: c.sf_hdtr = undefined;
+    var headers: [2]iovec_const = undefined;
+    var headers_i: u8 = 0;
+    if (header.len != 0) {
+        headers[headers_i] = .{ .base = header.ptr, .len = header.len };
+        headers_i += 1;
+    }
+    if (reader_buffered.len != 0) {
+        headers[headers_i] = .{ .base = reader_buffered.ptr, .len = reader_buffered.len };
+        headers_i += 1;
+    }
+    const hdtr: ?*c.sf_hdtr = if (headers_i == 0) null else b: {
+        hdtr_data = .{
+            .headers = &headers,
+            .hdr_cnt = headers_i,
+            .trailers = null,
+            .trl_cnt = 0,
+        };
+        break :b &hdtr_data;
+    };
+    const max_count = std.math.maxInt(i32);
+    const flags = 0;
+    while (true) {
+        try ev.checkCancel();
+        var len: c.off_t = @min(file_limit, max_count);
+        const wait: bool = wait: {
+            while (true) switch (c.errno(c.sendfile(in_fd, out_fd, offset, &len, hdtr, flags))) {
+                .SUCCESS => break :wait false,
+                .OPNOTSUPP, .NOTSOCK, .NOSYS => {
+                    @atomicStore(UseSendfile, &ev.use_sendfile, .disabled, .monotonic);
+                    return 0;
+                },
+                .INTR => if (len > 0) break :wait false,
+                .AGAIN => break :wait (len == 0),
+                else => |e| switch (e) {
+                    .NOTCONN => return error.NetworkDown,
+                    .IO => return error.NetworkDown,
+                    .PIPE => return error.NetworkDown,
+                    .BADF => |err| return errnoBug(err),
+                    .FAULT => |err| return errnoBug(err),
+                    .INVAL => |err| return errnoBug(err),
+                    else => |err| return unexpectedErrno(err),
+                },
+            };
+        };
+        if (wait) {
+            ev.netWaitWritable(out_fd) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.SystemResources => return error.NetworkDown,
+            };
+            continue;
+        }
+        if (len == 0) {
+            file_reader.size = file_reader.pos;
+            return 0;
+        }
+        const u_len: usize = @bitCast(len);
+        file_reader.interface.toss(u_len -| header.len);
+        return u_len;
+    }
+}
+
+fn netWaitWritable(ev: *Evented, handle: net.Socket.Handle) (Io.Cancelable || error{SystemResources})!void {
+    const source = c.dispatch.source_create(
+        .WRITE,
+        @bitCast(@as(isize, handle)),
+        .none,
+        ev.queue,
+    ) orelse return error.SystemResources;
+    source.as_object().set_context(Thread.current().currentFiber());
+    source.set_event_handler(&Fiber.@"resume");
+    ev.yield(.{ .activate = source.as_object() });
+    source.as_object().release();
+    try ev.checkCancel();
+}
+
+fn netWaitReadable(ev: *Evented, handle: net.Socket.Handle) (Io.Cancelable || error{SystemResources})!usize {
+    const source = c.dispatch.source_create(
+        .READ,
+        @bitCast(@as(isize, handle)),
+        .none,
+        ev.queue,
+    ) orelse return error.SystemResources;
+    source.as_object().set_context(Thread.current().currentFiber());
+    source.set_event_handler(&Fiber.@"resume");
+    ev.yield(.{ .activate = source.as_object() });
+    const limit = source.get_data();
+    source.as_object().release();
+    try ev.checkCancel();
+    return limit;
+}
+
+fn netReceive(
+    ev: *Evented,
+    socket_handle: net.Socket.Handle,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) Io.Cancelable!struct { ?net.Socket.ReceiveError, usize } {
+    const posix_flags: u32 =
+        @as(u32, if (flags.oob) c.MSG.OOB else 0) |
+        @as(u32, if (flags.peek) c.MSG.PEEK else 0) |
+        @as(u32, if (flags.trunc) c.MSG.TRUNC else 0) |
+        c.MSG.NOSIGNAL |
+        c.MSG.DONTWAIT;
+    while (true) {
+        try ev.checkCancel();
+        var data_i: usize = 0;
+        for (message_buffer, 0..) |*msg, msg_i| {
+            const remaining = data_buffer[data_i..];
+            netReceiveOne(socket_handle, msg, remaining, posix_flags) catch |err| switch (err) {
+                error.WouldBlock => {
+                    if (msg_i != 0) return .{ null, msg_i };
+                    _ = ev.netWaitReadable(socket_handle) catch |wait_err| switch (wait_err) {
+                        error.Canceled => |e| return e,
+                        error.SystemResources => return .{ error.SystemResources, msg_i },
+                    };
+                    break;
+                },
+                else => |e| return .{ e, msg_i },
+            };
+            data_i += msg.data.len;
+        } else return .{ null, message_buffer.len };
+    }
+}
+
+fn netReceiveOne(
+    socket_handle: net.Socket.Handle,
+    message: *net.IncomingMessage,
+    data_buffer: []u8,
+    posix_flags: u32,
+) (net.Socket.ReceiveError || error{WouldBlock})!void {
+    var storage: PosixAddress = undefined;
+    var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+    var msg: c.msghdr = .{
+        .name = &storage.any,
+        .namelen = @sizeOf(PosixAddress),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        .control = message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = undefined,
+    };
+    while (true) {
+        const rc = c.recvmsg(socket_handle, &msg, posix_flags);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                const data = data_buffer[0..@intCast(rc)];
+                message.* = .{
+                    .from = addressFromPosix(&storage),
+                    .data = data,
+                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .flags = .{
+                        .eor = (msg.flags & c.MSG.EOR) != 0,
+                        .trunc = (msg.flags & c.MSG.TRUNC) != 0,
+                        .ctrunc = (msg.flags & c.MSG.CTRUNC) != 0,
+                        .oob = (msg.flags & c.MSG.OOB) != 0,
+                        .errqueue = if (@hasDecl(c.MSG, "ERRQUEUE")) (msg.flags & c.MSG.ERRQUEUE) != 0 else false,
+                    },
+                };
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .NOTCONN => return error.SocketUnconnected,
+            .MSGSIZE => return error.MessageOversize,
+            .PIPE => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .OPNOTSUPP => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netRead(ev: *Evented, socket_handle: net.Socket.Handle, data: []const []u8) net.Stream.Reader.Error!usize {
+    while (true) {
+        try ev.checkCancel();
+        return netReadLimit(socket_handle, data, .unlimited) catch |err| switch (err) {
+            error.WouldBlock => {
+                _ = try ev.netWaitReadable(socket_handle);
+                continue;
+            },
+            else => |e| return e,
+        };
+    }
+}
+
+fn netReadLimit(
+    socket_handle: net.Socket.Handle,
+    data: []const []u8,
+    limit: Io.Limit,
+) (net.Stream.Reader.Error || error{WouldBlock})!usize {
+    var iovecs: [max_iovecs_len]iovec = undefined;
+    var iovlen: iovlen_t = 0;
+    var remaining = if (limit == .nothing) .unlimited else limit;
+    for (data) |buf| addBuf(false, &iovecs, &iovlen, &remaining, buf);
+    if (iovlen == 0) return 0;
+    while (true) {
+        const rc = c.readv(socket_handle, &iovecs, iovlen);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .NOTCONN => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .PIPE => return error.SocketUnconnected,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
 fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
@@ -4917,49 +5585,518 @@ fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
     for (handles) |handle| closeFd(handle);
 }
 
-fn netShutdownUnavailable(
+fn netShutdown(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = handle;
-    _ = how;
-    unreachable; // How you gonna shutdown something that was impossible to open?
+
+    const posix_how: i32 = switch (how) {
+        .recv => c.SHUT.RD,
+        .send => c.SHUT.WR,
+        .both => c.SHUT.RDWR,
+    };
+
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.shutdown(handle, posix_how))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
+            .NOTCONN => return error.SocketUnconnected,
+            .NOBUFS => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
-fn netInterfaceNameResolveUnavailable(
+fn waitReadable(ev: *Evented, fd: c.fd_t) error{ Canceled, SystemResources }!void {
+    const source = c.dispatch.source_create(
+        .READ,
+        @bitCast(@as(isize, fd)),
+        .none,
+        ev.queue,
+    ) orelse return error.SystemResources;
+    source.as_object().set_context(Thread.current().currentFiber());
+    source.set_event_handler(&Fiber.@"resume");
+    ev.yield(.{ .activate = source.as_object() });
+    source.as_object().release();
+    try ev.checkCancel();
+}
+
+fn waitWritable(ev: *Evented, fd: c.fd_t) error{ Canceled, SystemResources }!void {
+    const source = c.dispatch.source_create(
+        .WRITE,
+        @bitCast(@as(isize, fd)),
+        .none,
+        ev.queue,
+    ) orelse return error.SystemResources;
+    source.as_object().set_context(Thread.current().currentFiber());
+    source.set_event_handler(&Fiber.@"resume");
+    ev.yield(.{ .activate = source.as_object() });
+    source.as_object().release();
+    try ev.checkCancel();
+}
+
+fn openSocket(
+    ev: *Evented,
+    family: c.sa_family_t,
+    options: net.IpAddress.BindOptions,
+) error{
+    AddressFamilyUnsupported,
+    ProtocolUnsupportedBySystem,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    ProtocolUnsupportedByAddressFamily,
+    SocketModeUnsupported,
+    OptionUnsupported,
+    Unexpected,
+    Canceled,
+}!c.fd_t {
+    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
+    const socket_fd = while (true) {
+        try ev.checkCancel();
+        const rc = c.socket(family, mode, protocol);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                const fd: c.fd_t = @intCast(rc);
+                errdefer closeFd(fd);
+                try setCloexec(ev, fd);
+                try setNonblocking(ev, fd);
+                break fd;
+            },
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    errdefer closeFd(socket_fd);
+
+    if (options.ip6_only) {
+        if (c.IPV6 == void) return error.OptionUnsupported;
+        try setSocketOption(ev, socket_fd, c.IPPROTO.IPV6, c.IPV6.V6ONLY, 0);
+    }
+
+    return socket_fd;
+}
+
+fn setCloexec(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.fcntl(fd, c.F.SETFD, @as(usize, c.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn setNonblocking(ev: *Evented, fd: c.fd_t) error{ Canceled, Unexpected }!void {
+    var fl_flags: usize = while (true) {
+        try ev.checkCancel();
+        const rc = c.fcntl(fd, c.F.GETFL, @as(usize, 0));
+        switch (c.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    fl_flags |= @as(usize, 1 << @bitOffsetOf(c.O, "NONBLOCK"));
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.fcntl(fd, c.F.SETFL, fl_flags))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixBind(
+    ev: *Evented,
+    socket_fd: c.fd_t,
+    addr: *const c.sockaddr,
+    addr_len: c.socklen_t,
+) net.IpAddress.BindError!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.bind(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .FAULT => |err| return errnoBug(err),
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixBindUnix(
+    ev: *Evented,
+    fd: c.fd_t,
+    addr: *const c.sockaddr,
+    addr_len: c.socklen_t,
+) net.UnixAddress.ListenError!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.bind(fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .NOMEM => return error.SystemResources,
+
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .PERM => return error.PermissionDenied,
+
+            .BADF => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .NAMETOOLONG => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixConnect(
+    ev: *Evented,
+    socket_fd: c.fd_t,
+    addr: *const c.sockaddr,
+    addr_len: c.socklen_t,
+) net.IpAddress.ConnectError!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.connect(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN, .INPROGRESS => {
+                try waitWritable(ev, socket_fd);
+                return getSocketError(ev, socket_fd);
+            },
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ALREADY => return error.ConnectionPending,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .TIMEDOUT => return error.Timeout,
+            .ACCES => return error.AccessDenied,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err),
+            .CONNABORTED => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOENT => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .PERM => |err| return errnoBug(err),
+            .PROTOTYPE => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixConnectUnix(
+    ev: *Evented,
+    fd: c.fd_t,
+    addr: *const c.sockaddr,
+    addr_len: c.socklen_t,
+) net.UnixAddress.ConnectError!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.connect(fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN, .INPROGRESS => {
+                try waitWritable(ev, fd);
+                getSocketError(ev, fd) catch |err| switch (err) {
+                    error.AddressUnavailable,
+                    error.AddressFamilyUnsupported,
+                    error.ConnectionPending,
+                    error.ConnectionRefused,
+                    error.ConnectionResetByPeer,
+                    error.HostUnreachable,
+                    error.NetworkUnreachable,
+                    error.Timeout,
+                    error.NetworkDown,
+                    => return error.WouldBlock,
+                    else => |e| return e,
+                };
+                return;
+            },
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ACCES => return error.AccessDenied,
+
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .PERM => return error.PermissionDenied,
+
+            .BADF => |err| return errnoBug(err),
+            .CONNABORTED => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .PROTOTYPE => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixGetSockName(
+    ev: *Evented,
+    socket_fd: c.fd_t,
+    addr: *c.sockaddr,
+    addr_len: *c.socklen_t,
+) error{ SystemResources, Canceled, Unexpected }!void {
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.getsockname(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .NOBUFS => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn setSocketOption(
+    ev: *Evented,
+    fd: c.fd_t,
+    level: i32,
+    opt_name: u32,
+    option: u32,
+) error{ Canceled, Unexpected }!void {
+    const o: []const u8 = @ptrCast(&option);
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.setsockopt(fd, level, opt_name, o.ptr, @intCast(o.len)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn getSocketError(ev: *Evented, fd: c.fd_t) net.IpAddress.ConnectError!void {
+    var err_int: c_int = 0;
+    var err_len: c.socklen_t = @sizeOf(c_int);
+    while (true) {
+        try ev.checkCancel();
+        switch (c.errno(c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &err_int, &err_len))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .BADF => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+    if (err_int == 0) return;
+    switch (@as(c.E, @enumFromInt(err_int))) {
+        .SUCCESS => return,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.Timeout,
+        .ACCES, .PERM => return error.AccessDenied,
+        .NETDOWN => return error.NetworkDown,
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+fn netInterfaceNameResolve(
     userdata: ?*anyopaque,
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = name;
-    return error.InterfaceNotFound;
+    try ev.checkCancel();
+    const index = c.if_nametoindex(&name.bytes);
+    if (index == 0) return error.InterfaceNotFound;
+    return .{ .index = @bitCast(index) };
 }
 
-fn netInterfaceNameUnavailable(
+fn netInterfaceName(
     userdata: ?*anyopaque,
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = interface;
-    return error.Unexpected;
+    try ev.checkCancel();
+    var name: net.Interface.Name = undefined;
+    if (if_indextoname(interface.index, &name.bytes) == null) return error.InterfaceNotFound;
+    return name;
 }
 
-fn netLookupUnavailable(
+extern "c" fn if_indextoname(ifindex: c_uint, ifname: [*]u8) ?[*:0]u8;
+
+fn netLookup(
     userdata: ?*anyopaque,
     host_name: net.HostName,
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = host_name;
-    _ = options;
-    resolved.close(ev.io());
-    return error.NetworkDown;
+    defer resolved.close(ev.io());
+    netLookupFallible(ev, host_name, resolved, options) catch |err| switch (err) {
+        error.Closed => unreachable,
+        else => |e| return e,
+    };
+}
+
+fn netLookupFallible(
+    ev: *Evented,
+    host_name: net.HostName,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    const ev_io = ev.io();
+    const name = host_name.bytes;
+    assert(name.len <= net.HostName.max_len);
+
+    if (net.IpAddress.parseIp6(name, options.port)) |addr| {
+        if (options.family == .ip4) return error.UnknownHostName;
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+
+    if (net.IpAddress.parseIp4(name, options.port)) |addr| {
+        if (options.family == .ip6) return error.UnknownHostName;
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+
+    // RFC 6761 Section 6.3.3: localhost names always resolve to loopback.
+    const localhost = if (name[name.len - 1] == '.') "localhost." else "localhost";
+    if (std.mem.endsWith(u8, name, localhost) and
+        (name.len == localhost.len or name[name.len - localhost.len] == '.'))
+    {
+        var results_buffer: [3]net.HostName.LookupResult = undefined;
+        var results_index: usize = 0;
+        if (options.family != .ip4) {
+            results_buffer[results_index] = .{ .address = .{ .ip6 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.family != .ip6) {
+            results_buffer[results_index] = .{ .address = .{ .ip4 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.canonical_name_buffer) |buf| {
+            const canon_name = "localhost";
+            const canon_name_dest = buf[0..canon_name.len];
+            canon_name_dest.* = canon_name.*;
+            results_buffer[results_index] = .{ .canonical_name = .{ .bytes = canon_name_dest } };
+            results_index += 1;
+        }
+        try resolved.putAll(ev_io, results_buffer[0..results_index]);
+        return;
+    }
+
+    // TODO use CFHostStartInfoResolution / CFHostCancelInfoResolution for true async DNS.
+    var name_buffer: [net.HostName.max_len:0]u8 = undefined;
+    @memcpy(name_buffer[0..name.len], name);
+    name_buffer[name.len] = 0;
+    const name_c = name_buffer[0..name.len :0];
+
+    var port_buffer: [8]u8 = undefined;
+    const port_c = std.fmt.bufPrintSentinel(&port_buffer, "{d}", .{options.port}, 0) catch unreachable;
+
+    const hints: posix.addrinfo = .{
+        .flags = .{ .CANONNAME = options.canonical_name_buffer != null, .NUMERICSERV = true },
+        .family = posix.AF.UNSPEC,
+        .socktype = posix.SOCK.STREAM,
+        .protocol = posix.IPPROTO.TCP,
+        .canonname = null,
+        .addr = null,
+        .addrlen = 0,
+        .next = null,
+    };
+    var res: ?*posix.addrinfo = null;
+    while (true) {
+        try ev.checkCancel();
+        switch (posix.system.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &res)) {
+            @as(posix.system.EAI, @enumFromInt(0)) => break,
+            .SYSTEM => switch (posix.errno(-1)) {
+                .INTR => continue,
+                else => |e| return posix.unexpectedErrno(e),
+            },
+            else => |e| switch (e) {
+                .ADDRFAMILY => return error.AddressFamilyUnsupported,
+                .AGAIN => return error.NameServerFailure,
+                .FAIL => return error.NameServerFailure,
+                .FAMILY => return error.AddressFamilyUnsupported,
+                .MEMORY => return error.SystemResources,
+                .NODATA => return error.UnknownHostName,
+                .NONAME => return error.UnknownHostName,
+                else => return error.Unexpected,
+            },
+        }
+    }
+    defer if (res) |some| posix.system.freeaddrinfo(some);
+
+    var it = res;
+    var canon_name: ?[*:0]const u8 = null;
+    while (it) |info| : (it = info.next) {
+        const addr = info.addr orelse continue;
+        try resolved.putOne(ev_io, .{
+            .address = Io.Threaded.addressFromPosix(@alignCast(@fieldParentPtr("any", addr))),
+        });
+        if (info.canonname) |n| {
+            if (canon_name == null) canon_name = n;
+        }
+    }
+    if (canon_name) |n| {
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, std.mem.sliceTo(n, 0))) |canon| {
+            try resolved.putOne(ev_io, .{ .canonical_name = canon });
+        }
+    }
 }
 
 fn readAll(ev: *Evented, file: File, buffer: []u8) File.ReadStreamingError!void {
