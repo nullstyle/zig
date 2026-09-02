@@ -4229,10 +4229,49 @@ fn processReplacePath(
     options: process.ReplaceOptions,
 ) process.ReplaceError {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processReplacePath");
+
+    if (!process.can_replace) return error.OperationUnsupported;
+
+    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
+    argv_buf[0] = (try arena.dupeSentinel(u8, try argv0Path(arena, options.argv[0]), 0)).ptr;
+    for (options.argv[1..], 1..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
+
+    const env_block = env_block: {
+        const prog_fd: i32 = -1;
+        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
+            .zig_progress_fd = prog_fd,
+        });
+        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
+            .zig_progress_fd = prog_fd,
+        });
+    };
+
+    // `argv[0]` is relative to `dir`; change into it so that the path
+    // resolves against `dir`.
+    processSetCurrentDir(userdata, dir) catch |err| switch (err) {
+        error.AccessDenied,
+        error.Canceled,
+        error.FileNotFound,
+        error.FileSystem,
+        error.NotDir,
+        error.Unexpected,
+        => |e| return e,
+        // Not produced by `fchdir` on POSIX.
+        error.BadPathName,
+        error.NameTooLong,
+        error.NoDevice,
+        error.OperationUnsupported,
+        error.UnrecognizedVolume,
+        => return error.Unexpected,
+    };
+
+    // The "./" prefix (added by `argv0Path`) ensures `execv` does not search
+    // PATH; `PATH` is unused but must still be non-null.
+    return ev.execv(.no_expand, argv_buf.ptr[0].?, argv_buf.ptr, env_block, ".");
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
@@ -4273,10 +4312,31 @@ fn processSpawnPath(
     options: process.SpawnOptions,
 ) process.SpawnError!process.Child {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processSpawnPath");
+
+    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const argv = try arena.alloc([]const u8, options.argv.len);
+    argv[0] = try argv0Path(arena, options.argv[0]);
+    @memcpy(argv[1..], options.argv[1..]);
+
+    var path_options = options;
+    path_options.argv = argv;
+    path_options.cwd = .{ .dir = dir };
+    return processSpawn(userdata, path_options);
+}
+
+/// Returns `arg0` guaranteed to be treated as a path relative to the current
+/// working directory rather than searched for in `PATH`, by prefixing "./"
+/// when it contains no '/'.
+fn argv0Path(arena: std.mem.Allocator, arg0: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.mem.findScalar(u8, arg0, '/') != null) return arg0;
+    const result = try arena.alloc(u8, arg0.len + 2);
+    result[0] = '.';
+    result[1] = '/';
+    @memcpy(result[2..], arg0);
+    return result;
 }
 
 const prog_fileno = @max(c.STDIN_FILENO, c.STDOUT_FILENO, c.STDERR_FILENO) + 1;
