@@ -14256,7 +14256,7 @@ pub const PosixAddress = extern union {
     in6: posix.sockaddr.in6,
 };
 
-const UnixAddress = extern union {
+pub const UnixAddress = extern union {
     any: posix.sockaddr,
     un: posix.sockaddr.un,
 };
@@ -14289,7 +14289,7 @@ pub fn addressToPosix(a: *const IpAddress, storage: *PosixAddress) posix.socklen
     };
 }
 
-fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
+pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
     storage.un.family = posix.AF.UNIX;
     var path_len = switch (native_os) {
         .windows => @min(a.path.len, storage.un.path.len),
@@ -15029,7 +15029,7 @@ const LookupDnsWindows = struct {
     }
 };
 
-fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
+pub fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
     const buf = canonical_name_buffer orelse return null;
     const dest = buf[0..name.len];
     @memcpy(dest, name);
