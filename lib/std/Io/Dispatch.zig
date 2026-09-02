@@ -41,9 +41,13 @@ const main_loop_stack_size = 8 * 1024;
 
 queue: c.dispatch.queue_t,
 backing_allocator_needs_mutex: bool,
-backing_allocator_mutex: Mutex,
+backing_allocator_lock: SpinLock,
 /// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
+/// Fibers created and not yet destroyed. A finished fiber resumes its awaiter
+/// before its own stack is freed on a worker's main context, so `deinit`
+/// waits for this to reach zero before tearing down shared state.
+live_fibers: std.atomic.Value(usize),
 main_fiber: Fiber,
 main_loop_stack: [*]align(builtin.target.stackAlignment()) u8,
 exit_semaphore: c.dispatch.semaphore_t,
@@ -81,8 +85,18 @@ const Thread = struct {
         .csprng = undefined,
     };
 
+    /// A fiber can be parked on one OS thread and resumed on another, so
+    /// `self` must be re-read after every context switch. `&self` is a
+    /// link-time constant to the optimizer: it propagates the address into
+    /// callers, drops the call's result, and may reuse a thread-local
+    /// lookup made before a switch. Routing the address through a volatile
+    /// asm operand makes it an opaque runtime value, so every caller
+    /// consumes what this call returned.
     noinline fn current() *Thread {
-        return &self;
+        return asm volatile (""
+            : [ret] "=r" (-> *Thread),
+            : [in] "0" (&self),
+            : .{ .memory = true });
     }
 
     fn currentFiber(thread: *Thread) *Fiber {
@@ -95,6 +109,21 @@ const Thread = struct {
         reserved: u32,
         active: u32,
     };
+};
+
+/// Guards `backing_allocator` when it is not thread-safe. A spinlock rather
+/// than the fiber-aware `Mutex`: an allocation never parks, and `Fiber.destroy`
+/// runs on a worker's main context, where parking is not possible.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *SpinLock) void {
+        while (l.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(l: *SpinLock) void {
+        l.locked.store(false, .release);
+    }
 };
 
 const Fiber = struct {
@@ -208,11 +237,14 @@ const Fiber = struct {
     );
 
     fn create(ev: *Evented) error{OutOfMemory}!*Fiber {
-        return @ptrCast(try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size));
+        const bytes = try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size);
+        _ = ev.live_fibers.fetchAdd(1, .monotonic);
+        return @ptrCast(bytes);
     }
 
     fn destroy(fiber: *Fiber, ev: *Evented) void {
         ev.allocator().free(fiber.allocatedSlice());
+        _ = ev.live_fibers.fetchSub(1, .release);
     }
 
     fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
@@ -304,8 +336,8 @@ pub fn allocator(ev: *Evented) std.mem.Allocator {
 
 fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
-    defer ev.backing_allocator_mutex.unlock();
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
 }
 
@@ -317,8 +349,8 @@ fn resize(
     ret_addr: usize,
 ) bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
-    defer ev.backing_allocator_mutex.unlock();
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
 }
 
@@ -330,15 +362,15 @@ fn remap(
     ret_addr: usize,
 ) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
-    defer ev.backing_allocator_mutex.unlock();
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
-    defer ev.backing_allocator_mutex.unlock();
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
 
@@ -503,7 +535,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     ev.* = .{
         .queue = queue,
         .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
-        .backing_allocator_mutex = undefined,
+        .backing_allocator_lock = .{},
         .backing_allocator = backing_allocator,
         .main_fiber = .{
             .required_align = {},
@@ -515,6 +547,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
             .cancel_protection = .unblocked,
         },
         .main_loop_stack = main_loop_stack.ptr,
+        .live_fibers = .init(0),
         .exit_semaphore = exit_semaphore,
 
         .use_fcopyfile = .default,
@@ -542,8 +575,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng_mutex = undefined,
         .csprng = .uninitialized,
     };
-    try ev.backing_allocator_mutex.init(queue);
-    errdefer ev.backing_allocator_mutex.deinit();
     var initialized_futexes: usize = 0;
     errdefer for (ev.futexes[0..initialized_futexes]) |*futex| futex.deinit();
     for (&ev.futexes) |*futex| {
@@ -573,19 +604,30 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 
 pub fn deinit(ev: *Evented) void {
     assert(Thread.current().currentFiber() == &ev.main_fiber);
+    // A finished fiber resumes its awaiter before its stack is freed on a
+    // worker's main context. Wait for those late frees so the teardown
+    // below cannot race them.
+    while (ev.live_fibers.load(.acquire) != 0) {
+        ev.yield(.{ .after = ev.timeFromTimeout(.{
+            .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+        }) });
+    }
     ev.yield(.exit);
     ev.csprng_mutex.deinit();
     if (ev.dev_null_file) |file| fileClose(ev, &.{file}) else |_| {}
     ev.stderr_mutex.deinit();
     for (&ev.futexes) |*futex| futex.deinit();
     ev.exit_semaphore.as_object().release();
-    ev.backing_allocator_mutex.deinit();
     ev.backing_allocator.free(ev.main_loop_stack[0..main_loop_stack_size]);
     ev.queue.as_object().release();
 }
 
 fn yield(ev: *Evented, pending_task: SwitchMessage.PendingTask) void {
     const thread: *Thread = .current();
+    // Only a fiber may park. `SwitchMessage.handle` runs on the thread's
+    // main context, so anything it calls must never block on a fiber
+    // primitive; switching "from" the main context corrupts it.
+    assert(thread.current_context != &thread.main_context);
     const message: SwitchMessage = .{
         .contexts = .{
             .old = thread.current_context.?,
@@ -646,7 +688,10 @@ const SwitchMessage = struct {
         exit,
     };
 
-    fn handle(message: *const SwitchMessage, ev: *Evented) void {
+    /// Runs on the destination side of every switch; kept out of line so the
+    /// thread-local lookup inside it can never be merged with one the
+    /// caller made before the switch.
+    noinline fn handle(message: *const SwitchMessage, ev: *Evented) void {
         const thread: *Thread = .current();
         thread.current_context = message.contexts.new;
         switch (message.pending_task) {
@@ -1956,7 +2001,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         error.Canceled => |e| return e,
     } orelse return;
-    if (batch.pending.head == .none) return;
+    if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
     var waiter: BatchWaiter = .{
         .sleeper = .init(ev.queue, Thread.current().currentFiber()),
         .queue = queue,
@@ -1964,6 +2009,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     if (batch.completed.head != .none) BatchWaiter.signal(&waiter);
     queue.as_object().set_context(&waiter);
     ev.yield(.{ .@"resume" = queue.as_object() });
+    batchReleaseIdleQueue(batch);
 }
 
 fn batchAwaitConcurrent(
@@ -1973,7 +2019,7 @@ fn batchAwaitConcurrent(
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const queue = try ev.batchDrainSubmitted(batch, true) orelse return;
-    if (batch.pending.head == .none) return;
+    if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
     var waiter: BatchWaiter = .{
         .sleeper = .init(ev.queue, Thread.current().currentFiber()),
         .queue = queue,
@@ -1994,10 +2040,47 @@ fn batchAwaitConcurrent(
     } else BatchWaiter.signal(&waiter);
     queue.as_object().set_context(&waiter);
     ev.yield(.{ .@"resume" = queue.as_object() });
+    if (timeout != .none and batch.completed.head == .none) {
+        // The timer fired before any operation completed. The operations stay
+        // pending on the (now suspended) batch queue, as on the other
+        // backends: the caller may await again or call `Batch.cancel`.
+        return error.Timeout;
+    }
+    batchReleaseIdleQueue(batch);
 }
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    batchCancelPending(ev, batch);
+}
+
+/// Releases the per-batch serial queue once nothing is pending on it, so a
+/// caller that never calls `Batch.cancel` (`Io.operateTimeout` builds a
+/// fresh `Batch` per call) does not leak one queue per operation. A later
+/// submission on the same batch simply creates a new queue.
+///
+/// Precondition: the calling fiber owns the batch, so the queue is suspended
+/// (it is suspended whenever the fiber runs); a suspended object must not be
+/// released, so the suspend is balanced first.
+fn batchReleaseIdleQueue(batch: *Io.Batch) void {
+    if (batch.pending.head != .none) return;
+    const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
+    queue.as_object().@"resume"();
+    queue.as_object().release();
+    batch.userdata = null;
+}
+
+/// Cancels every pending operation of `batch`, waits for their cancel
+/// handlers to run, and releases the batch's serial queue. On return
+/// `batch.userdata` is null and nothing refers to `batch.storage` any
+/// more, so the caller may drop the storage.
+///
+/// Precondition: the calling fiber owns the batch, which means the batch
+/// queue is suspended (it is suspended whenever the fiber runs), so
+/// `batch.pending` is stable while it is walked here.
+fn batchCancelPending(ev: *Evented, batch: *Io.Batch) void {
+    const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
+    if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
     var index = batch.pending.head;
     while (index != .none) {
         const storage = &batch.storage[index.toIndex()];
@@ -2005,18 +2088,17 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
         const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
         assert(operation_userdata.batch == batch);
         operation_userdata.source.cancel();
+        index = pending.node.next;
     }
-    const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
-    if (batch.pending.head != .none) {
-        var waiter: BatchWaiter = .{
-            .sleeper = .init(ev.queue, Thread.current().currentFiber()),
-            .queue = queue,
-            .timer = BatchWaiter.already_signaled,
-        };
-        if (batch.pending.head == .none) queue.async(&waiter, &BatchWaiter.signal);
-        queue.as_object().set_context(&waiter);
-        ev.yield(.{ .@"resume" = queue.as_object() });
-    }
+    // Park until the last cancel handler (`batchSourceCancel`) releases the
+    // queue and wakes us.
+    var waiter: BatchWaiter = .{
+        .sleeper = .init(ev.queue, Thread.current().currentFiber()),
+        .queue = queue,
+        .timer = BatchWaiter.already_signaled,
+    };
+    queue.as_object().set_context(&waiter);
+    ev.yield(.{ .@"resume" = queue.as_object() });
     batch.userdata = null;
 }
 
@@ -2060,6 +2142,32 @@ const BatchOperationUserdata = extern struct {
 
             fn data(operation: *const @This()) []const []const u8 {
                 return operation.data_ptr[0..operation.data_len];
+            }
+        },
+        net_receive: extern struct {
+            message_ptr: [*]net.IncomingMessage,
+            message_len: usize,
+            data_ptr: [*]u8,
+            data_len: usize,
+            /// `net.ReceiveFlags`, stored as its backing integer.
+            flags: u8,
+
+            fn messages(operation: *const @This()) []net.IncomingMessage {
+                return operation.message_ptr[0..operation.message_len];
+            }
+
+            fn data(operation: *const @This()) []u8 {
+                return operation.data_ptr[0..operation.data_len];
+            }
+        },
+        net_send: extern struct {
+            message_ptr: [*]net.OutgoingMessage,
+            message_len: usize,
+            /// `net.SendFlags`, stored as its backing integer.
+            flags: u8,
+
+            fn messages(operation: *const @This()) []net.OutgoingMessage {
+                return operation.message_ptr[0..operation.message_len];
             }
         },
     },
@@ -2174,8 +2282,96 @@ fn batchDrainSubmitted(
                     break :result null;
                 },
                 .device_io_control => {},
-                .net_receive => @panic("TODO implement batched net_receive"),
-                .net_send => @panic("TODO implement batched net_send"),
+                .net_receive => |operation| {
+                    // Drain whatever is already queued without blocking; a
+                    // readiness source is armed only if nothing at all was
+                    // available, mirroring the Threaded backend's poll path.
+                    const opt_err, const count = netReceiveNonblocking(
+                        operation.socket_handle,
+                        operation.message_buffer,
+                        operation.data_buffer,
+                        operation.flags,
+                    );
+                    if (opt_err) |err| switch (err) {
+                        error.WouldBlock => {},
+                        else => |e| break :result .{ .net_receive = .{ e, count } },
+                    } else break :result .{ .net_receive = .{ null, count } };
+                    const message_buffer = operation.message_buffer;
+                    const data_buffer = operation.data_buffer;
+                    const flags = operation.flags;
+                    const source = c.dispatch.source_create(
+                        .READ,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_receive = .{ error.SystemResources, 0 } };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_receive,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_receive = .{
+                            .message_ptr = message_buffer.ptr,
+                            .message_len = message_buffer.len,
+                            .data_ptr = data_buffer.ptr,
+                            .data_len = data_buffer.len,
+                            .flags = @bitCast(flags),
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
+                .net_send => |operation| {
+                    // Same shape as `net_receive`: send what the socket
+                    // accepts right now; arm a writability source only when
+                    // the very first message would block.
+                    const opt_err, const sent = netSendNonblocking(
+                        operation.socket_handle,
+                        operation.messages,
+                        operation.flags,
+                    );
+                    if (opt_err) |err| switch (err) {
+                        error.WouldBlock => {},
+                        else => |e| break :result .{ .net_send = .{ e, sent } },
+                    } else break :result .{ .net_send = .{ null, sent } };
+                    const messages = operation.messages;
+                    const flags = operation.flags;
+                    const source = c.dispatch.source_create(
+                        .WRITE,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_send = .{ error.SystemResources, 0 } };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_send,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_send = .{
+                            .message_ptr = messages.ptr,
+                            .message_len = messages.len,
+                            .flags = @bitCast(flags),
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
                 .net_read => |operation| {
                     const data = for (operation.data, 0..) |buffer, data_index| {
                         if (buffer.len > 0) break operation.data[data_index..];
@@ -2302,8 +2498,33 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
             } };
         },
         .device_io_control => unreachable,
-        .net_receive => @panic("TODO implement batched net_receive"),
-        .net_send => @panic("TODO implement batched net_send"),
+        .net_receive => {
+            const operation = &operation_userdata.operation.net_receive;
+            const opt_err, const count = netReceiveNonblocking(
+                @intCast(source.get_handle()),
+                operation.messages(),
+                operation.data(),
+                @bitCast(operation.flags),
+            );
+            if (opt_err) |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| break :result .{ .net_receive = .{ e, count } },
+            };
+            break :result .{ .net_receive = .{ null, count } };
+        },
+        .net_send => {
+            const operation = &operation_userdata.operation.net_send;
+            const opt_err, const sent = netSendNonblocking(
+                @intCast(source.get_handle()),
+                operation.messages(),
+                @bitCast(operation.flags),
+            );
+            if (opt_err) |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| break :result .{ .net_send = .{ e, sent } },
+            };
+            break :result .{ .net_send = .{ null, sent } };
+        },
         .net_read => {
             const operation = &operation_userdata.operation.net_read;
             break :result .{ .net_read = netReadOnce(
@@ -5610,6 +5831,14 @@ fn waitReady(
     source.as_object().set_context(Thread.current().currentFiber());
     source.set_event_handler(&Fiber.@"resume");
     ev.yield(.{ .activate = source.as_object() });
+    // The fiber is now running inside this source's event handler. The
+    // source is level-triggered: if the descriptor is still ready when
+    // the handler returns (it usually is for a writable socket, and for
+    // a readable one when the caller drains only part of the queue),
+    // libdispatch re-arms it and would call `Fiber.resume` again after
+    // this fiber has parked somewhere else. Cancel before the deferred
+    // release so no second resume can be delivered.
+    source.cancel();
     _ = source.get_data();
 }
 
@@ -5800,19 +6029,41 @@ fn netSendOne(
     }
 }
 
+fn posixSendFlags(flags: net.SendFlags) u32 {
+    return @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm) posix.MSG.CONFIRM else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "DONTROUTE") and flags.dont_route) posix.MSG.DONTROUTE else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "EOR") and flags.eor) posix.MSG.EOR else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "OOB") and flags.oob) posix.MSG.OOB else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "FASTOPEN") and flags.fastopen) posix.MSG.FASTOPEN else 0) |
+        posix.MSG.NOSIGNAL;
+}
+
+/// Sends as many of `messages` as the socket accepts right now, in order.
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN` ends the batch normally with the count sent so far, which
+/// is the contract `Io.Operation.NetSend` callers (`Socket.sendMany`) expect.
+fn netSendNonblocking(
+    handle: c.fd_t,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?(Io.Operation.NetSend.Error || error{WouldBlock}), usize } {
+    const posix_flags = posixSendFlags(flags);
+    for (messages, 0..) |*message, i| {
+        netSendOne(handle, message, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => return if (i == 0) .{ error.WouldBlock, 0 } else .{ null, i },
+            else => |e| return .{ e, i },
+        };
+    }
+    return .{ null, messages.len };
+}
+
 fn netSend(
     ev: *Evented,
     handle: c.fd_t,
     messages: []net.OutgoingMessage,
     flags: net.SendFlags,
 ) struct { ?Io.Operation.NetSend.Error, usize } {
-    const posix_flags: u32 =
-        @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm) posix.MSG.CONFIRM else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "DONTROUTE") and flags.dont_route) posix.MSG.DONTROUTE else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "EOR") and flags.eor) posix.MSG.EOR else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "OOB") and flags.oob) posix.MSG.OOB else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "FASTOPEN") and flags.fastopen) posix.MSG.FASTOPEN else 0) |
-        posix.MSG.NOSIGNAL;
+    const posix_flags = posixSendFlags(flags);
 
     for (messages, 0..) |*message, i| {
         while (true) {
@@ -5895,6 +6146,38 @@ fn netReceiveOnce(
     }
 }
 
+/// Receives as many messages as are immediately available, carving
+/// `data_buffer` sequentially (each message's `data` is a slice of it).
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN`, a full `message_buffer`, or an exhausted `data_buffer`
+/// ends the batch normally with the count received so far. Any other
+/// error is reported together with the number of messages already
+/// received, which the caller must still process. Like the Threaded
+/// backend's poll path this lets `Socket.receiveManyTimeout` drain a
+/// queue in one operation; unlike it, an exhausted `data_buffer` stops
+/// the batch instead of consuming further datagrams into zero-length
+/// buffers, and a hard error keeps the count instead of reporting zero.
+fn netReceiveNonblocking(
+    handle: c.fd_t,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) struct { ?(Io.Operation.NetReceive.Error || error{WouldBlock}), usize } {
+    var data_i: usize = 0;
+    for (message_buffer, 0..) |*message, message_i| {
+        const remaining = data_buffer[data_i..];
+        // No room left for another datagram: stop rather than let
+        // `recvmsg` consume one into a zero-length buffer.
+        if (remaining.len == 0 and message_i != 0) return .{ null, message_i };
+        netReceiveOnce(handle, message, remaining, flags) catch |err| switch (err) {
+            error.WouldBlock => return if (message_i == 0) .{ error.WouldBlock, 0 } else .{ null, message_i },
+            else => |e| return .{ e, message_i },
+        };
+        data_i += message.data.len;
+    }
+    return .{ null, message_buffer.len };
+}
+
 fn netReceive(
     ev: *Evented,
     handle: c.fd_t,
@@ -5903,16 +6186,16 @@ fn netReceive(
     flags: net.ReceiveFlags,
 ) struct { ?Io.Operation.NetReceive.Error, usize } {
     assert(message_buffer.len >= 1);
-    const message = &message_buffer[0];
     while (true) {
-        netReceiveOnce(handle, message, data_buffer, flags) catch |err| switch (err) {
+        const opt_err, const count = netReceiveNonblocking(handle, message_buffer, data_buffer, flags);
+        if (opt_err) |err| switch (err) {
             error.WouldBlock => {
                 waitReady(ev, handle, .READ) catch |e| return .{ e, 0 };
                 continue;
             },
-            else => |e| return .{ e, 0 },
+            else => |e| return .{ e, count },
         };
-        return .{ null, 1 };
+        return .{ null, count };
     }
 }
 
