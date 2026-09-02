@@ -23,6 +23,7 @@ const max_iovecs_len = Io.Threaded.max_iovecs_len;
 const nanosecondsFromPosix = Io.Threaded.nanosecondsFromPosix;
 const net = Io.net;
 const pathToPosix = Io.Threaded.pathToPosix;
+const posix = std.posix;
 const process = std.process;
 const recoverableOsBugDetected = Io.Threaded.recoverableOsBugDetected;
 const setTimestampToPosix = Io.Threaded.setTimestampToPosix;
@@ -451,19 +452,19 @@ pub fn io(ev: *Evented) Io {
             .random = random,
             .randomSecure = randomSecure,
 
-            .netListenIp = netListenIpUnavailable,
-            .netAccept = netAcceptUnavailable,
-            .netBindIp = netBindIpUnavailable,
-            .netConnectIp = netConnectIpUnavailable,
-            .netListenUnix = netListenUnixUnavailable,
-            .netConnectUnix = netConnectUnixUnavailable,
-            .netSocketCreatePair = netSocketCreatePairUnavailable,
-            .netWriteFile = netWriteFileUnavailable,
+            .netListenIp = netListenIp,
+            .netAccept = netAccept,
+            .netBindIp = netBindIp,
+            .netConnectIp = netConnectIp,
+            .netListenUnix = netListenUnix,
+            .netConnectUnix = netConnectUnix,
+            .netSocketCreatePair = netSocketCreatePair,
+            .netWriteFile = netWriteFile,
             .netClose = netClose,
-            .netShutdown = netShutdownUnavailable,
-            .netInterfaceNameResolve = netInterfaceNameResolveUnavailable,
-            .netInterfaceName = netInterfaceNameUnavailable,
-            .netLookup = netLookupUnavailable,
+            .netShutdown = netShutdown,
+            .netInterfaceNameResolve = netInterfaceNameResolve,
+            .netInterfaceName = netInterfaceName,
+            .netLookup = netLookup,
         },
     };
 }
@@ -1710,10 +1711,21 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             },
         },
         .device_io_control => |*o| return .{ .device_io_control = try deviceIoControl(o) },
-        .net_receive => @panic("TODO implement net_receive operation"),
-        .net_send => @panic("TODO implement net_send operation"),
-        .net_read => @panic("TODO implement net_read operation"),
-        .net_write => @panic("TODO implement net_write operation"),
+        .net_receive => |*o| return .{
+            .net_receive = r: {
+                const opt_err, const count = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                if (opt_err) |err| break :r .{ err, count } else break :r .{ null, count };
+            },
+        },
+        .net_send => |o| return .{
+            .net_send = ev.netSend(o.socket_handle, o.messages, o.flags),
+        },
+        .net_read => |o| return .{
+            .net_read = ev.netRead(o.socket_handle, o.data),
+        },
+        .net_write => |o| return .{
+            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat),
+        },
     }
 }
 
@@ -2022,6 +2034,25 @@ const BatchOperationUserdata = extern struct {
                 return operation.data_ptr[0..operation.data_len];
             }
         },
+        net_read: extern struct {
+            data_ptr: [*][]u8,
+            data_len: usize,
+        },
+        net_write: extern struct {
+            header_ptr: [*]const u8,
+            header_len: usize,
+            data_ptr: [*]const []const u8,
+            data_len: usize,
+            splat: usize,
+
+            fn header(operation: *const @This()) []const u8 {
+                return operation.header_ptr[0..operation.header_len];
+            }
+
+            fn data(operation: *const @This()) []const []const u8 {
+                return operation.data_ptr[0..operation.data_len];
+            }
+        },
     },
 
     const Erased = Io.Operation.Storage.Pending.Userdata;
@@ -2136,8 +2167,74 @@ fn batchDrainSubmitted(
                 .device_io_control => {},
                 .net_receive => @panic("TODO implement batched net_receive"),
                 .net_send => @panic("TODO implement batched net_send"),
-                .net_read => @panic("TODO implement batched net_read"),
-                .net_write => @panic("TODO implement batched net_write"),
+                .net_read => |operation| {
+                    const data = for (operation.data, 0..) |buffer, data_index| {
+                        if (buffer.len > 0) break operation.data[data_index..];
+                    } else break :result .{ .net_read = 0 };
+                    const source = c.dispatch.source_create(
+                        .READ,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_read = error.SystemResources };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_read,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_read = .{
+                            .data_ptr = data.ptr,
+                            .data_len = data.len,
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
+                .net_write => |operation| {
+                    const data = for (operation.data, 0..) |buffer, data_index| {
+                        if (buffer.len > 0) break operation.data[data_index..];
+                    } else if (operation.header.len > 0)
+                        operation.data[0..1]
+                    else
+                        break :result .{ .net_write = 0 };
+                    const source = c.dispatch.source_create(
+                        .WRITE,
+                        @bitCast(@as(isize, operation.socket_handle)),
+                        .none,
+                        queue,
+                    ) orelse break :result .{ .net_write = error.SystemResources };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_write,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .source = source,
+                        .operation = .{ .net_write = .{
+                            .header_ptr = operation.header.ptr,
+                            .header_len = operation.header.len,
+                            .data_ptr = data.ptr,
+                            .data_len = data.len,
+                            .splat = operation.splat,
+                        } },
+                    };
+                    source.as_object().set_context(storage);
+                    source.set_event_handler(&batchSourceEvent);
+                    source.set_cancel_handler(&batchSourceCancel);
+                    source.as_object().activate();
+                    break :result null;
+                },
             };
             if (concurrency) return error.ConcurrencyUnavailable;
             break :result try operate(ev, storage.submission.operation);
@@ -2198,8 +2295,28 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
         .device_io_control => unreachable,
         .net_receive => @panic("TODO implement batched net_receive"),
         .net_send => @panic("TODO implement batched net_send"),
-        .net_read => @panic("TODO implement batched net_read"),
-        .net_write => @panic("TODO implement batched net_write"),
+        .net_read => {
+            const operation = &operation_userdata.operation.net_read;
+            break :result .{ .net_read = netReadOnce(
+                @intCast(source.get_handle()),
+                operation.data_ptr[0..operation.data_len],
+            ) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| e,
+            } };
+        },
+        .net_write => {
+            const operation = &operation_userdata.operation.net_write;
+            break :result .{ .net_write = netWriteOnce(
+                @intCast(source.get_handle()),
+                operation.header_ptr[0..operation.header_len],
+                operation.data_ptr[0..operation.data_len],
+                operation.splat,
+            ) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| e,
+            } };
+        },
     };
 
     switch (pending.node.prev) {
@@ -4791,98 +4908,219 @@ fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
     if (buffer.len > 0) c.arc4random_buf(buffer.ptr, buffer.len);
 }
 
-fn netListenIpUnavailable(
+fn netListenIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = Io.Threaded.posixAddressFamily(address);
+    const socket_fd = try openSocket(family, options.mode, options.protocol);
+    errdefer closeFd(socket_fd);
+
+    if (options.reuse_address) {
+        try setSocketOption(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+        if (@hasDecl(posix.SO, "REUSEPORT"))
+            try setSocketOption(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
+
+    var storage: Io.Threaded.PosixAddress = undefined;
+    var addr_len = Io.Threaded.addressToPosix(address, &storage);
+    try posixBind(socket_fd, &storage.any, addr_len);
+    try posixListen(socket_fd, options.kernel_backlog);
+    try posixGetSockName(socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
 
-fn netAcceptUnavailable(
+fn netAccept(
     userdata: ?*anyopaque,
     listen_handle: net.Socket.Handle,
     options: net.Server.AcceptOptions,
 ) net.Server.AcceptError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = listen_handle;
     _ = options;
-    return error.NetworkDown;
+    while (true) {
+        var storage: Io.Threaded.PosixAddress = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(Io.Threaded.PosixAddress);
+        const rc = c.accept(listen_handle, &storage.any, &addr_len);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                const socket_fd: c.fd_t = @intCast(rc);
+                errdefer closeFd(socket_fd);
+                try setSocketFlags(socket_fd);
+                return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
+            },
+            .INTR => continue,
+            .AGAIN => try waitReady(ev, listen_handle, .READ),
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .CONNABORTED => return error.ConnectionAborted,
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => return error.SocketNotListening,
+            .NOTSOCK => |err| return errnoBug(err),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .OPNOTSUPP => |err| return errnoBug(err),
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
-fn netBindIpUnavailable(
+fn netBindIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = Io.Threaded.posixAddressFamily(address);
+    const socket_fd = try openSocket(family, options.mode, options.protocol);
+    errdefer closeFd(socket_fd);
+    if (options.ip6_only) |ip6_only| {
+        if (posix.IPV6 == void) return error.OptionUnsupported;
+        try setSocketOption(socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @intFromBool(ip6_only));
+    }
+    var storage: Io.Threaded.PosixAddress = undefined;
+    var addr_len = Io.Threaded.addressToPosix(address, &storage);
+    try posixBind(socket_fd, &storage.any, addr_len);
+    if (options.allow_broadcast)
+        try setSocketOption(socket_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, 1);
+    try posixGetSockName(socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
 
-fn netConnectIpUnavailable(
+fn netConnectIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
+    if (options.timeout != .none) return error.OptionUnsupported; // TODO timer race
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    const family = Io.Threaded.posixAddressFamily(address);
+    const socket_fd = try openSocket(family, options.mode, options.protocol);
+    errdefer closeFd(socket_fd);
+    var storage: Io.Threaded.PosixAddress = undefined;
+    var addr_len = Io.Threaded.addressToPosix(address, &storage);
+    try posixConnect(ev, socket_fd, &storage.any, addr_len);
+    try posixGetSockName(socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
 
-fn netListenUnixUnavailable(
+fn netListenUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
-    _ = address;
-    _ = options;
-    return error.AddressFamilyUnsupported;
+    const socket_fd = openSocket(posix.AF.UNIX, .stream, null) catch |err| switch (err) {
+        error.ProtocolUnsupportedBySystem,
+        error.ProtocolUnsupportedByAddressFamily,
+        error.SocketModeUnsupported,
+        => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer closeFd(socket_fd);
+
+    var storage: Io.Threaded.UnixAddress = undefined;
+    const addr_len = Io.Threaded.addressUnixToPosix(address, &storage);
+    try posixBindUnix(socket_fd, &storage.any, addr_len);
+    try posixListen(socket_fd, options.kernel_backlog);
+    return socket_fd;
 }
 
-fn netConnectUnixUnavailable(
+fn netConnectUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    return error.AddressFamilyUnsupported;
+    const socket_fd = openSocket(posix.AF.UNIX, .stream, null) catch |err| switch (err) {
+        error.ProtocolUnsupportedByAddressFamily,
+        error.SocketModeUnsupported,
+        => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer closeFd(socket_fd);
+    var storage: Io.Threaded.UnixAddress = undefined;
+    const addr_len = Io.Threaded.addressUnixToPosix(address, &storage);
+    posixConnect(ev, socket_fd, &storage.any, addr_len) catch |err| switch (err) {
+        error.AddressUnavailable,
+        error.ConnectionPending,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.Timeout,
+        => return error.Unexpected, // only possible for IP sockets
+        else => |e| return e,
+    };
+    return socket_fd;
 }
 
-fn netSocketCreatePairUnavailable(
+fn netSocketCreatePair(
     userdata: ?*anyopaque,
     options: net.Socket.CreatePairOptions,
 ) net.Socket.CreatePairError![2]net.Socket {
-    _ = userdata;
-    _ = options;
-    return error.OperationUnsupported;
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    _ = ev;
+    const family: posix.sa_family_t = switch (options.family) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const sock_mode, const sock_protocol = Io.Threaded.posixSocketModeProtocol(
+        family,
+        options.mode,
+        options.protocol,
+    ) catch return error.SocketModeUnsupported;
+
+    var sockets: [2]c.fd_t = undefined;
+    while (true) switch (c.errno(c.socketpair(family, @intCast(sock_mode), @intCast(sock_protocol), &sockets))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ACCES => return error.AccessDenied,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .INVAL => return error.ProtocolUnsupportedBySystem,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS => return error.SystemResources,
+        .NOMEM => return error.SystemResources,
+        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+        .PROTOTYPE => return error.SocketModeUnsupported,
+        else => |err| return unexpectedErrno(err),
+    };
+    errdefer {
+        closeFd(sockets[0]);
+        closeFd(sockets[1]);
+    }
+    for (&sockets) |*socket_fd| try setSocketFlags(socket_fd.*);
+    var storages: [2]Io.Threaded.PosixAddress = undefined;
+    var addr_lens: [2]posix.socklen_t = .{ @sizeOf(Io.Threaded.PosixAddress), @sizeOf(Io.Threaded.PosixAddress) };
+    try posixGetSockName(sockets[0], &storages[0].any, &addr_lens[0]);
+    try posixGetSockName(sockets[1], &storages[1].any, &addr_lens[1]);
+    return .{
+        .{ .handle = sockets[0], .address = Io.Threaded.addressFromPosix(&storages[0]) },
+        .{ .handle = sockets[1], .address = Io.Threaded.addressFromPosix(&storages[1]) },
+    };
 }
 
-fn netWriteFileUnavailable(
+fn netWriteFile(
     userdata: ?*anyopaque,
     socket_handle: net.Socket.Handle,
     header: []const u8,
     file_reader: *File.Reader,
     limit: Io.Limit,
 ) net.Stream.Writer.WriteFileError!usize {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
+    _ = userdata;
     _ = socket_handle;
     _ = header;
     _ = file_reader;
     _ = limit;
+    // TODO implement netWriteFile
     return error.Unimplemented;
 }
 
@@ -4892,49 +5130,718 @@ fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     for (sockets) |socket| closeFd(socket.handle);
 }
 
-fn netShutdownUnavailable(
+fn netShutdown(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
-    _ = handle;
-    _ = how;
-    unreachable; // How you gonna shutdown something that was impossible to open?
+    const posix_how: i32 = switch (how) {
+        .recv => posix.SHUT.RD,
+        .send => posix.SHUT.WR,
+        .both => posix.SHUT.RDWR,
+    };
+    while (true) {
+        switch (c.errno(c.shutdown(handle, posix_how))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
+            .NOTCONN => return error.SocketUnconnected,
+            .NOBUFS => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
-fn netInterfaceNameResolveUnavailable(
+fn netInterfaceNameResolve(
     userdata: ?*anyopaque,
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
-    _ = name;
-    return error.InterfaceNotFound;
+    const index = c.if_nametoindex(&name.bytes);
+    if (index == 0) return error.InterfaceNotFound;
+    return .{ .index = @bitCast(index) };
 }
 
-fn netInterfaceNameUnavailable(
+fn netInterfaceName(
     userdata: ?*anyopaque,
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     _ = interface;
+    // TODO implement via sysctl(NET_RT_IFLIST); the SDK textstub does not
+    // export `if_indextoname` for arm64-macos, so the libc route is not
+    // linkable with zig's linker.
     return error.Unexpected;
 }
 
-fn netLookupUnavailable(
+fn netLookup(
     userdata: ?*anyopaque,
     host_name: net.HostName,
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = host_name;
-    _ = options;
-    resolved.close(ev.io());
-    return error.NetworkDown;
+    defer resolved.close(ev.io());
+    netLookupFallible(ev, host_name, resolved, options) catch |err| switch (err) {
+        error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
+        else => |e| return e,
+    };
+}
+
+fn netLookupFallible(
+    ev: *Evented,
+    host_name: net.HostName,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    const ev_io = ev.io();
+    const name = host_name.bytes;
+    assert(name.len <= net.HostName.max_len);
+
+    // Darwin lacks an asynchronous resolver API, so we are stuck with
+    // getaddrinfo.
+    var name_buffer: [net.HostName.max_len:0]u8 = undefined;
+    @memcpy(name_buffer[0..name.len], name);
+    name_buffer[name.len] = 0;
+    const name_c = name_buffer[0..name.len :0];
+
+    var port_buffer: [8]u8 = undefined;
+    const port_c = std.mem.printSentinel(&port_buffer, "{d}", .{options.port}, 0) catch unreachable;
+
+    const family: i32 = if (options.family) |f| switch (f) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    } else posix.AF.UNSPEC;
+
+    const hints: c.addrinfo = .{
+        .flags = .{ .CANONNAME = options.canonical_name_buffer != null, .NUMERICSERV = true },
+        .family = family,
+        .socktype = posix.SOCK.STREAM,
+        .protocol = posix.IPPROTO.TCP,
+        .canonname = null,
+        .addr = null,
+        .addrlen = 0,
+        .next = null,
+    };
+    var res: ?*c.addrinfo = null;
+    switch (c.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &res)) {
+        @as(c.EAI, @fromBackingInt(0)) => {},
+        .SYSTEM => switch (c.errno(-1)) {
+            .INTR => return netLookupFallible(ev, host_name, resolved, options),
+            else => |e| return unexpectedErrno(e),
+        },
+        .ADDRFAMILY => return error.AddressFamilyUnsupported,
+        .AGAIN => return error.NameServerFailure,
+        .FAIL => return error.NameServerFailure,
+        .FAMILY => return error.AddressFamilyUnsupported,
+        .MEMORY => return error.SystemResources,
+        .NODATA => return error.UnknownHostName,
+        .NONAME => return error.UnknownHostName,
+        else => return error.Unexpected,
+    }
+    defer if (res) |some| c.freeaddrinfo(some);
+
+    var it = res;
+    var canon_name: ?[*:0]const u8 = null;
+    while (it) |info| : (it = info.next) {
+        const addr = info.addr orelse continue;
+        try resolved.putOne(ev_io, .{
+            .address = Io.Threaded.addressFromPosix(@alignCast(@fieldParentPtr("any", addr))),
+        });
+        if (info.canonname) |n| {
+            if (canon_name == null) {
+                canon_name = n;
+            }
+        }
+    }
+    if (canon_name) |n| {
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, std.mem.sliceTo(n, 0))) |canon| {
+            try resolved.putOne(ev_io, .{ .canonical_name = canon });
+        }
+    }
+}
+
+const OpenSocketError = error{
+    AddressFamilyUnsupported,
+    ProtocolUnsupportedBySystem,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    ProtocolUnsupportedByAddressFamily,
+    SocketModeUnsupported,
+    OptionUnsupported,
+    Unexpected,
+};
+
+fn openSocket(
+    family: posix.sa_family_t,
+    mode: net.Socket.Mode,
+    protocol: ?net.Protocol,
+) OpenSocketError!c.fd_t {
+    const sock_mode, const sock_protocol =
+        try Io.Threaded.posixSocketModeProtocol(family, mode, protocol);
+    const socket_fd = while (true) {
+        // Darwin lacks SOCK_CLOEXEC and SOCK_NONBLOCK, so `setSocketFlags`
+        // applies both after creation.
+        const rc = c.socket(family, @intCast(sock_mode), @intCast(sock_protocol));
+        switch (c.errno(rc)) {
+            .SUCCESS => break @as(c.fd_t, @intCast(rc)),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    errdefer closeFd(socket_fd);
+    try setSocketFlags(socket_fd);
+    return socket_fd;
+}
+
+fn setSocketFlags(fd: c.fd_t) error{Unexpected}!void {
+    const o_nonblock: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
+    while (true) {
+        const flags = c.fcntl(fd, posix.F.GETFL);
+        switch (c.errno(flags)) {
+            .SUCCESS => {
+                if (flags & o_nonblock != 0) break;
+                switch (c.errno(c.fcntl(fd, posix.F.SETFL, @as(usize, @intCast(flags | o_nonblock))))) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => |err| return unexpectedErrno(err),
+                }
+            },
+            .INTR => continue,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+    while (true) {
+        switch (c.errno(c.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn setSocketOption(fd: c.fd_t, level: i32, opt_name: u32, option: u32) error{Unexpected}!void {
+    while (true) {
+        switch (c.errno(c.setsockopt(fd, level, opt_name, &option, @sizeOf(u32)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .NOTSOCK => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixBind(socket_fd: c.fd_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) error{
+    AccessDenied,
+    AddressInUse,
+    AddressFamilyUnsupported,
+    AddressUnavailable,
+    SystemResources,
+    Unexpected,
+}!void {
+    while (true) {
+        switch (c.errno(c.bind(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .INVAL => |err| return errnoBug(err), // invalid parameters
+            .NOTSOCK => |err| return errnoBug(err), // invalid `sockfd`
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .FAULT => |err| return errnoBug(err), // invalid `addr` pointer
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixBindUnix(socket_fd: c.fd_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) error{
+    AccessDenied,
+    AddressInUse,
+    AddressFamilyUnsupported,
+    AddressUnavailable,
+    SystemResources,
+    SymLinkLoop,
+    FileNotFound,
+    NotDir,
+    ReadOnlyFileSystem,
+    PermissionDenied,
+    Unexpected,
+}!void {
+    while (true) {
+        switch (c.errno(c.bind(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .NOMEM => return error.SystemResources,
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .PERM => return error.PermissionDenied,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .INVAL => |err| return errnoBug(err), // invalid parameters
+            .NOTSOCK => |err| return errnoBug(err), // invalid `sockfd`
+            .FAULT => |err| return errnoBug(err), // invalid `addr` pointer
+            .NAMETOOLONG => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixListen(socket_fd: c.fd_t, backlog: u31) error{AddressInUse, Unexpected}!void {
+    while (true) {
+        switch (c.errno(c.listen(socket_fd, backlog))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn posixConnect(
+    ev: *Evented,
+    socket_fd: c.fd_t,
+    addr: *const posix.sockaddr,
+    addr_len: posix.socklen_t,
+) ConnectError!void {
+    while (true) {
+        switch (c.errno(c.connect(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            // The socket is nonblocking; the outcome is determined once the
+            // socket becomes writable.
+            .AGAIN, .INPROGRESS => return connectFinish(ev, socket_fd),
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ALREADY => return error.ConnectionPending,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .TIMEDOUT => return error.Timeout,
+            .ACCES => return error.AccessDenied,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .CONNABORTED => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOENT => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .PERM => |err| return errnoBug(err),
+            .PROTOTYPE => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+
+
+const ConnectError = error{
+    AccessDenied,
+    AddressFamilyUnsupported,
+    AddressUnavailable,
+    ConnectionPending,
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    HostUnreachable,
+    NetworkDown,
+    NetworkUnreachable,
+    SystemResources,
+    Timeout,
+    Unexpected,
+};
+
+fn connectFinish(ev: *Evented, socket_fd: c.fd_t) ConnectError!void {
+    try waitReady(ev, socket_fd, .WRITE);
+    var value: c_int = undefined;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    switch (c.errno(c.getsockopt(socket_fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len))) {
+        .SUCCESS => {},
+        .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+        .NOTSOCK => |err| return errnoBug(err),
+        .INVAL => |err| return errnoBug(err),
+        .FAULT => |err| return errnoBug(err),
+        else => |err| return unexpectedErrno(err),
+    }
+    return switch (c.errno(value)) {
+        .SUCCESS => {},
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NETDOWN => error.NetworkDown,
+        .TIMEDOUT => error.Timeout,
+        .ACCES => error.AccessDenied,
+        .PERM => error.AccessDenied,
+        else => |err| unexpectedErrno(err),
+    };
+}
+
+fn posixGetSockName(socket_fd: c.fd_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) error{SystemResources, Unexpected}!void {
+    while (true) {
+        switch (c.errno(c.getsockname(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err), // invalid parameters
+            .NOTSOCK => |err| return errnoBug(err), // always a race condition
+            .NOBUFS => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+/// Suspends the current fiber until `handle` is ready for reading (`.READ`) or
+/// writing (`.WRITE`), following the same dispatch source lifecycle as
+/// `fileReadStreaming`.
+///
+/// A spurious return is possible; callers must retry the operation and wait
+/// again on `error.WouldBlock`.
+fn waitReady(
+    ev: *Evented,
+    handle: c.fd_t,
+    source_type: c.dispatch.source_type_t,
+) error{SystemResources}!void {
+    const source = c.dispatch.source_create(
+        source_type,
+        @bitCast(@as(isize, handle)),
+        .none,
+        ev.queue,
+    ) orelse return error.SystemResources;
+    defer source.as_object().release();
+    source.as_object().set_context(Thread.current().currentFiber());
+    source.set_event_handler(&Fiber.@"resume");
+    ev.yield(.{ .activate = source.as_object() });
+    _ = source.get_data();
+}
+
+/// Performs one nonblocking `readv` attempt on a socket.
+fn netReadOnce(handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || error{WouldBlock})!usize {
+    var iovecs: [max_iovecs_len]iovec = undefined;
+    var iovlen: iovlen_t = 0;
+    var remaining: Io.Limit = .unlimited;
+    for (data) |buf| addBuf(false, &iovecs, &iovlen, &remaining, buf);
+    if (iovlen == 0) return 0;
+    while (true) {
+        const rc = c.readv(handle, &iovecs, iovlen);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .NOTCONN => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .PIPE => return error.SocketUnconnected,
+            .NETDOWN => return error.NetworkDown,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netRead(ev: *Evented, handle: c.fd_t, data: [][]u8) Io.Operation.NetRead.Error!usize {
+    while (true) return netReadOnce(handle, data) catch |err| switch (err) {
+        error.WouldBlock => {
+            try waitReady(ev, handle, .READ);
+            continue;
+        },
+        else => |e| return e,
+    };
+}
+
+/// Performs one nonblocking `sendmsg` attempt on a socket, transferring
+/// `header` followed by `data` and `splat`.
+fn netWriteOnce(
+    handle: c.fd_t,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) (Io.Operation.NetWrite.Error || error{WouldBlock})!usize {
+    var iovecs: [max_iovecs_len]iovec_const = undefined;
+    var iovlen: iovlen_t = 0;
+    var remaining: Io.Limit = .unlimited;
+    addBuf(true, &iovecs, &iovlen, &remaining, header);
+    for (data[0 .. data.len - 1]) |bytes| addBuf(true, &iovecs, &iovlen, &remaining, bytes);
+    const pattern = data[data.len - 1];
+    var backup_buffer: [splat_buffer_size]u8 = undefined;
+    if (iovecs.len - iovlen != 0 and remaining != .nothing) switch (splat) {
+        0 => {},
+        1 => addBuf(true, &iovecs, &iovlen, &remaining, pattern),
+        else => switch (pattern.len) {
+            0 => {},
+            1 => {
+                const splat_buffer = &backup_buffer;
+                const memset_len = @min(splat_buffer.len, splat);
+                const buf = splat_buffer[0..memset_len];
+                @memset(buf, pattern[0]);
+                addBuf(true, &iovecs, &iovlen, &remaining, buf);
+                var remaining_splat = splat - buf.len;
+                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0 and remaining != .nothing) {
+                    assert(buf.len == splat_buffer.len);
+                    addBuf(true, &iovecs, &iovlen, &remaining, splat_buffer);
+                    remaining_splat -= splat_buffer.len;
+                }
+                addBuf(true, &iovecs, &iovlen, &remaining, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
+            },
+            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
+                if (remaining == .nothing) break;
+                addBuf(true, &iovecs, &iovlen, &remaining, pattern);
+            },
+        },
+    };
+    if (iovlen == 0) return 0;
+    const msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iovecs,
+        .iovlen = @intCast(iovlen),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    while (true) {
+        const rc = c.sendmsg(handle, &msg, posix.MSG.NOSIGNAL);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .ALREADY => return error.FastOpenAlreadyInProgress,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PIPE => return error.SocketUnconnected,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOTCONN => return error.SocketUnconnected,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
+            .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
+            .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+            .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
+            .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
+            .OPNOTSUPP => |err| return errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netWrite(
+    ev: *Evented,
+    handle: c.fd_t,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) Io.Operation.NetWrite.Error!usize {
+    while (true) return netWriteOnce(handle, header, data, splat) catch |err| switch (err) {
+        error.WouldBlock => {
+            try waitReady(ev, handle, .WRITE);
+            continue;
+        },
+        else => |e| return e,
+    };
+}
+
+/// Performs one nonblocking `sendmsg` attempt, transferring a single message
+/// to its destination address. On success, `message.data_len` is updated with
+/// the number of bytes transferred.
+fn netSendOne(
+    handle: c.fd_t,
+    message: *net.OutgoingMessage,
+    flags: u32,
+) (Io.Operation.NetSend.Error || error{WouldBlock})!void {
+    var addr: Io.Threaded.PosixAddress = undefined;
+    var iov: iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
+    const msg: posix.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = Io.Threaded.addressToPosix(message.address, &addr),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        // OS returns EINVAL if this pointer is invalid even if controllen is zero.
+        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    while (true) {
+        const rc = c.sendmsg(handle, &msg, flags);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                message.data_len = @intCast(rc);
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .ACCES => return error.AccessDenied,
+            .ALREADY => return error.FastOpenAlreadyInProgress,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .MSGSIZE => return error.MessageOversize,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PIPE => return error.SocketUnconnected,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .NOTCONN => return error.SocketUnconnected,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
+            .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
+            .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+            .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
+            .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
+            .OPNOTSUPP => |err| return errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netSend(
+    ev: *Evented,
+    handle: c.fd_t,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?Io.Operation.NetSend.Error, usize } {
+    const posix_flags: u32 =
+        @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm) posix.MSG.CONFIRM else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "DONTROUTE") and flags.dont_route) posix.MSG.DONTROUTE else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "EOR") and flags.eor) posix.MSG.EOR else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "OOB") and flags.oob) posix.MSG.OOB else 0) |
+        @as(u32, if (@hasDecl(posix.MSG, "FASTOPEN") and flags.fastopen) posix.MSG.FASTOPEN else 0) |
+        posix.MSG.NOSIGNAL;
+
+    for (messages, 0..) |*message, i| {
+        while (true) {
+            netSendOne(handle, message, posix_flags) catch |err| switch (err) {
+                error.WouldBlock => {
+                    waitReady(ev, handle, .WRITE) catch |e| return .{ e, i };
+                    continue;
+                },
+                else => |e| return .{ e, i },
+            };
+            break;
+        }
+    }
+    return .{ null, messages.len };
+}
+
+/// Performs one nonblocking `recvmsg` attempt, receiving a single message into
+/// `data_buffer` and populating `message`.
+fn netReceiveOnce(
+    handle: c.fd_t,
+    message: *net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) (Io.Operation.NetReceive.Error || error{WouldBlock})!void {
+    const posix_flags: u32 =
+        @as(u32, if (flags.oob) posix.MSG.OOB else 0) |
+        @as(u32, if (flags.peek) posix.MSG.PEEK else 0) |
+        @as(u32, if (flags.trunc) posix.MSG.TRUNC else 0) |
+        posix.MSG.NOSIGNAL;
+
+    var storage: Io.Threaded.PosixAddress = undefined;
+    var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+    var msg: posix.msghdr = .{
+        .name = &storage.any,
+        .namelen = @sizeOf(Io.Threaded.PosixAddress),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        .control = message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = undefined,
+    };
+    while (true) {
+        const rc = c.recvmsg(handle, &msg, posix_flags);
+        switch (c.errno(rc)) {
+            .SUCCESS => {
+                const data = data_buffer[0..@intCast(rc)];
+                message.* = .{
+                    .from = Io.Threaded.addressFromPosix(&storage),
+                    .data = data,
+                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .flags = .{
+                        .eor = (msg.flags & posix.MSG.EOR) != 0,
+                        .trunc = (msg.flags & posix.MSG.TRUNC) != 0,
+                        .ctrunc = (msg.flags & posix.MSG.CTRUNC) != 0,
+                        .oob = (msg.flags & posix.MSG.OOB) != 0,
+                        .errqueue = if (@hasDecl(posix.MSG, "ERRQUEUE")) (msg.flags & posix.MSG.ERRQUEUE) != 0 else false,
+                    },
+                };
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .NOTCONN => return error.SocketUnconnected,
+            .MSGSIZE => return error.MessageOversize,
+            .PIPE => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .OPNOTSUPP => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netReceive(
+    ev: *Evented,
+    handle: c.fd_t,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) struct { ?Io.Operation.NetReceive.Error, usize } {
+    assert(message_buffer.len >= 1);
+    const message = &message_buffer[0];
+    while (true) {
+        netReceiveOnce(handle, message, data_buffer, flags) catch |err| switch (err) {
+            error.WouldBlock => {
+                waitReady(ev, handle, .READ) catch |e| return .{ e, 0 };
+                continue;
+            },
+            else => |e| return .{ e, 0 },
+        };
+        return .{ null, 1 };
+    }
 }
 
 fn readAll(ev: *Evented, file: File, buffer: []u8) File.ReadStreamingError!void {
