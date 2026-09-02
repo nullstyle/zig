@@ -5091,7 +5091,12 @@ fn netSocketCreatePair(
         .NOMEM => return error.SystemResources,
         .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
         .PROTOTYPE => return error.SocketModeUnsupported,
-        else => |err| return unexpectedErrno(err),
+        // XNU reports EOPNOTSUPP (102, unnamed in `std.c.darwin.E`) because it
+        // only supports AF_UNIX socketpairs.
+        else => |err| return if (@intFromEnum(err) == 102)
+            error.OperationUnsupported
+        else
+            unexpectedErrno(err),
     };
     errdefer {
         closeFd(sockets[0]);
