@@ -189,6 +189,19 @@ fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheE
         },
     };
 
+    // A Canonical Frame Address in the null page is never valid: on every
+    // implemented architecture the CFA is the previous frame's stack
+    // pointer, and the null page is unmapped. Such a value means the
+    // register the rule is keyed on holds the null frame-pointer sentinel
+    // that terminates a frame chain — reached when unwinding crosses a
+    // manually-initialized stack such as a fiber's entry trampoline, which
+    // has no unwind info of its own. Treating it as the end of the stack
+    // matches the frame-pointer walker's sentinel handling.
+    if (isNullPageAddress(cfa)) {
+        try endOfStack(&unwinder.cpu_state);
+        return 0;
+    }
+
     // Create a copy of the CPU state, to which we will apply the new rules.
     var new_cpu_state = unwinder.cpu_state;
 
@@ -219,7 +232,12 @@ fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheE
             .undefined => .undefined,
             .same_value => .same,
             .offset => |offset| val: {
-                const ptr: *const std.debug.cpu_context.Native.Gpr = @ptrFromInt(try applyOffset(cfa, offset));
+                const addr = try applyOffset(cfa, offset);
+                if (isNullPageAddress(addr)) {
+                    try endOfStack(&unwinder.cpu_state);
+                    return 0;
+                }
+                const ptr: *const std.debug.cpu_context.Native.Gpr = @ptrFromInt(addr);
                 break :val .{ .val = ptr.* };
             },
             .val_offset => |offset| .{ .val = try applyOffset(cfa, offset) },
@@ -231,7 +249,13 @@ fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheE
                     .cpu_context = &unwinder.cpu_state,
                 }, cfa) orelse return error.InvalidDebugInfo;
                 const ptr: *const usize = switch (value) {
-                    .generic => |addr| @ptrFromInt(addr),
+                    .generic => |addr| addr: {
+                        if (isNullPageAddress(addr)) {
+                            try endOfStack(&unwinder.cpu_state);
+                            return 0;
+                        }
+                        break :addr @ptrFromInt(addr);
+                    },
                     else => return error.InvalidDebugInfo,
                 };
                 break :val .{ .val = ptr.* };
@@ -307,6 +331,20 @@ pub fn regNative(ctx: *std.debug.cpu_context.Native, num: u16) error{
 /// Since register rules are applied (usually) during a panic,
 /// checked addition / subtraction is used so that we can return
 /// an error and fall back to FP-based unwinding.
+/// The null page is unmapped on every supported platform, so no legitimate
+/// stack value or unwind address can fall inside it.
+fn isNullPageAddress(addr: usize) bool {
+    return addr < std.heap.page_size_min;
+}
+
+/// Terminates the walk: clears the program counter so the caller observes
+/// a null return address, exactly like a rule marking the return address
+/// `.undefined`.
+fn endOfStack(cpu_state: *std.debug.cpu_context.Native) !void {
+    const ip = try regNative(cpu_state, ip_reg_num);
+    ip.* = 0;
+}
+
 fn applyOffset(base: usize, offset: i64) !usize {
     return if (offset >= 0)
         try std.math.add(usize, base, @as(usize, @intCast(offset)))
