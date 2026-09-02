@@ -562,7 +562,13 @@ pub fn operateTimeout(io: Io, operation: Operation, timeout: Timeout) OperateTim
     var storage: [1]Operation.Storage = undefined;
     var batch: Batch = .init(&storage);
     batch.addAt(0, operation);
-    try batch.awaitConcurrent(io, timeout);
+    batch.awaitConcurrent(io, timeout) catch |err| {
+        // `storage` is about to go out of scope; the implementation may still
+        // hold references to it for the pending operation (a readiness source
+        // pointing at the storage, for instance), so tear it down first.
+        batch.cancel(io);
+        return err;
+    };
     const completion = batch.next().?;
     assert(completion.index == 0);
     return completion.result;
