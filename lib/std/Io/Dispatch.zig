@@ -629,6 +629,9 @@ const SwitchMessage = struct {
 
     const PendingTask = union(enum) {
         nothing,
+        /// A task fiber has run to completion; publish `finished` now that the
+        /// fiber is parked, so an awaiter observing `finished` may destroy it.
+        finished: *Fiber,
         await: *Fiber,
         activate: c.dispatch.object_t,
         @"resume": c.dispatch.object_t,
@@ -648,6 +651,10 @@ const SwitchMessage = struct {
         thread.current_context = message.contexts.new;
         switch (message.pending_task) {
             .nothing => {},
+            .finished => |fiber| {
+                if (@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel)) |awaiter|
+                    ev.queue.async(awaiter, &Fiber.@"resume");
+            },
             .await => |awaiting| {
                 const awaiter: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 if (@atomicRmw(?*Fiber, &awaiting.link.awaiter, .Xchg, awaiter, .acq_rel) ==
@@ -1025,9 +1032,11 @@ const AsyncClosure = struct {
         const fiber = closure.fiber;
         message.handle(ev);
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        if (@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel)) |awaiter|
-            ev.queue.async(awaiter, &Fiber.@"resume");
-        ev.yield(.nothing);
+        // `finished` must only become visible once this fiber is fully
+        // parked: `await` destroys the fiber after observing it, and the
+        // queue is concurrent, so an awaiter on another worker could
+        // otherwise free this stack while `call` is still executing.
+        ev.yield(.{ .finished = fiber });
         unreachable; // switched to dead fiber
     }
 };
