@@ -93,6 +93,27 @@ fn testUnixEcho(io: Io) !void {
     _ = std.posix.system.unlink(sock_path);
 }
 
+fn testConnectRefused(io: Io) !void {
+    // Bind then close a listener so that connecting to the ephemeral port is
+    // refused; the nonblocking connect must surface ECONNREFUSED through
+    // SO_ERROR once the socket becomes writable.
+    const listen_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try Io.net.IpAddress.listen(&listen_address, io, .{});
+    const address = server.socket.address;
+    server.deinit(io);
+    var attempts: usize = 0;
+    while (attempts < 10) : (attempts += 1) {
+        if (Io.net.IpAddress.connect(&address, io, .{ .mode = .stream })) |stream| {
+            stream.close(io);
+            continue;
+        } else |err| switch (err) {
+            error.ConnectionRefused => return,
+            else => return err,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn testUdpDatagram(io: Io) !void {
     const bind_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var receiver = try Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram });
@@ -139,6 +160,7 @@ pub fn main() !void {
     const io = evented.io();
     try testTcpEcho(io);
     try testUnixEcho(io);
+    try testConnectRefused(io);
     try testUdpDatagram(io);
     try testInterfaceResolve(io);
     try testHostLookup(io);

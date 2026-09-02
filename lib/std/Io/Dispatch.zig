@@ -5550,7 +5550,7 @@ fn connectFinish(ev: *Evented, socket_fd: c.fd_t) ConnectError!void {
         .FAULT => |err| return errnoBug(err),
         else => |err| return unexpectedErrno(err),
     }
-    return switch (c.errno(value)) {
+    return switch (@as(c.E, @fromBackingInt(@intCast(@as(u16, @truncate(@as(u32, @bitCast(value)))))))) {
         .SUCCESS => {},
         .ADDRNOTAVAIL => error.AddressUnavailable,
         .CONNREFUSED => error.ConnectionRefused,
