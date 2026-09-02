@@ -5153,7 +5153,7 @@ fn netSocketCreatePair(
         .PROTOTYPE => return error.SocketModeUnsupported,
         // XNU reports EOPNOTSUPP (102, unnamed in `std.c.darwin.E`) because it
         // only supports AF_UNIX socketpairs.
-        else => |err| return if (@intFromEnum(err) == 102)
+        else => |err| return if (@backingInt(err) == 102)
             error.OperationUnsupported
         else
             unexpectedErrno(err),
@@ -5475,7 +5475,7 @@ fn posixBindUnix(socket_fd: c.fd_t, addr: *const posix.sockaddr, addr_len: posix
     }
 }
 
-fn posixListen(socket_fd: c.fd_t, backlog: u31) error{AddressInUse, Unexpected}!void {
+fn posixListen(socket_fd: c.fd_t, backlog: u31) error{ AddressInUse, Unexpected }!void {
     while (true) {
         switch (c.errno(c.listen(socket_fd, backlog))) {
             .SUCCESS => return,
@@ -5523,8 +5523,6 @@ fn posixConnect(
     }
 }
 
-
-
 const ConnectError = error{
     AccessDenied,
     AddressFamilyUnsupported,
@@ -5567,7 +5565,7 @@ fn connectFinish(ev: *Evented, socket_fd: c.fd_t) ConnectError!void {
     };
 }
 
-fn posixGetSockName(socket_fd: c.fd_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) error{SystemResources, Unexpected}!void {
+fn posixGetSockName(socket_fd: c.fd_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) error{ SystemResources, Unexpected }!void {
     while (true) {
         switch (c.errno(c.getsockname(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
