@@ -12482,6 +12482,10 @@ fn netBindIpPosix(
     const family = posixAddressFamily(address);
     const socket_fd = try openSocketPosix(family, options);
     errdefer closeFd(socket_fd);
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOptionPosix(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try posixBind(socket_fd, &storage.any, addr_len);
@@ -12498,6 +12502,10 @@ fn netBindIpWindows(
     if (!have_networking) return error.NetworkDown;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
+    // Windows has no SO_REUSEPORT. SO_REUSEADDR is not a substitute for a
+    // datagram socket: it allows the shared bind but promises nothing about
+    // which socket receives.
+    if (options.reuse_port) return error.OptionUnsupported;
     const family = posixAddressFamily(address);
     const socket_handle = try openSocketAfd(family, options);
     errdefer windows.CloseHandle(socket_handle);
