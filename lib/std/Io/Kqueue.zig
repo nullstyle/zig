@@ -27,7 +27,7 @@ threads: Thread.List,
 /// into use-after-free. A pooled fiber's waiter is reinitialized on reuse,
 /// so a late event at worst causes a spurious wake the waiter's state
 /// machine absorbs.
-fiber_pool: ?*Fiber,
+fiber_pool: std.atomic.Value(?*Fiber),
 
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 const idle_stack_size = 256 * 1024;
@@ -113,8 +113,13 @@ const Fiber = struct {
     );
 
     fn allocate(k: *Kqueue) error{OutOfMemory}!*Fiber {
-        if (k.fiber_pool) |fiber| {
-            k.fiber_pool = fiber.queue_next;
+        var head = k.fiber_pool.load(.acquire);
+        while (head) |fiber| {
+            const next = fiber.queue_next;
+            if (k.fiber_pool.cmpxchgWeak(head, next, .acquire, .acquire)) |actual| {
+                head = actual;
+                continue;
+            }
             fiber.queue_next = null;
             return fiber;
         }
@@ -169,8 +174,14 @@ const Fiber = struct {
 fn recycle(k: *Kqueue, fiber: *Fiber) void {
     std.log.debug("recyling {*}", .{fiber});
     assert(fiber.queue_next == null);
-    fiber.queue_next = k.fiber_pool;
-    k.fiber_pool = fiber;
+    // The `.recycle` switch task runs on the destination thread, so the
+    // pool is a lock-free stack.
+    var head = k.fiber_pool.load(.monotonic);
+    while (true) {
+        fiber.queue_next = head;
+        if (k.fiber_pool.cmpxchgWeak(head, fiber, .release, .monotonic) == null) return;
+        head = k.fiber_pool.load(.monotonic);
+    }
 }
 
 pub const InitOptions = struct {
@@ -191,7 +202,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .gpa = gpa,
         .mutex = .init,
         .main_fiber_buffer = undefined,
-        .fiber_pool = null,
+        .fiber_pool = .init(null),
         .threads = .{
             .allocated = @ptrCast(allocated_slice[0..threads_size]),
             .reserved = 1,
@@ -254,8 +265,8 @@ pub fn deinit(k: *Kqueue) void {
     for (k.threads.allocated[0..active_threads], join_handles) |*thread, *handle| handle.* = thread.thread;
     k.yield(null, .exit);
     const main_thread = &k.threads.allocated[0];
-    while (k.fiber_pool) |fiber| {
-        k.fiber_pool = fiber.queue_next;
+    while (k.fiber_pool.load(.acquire)) |fiber| {
+        k.fiber_pool.store(fiber.queue_next, .monotonic);
         gpa.free(fiber.allocatedSlice());
     }
     main_thread.deinit(gpa);
@@ -464,6 +475,24 @@ fn threadEntry(k: *Kqueue, index: u32) void {
     thread.deinit(k.gpa);
 }
 
+/// Backend state for an `Io.Group`. The awaiter owns this memory: member
+/// fibers only read it, and the last one swaps the `finished` sentinel
+/// into `awaiter` (the same handshake `Future.await` uses), so a group
+/// await that is registering concurrently either finds the sentinel in
+/// its own switch task or is woken by the exiting member. `await`
+/// destroys the state after it is woken; `cancel` runs the same path.
+///
+/// There is no per-fiber cancellation on this backend yet, so `cancel`
+/// waits for the members to run to completion, like the Evented network
+/// waits elsewhere (no cancellation points).
+const GroupState = struct {
+    token: *Io.Group,
+    members: std.atomic.Value(usize),
+    awaiter: ?*Fiber,
+
+    const finished: ?*Fiber = Fiber.finished;
+};
+
 /// Tag bit in kevent `udata` distinguishing a batch waiter from a fiber
 /// pointer (both at least 4-aligned).
 const batch_userdata_tag: usize = 1;
@@ -661,6 +690,11 @@ const AsyncClosure = struct {
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     result_align: Alignment,
     already_awaited: bool,
+    /// When set, this fiber is an `Io.Group` member rather than a future:
+    /// `group_start` runs instead of `start`, and the group teardown runs
+    /// instead of the awaiter handshake.
+    group: ?*GroupState = null,
+    group_start: ?*const fn (context: *const anyopaque) void = null,
 
     fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
         return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
@@ -670,6 +704,10 @@ const AsyncClosure = struct {
         message.handle(closure.kqueue);
         const fiber = closure.fiber;
         std.log.debug("{*} performing async", .{fiber});
+        if (closure.group) |state| {
+            closure.group_start.?(closure.contextPointer());
+            return groupFinish(closure.kqueue, fiber, state);
+        }
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
         const awaiter = @atomicRmw(?*Fiber, &fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
         const ready_awaiter = r: {
@@ -908,13 +946,9 @@ fn groupAsync(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
+    groupConcurrent(userdata, type_erased, context, context_alignment, start) catch {
+        start(context.ptr);
+    };
 }
 
 fn groupConcurrent(
@@ -924,29 +958,90 @@ fn groupConcurrent(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
+    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
+    assert(context.len <= Fiber.max_context_size); // TODO
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
+    const state: *GroupState = s: {
+        if (type_erased.token.load(.acquire)) |token| break :s @ptrCast(@alignCast(token));
+        const created = k.gpa.create(GroupState) catch return error.ConcurrencyUnavailable;
+        created.* = .{ .token = type_erased, .members = .init(0), .awaiter = null };
+        if (type_erased.token.cmpxchgStrong(null, created, .acq_rel, .acquire)) |existing| {
+            k.gpa.destroy(created);
+            break :s @ptrCast(@alignCast(existing));
+        }
+        break :s created;
+    };
+    _ = state.members.fetchAdd(1, .monotonic);
+    errdefer _ = state.members.fetchSub(1, .monotonic);
+    const fiber = Fiber.allocate(k) catch return error.ConcurrencyUnavailable;
+    const closure: *AsyncClosure = .fromFiber(fiber);
+    fiber.* = .{
+        .required_align = {},
+        .context = switch (builtin.cpu.arch) {
+            .x86_64 => .{
+                .rsp = @intFromPtr(closure) - @sizeOf(usize),
+                .rbp = 0,
+                .rip = @intFromPtr(&fiberEntry),
+            },
+            .aarch64 => .{
+                .sp = @intFromPtr(closure),
+                .fp = 0,
+                .pc = @intFromPtr(&fiberEntry),
+            },
+            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+        },
+        .awaiter = null,
+        .queue_next = null,
+        .cancel_thread = null,
+        .awaiting_completions = .empty,
+        .batch_waiter = .{ .fiber = undefined, .state = .init(.canceled) },
+    };
+    closure.* = .{
+        .kqueue = k,
+        .fiber = fiber,
+        .start = undefined,
+        .result_align = .@"1",
+        .already_awaited = false,
+        .group = state,
+        .group_start = start,
+    };
+    @memcpy(closure.contextPointer(), context);
+
+    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
+}
+
+/// The last act of a group member fiber: count itself out and, when it is
+/// the last member, hand the group's completion to the awaiting fiber (or
+/// leave the sentinel for an await that registers later). The fiber then
+/// recycles itself on the destination thread's switch task.
+fn groupFinish(k: *Kqueue, fiber: *Fiber, state: *GroupState) noreturn {
+    const old = state.members.fetchSub(1, .acq_rel);
+    if (old == 1) {
+        const parked = @atomicRmw(?*Fiber, &state.awaiter, .Xchg, GroupState.finished, .acq_rel);
+        if (parked) |awaiter| {
+            k.yield(awaiter, .{ .recycle = fiber });
+        }
+    }
+    k.yield(null, .{ .recycle = fiber });
+    unreachable; // switched to dead fiber
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = initial_token;
-    @panic("TODO");
+    const state: *GroupState = @ptrCast(@alignCast(initial_token));
+    // The register_awaiter switch task swaps this fiber into the slot, or
+    // finds `finished` (set by the last member) and schedules it directly;
+    // the exiting member that finds the fiber in the slot schedules it.
+    k.yield(null, .{ .register_awaiter = &state.awaiter });
+    type_erased.token.store(null, .release);
+    k.gpa.destroy(state);
 }
 
 fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = group;
-    _ = token;
-    @panic("TODO");
+    // No per-fiber cancellation on this backend yet: network waits are not
+    // cancellation points, so members run to completion (the same posture
+    // as the Dispatch backend's network operations). Cancel waits.
+    groupAwait(userdata, group, token) catch {};
 }
 
 fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
