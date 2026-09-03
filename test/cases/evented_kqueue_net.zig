@@ -127,6 +127,32 @@ fn testUdpPing(io: Io) !void {
     try expectEqualStrings("udp ping", incoming.data);
 }
 
+/// Group tasks run as fibers and are awaited; this mirrors the shape the
+/// bundled loops use (`runUdpServer` in a `Group.concurrent` task).
+fn testGroupTasks(io: Io) !void {
+    const Context = struct {
+        io: Io,
+        iterations: usize = 0,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                Io.sleep(self.io, .fromMilliseconds(1), .awake) catch {};
+                self.iterations += 1;
+            }
+        }
+    };
+    var a: Context = .{ .io = io };
+    var b: Context = .{ .io = io };
+    var group: Io.Group = .init;
+    try group.concurrent(io, Context.run, .{&a});
+    try group.concurrent(io, Context.run, .{&b});
+    try group.await(io);
+    if (a.iterations != 3 or b.iterations != 3) return error.TestUnexpectedResult;
+    // A group with no pending work awaits immediately.
+    var empty: Io.Group = .init;
+    try empty.await(io);
+}
+
 pub fn main() !void {
     var kqueue: Io.Kqueue = undefined;
     try Io.Kqueue.init(&kqueue, std.heap.page_allocator, .{});
@@ -134,6 +160,7 @@ pub fn main() !void {
     const io = kqueue.io();
     try testUdpPing(io);
     try testUdpBatch(io);
+    try testGroupTasks(io);
 }
 
 // run
