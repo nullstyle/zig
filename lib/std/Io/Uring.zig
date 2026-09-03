@@ -5231,6 +5231,7 @@ fn netBindIp(
     defer maybe_sync.deinit(ev);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, options);
     errdefer ev.closeAsync(socket_fd);
+    if (options.reuse_port) try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1);
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
