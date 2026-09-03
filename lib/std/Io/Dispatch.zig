@@ -56,6 +56,13 @@ use_sendfile: UseSendfile,
 use_fcopyfile: UseFcopyfile,
 leeway: u64,
 
+/// Cached per-socket libdispatch objects for the batched network operations,
+/// keyed by socket handle. Entries are created on the first batched network
+/// operation on a socket and destroyed when the socket closes, so a timed
+/// receive or send costs no queue, source or timer registration. Only fibers
+/// touch the map (submission, close), under the backing allocator's lock.
+net_entries: std.AutoHashMapUnmanaged(net.Socket.Handle, *NetEntry) = .empty,
+
 futexes: [1 << 8]Futex,
 
 init_stderr_writer: c.dispatch.once_t,
@@ -613,6 +620,11 @@ pub fn deinit(ev: *Evented) void {
         }) });
     }
     ev.yield(.exit);
+    var net_entry_iterator = ev.net_entries.iterator();
+    while (net_entry_iterator.next()) |net_entry| {
+        netEntryTeardown(net_entry.value_ptr.*);
+    }
+    ev.net_entries.deinit(ev.allocator());
     ev.csprng_mutex.deinit();
     if (ev.dev_null_file) |file| fileClose(ev, &.{file}) else |_| {}
     ev.stderr_mutex.deinit();
@@ -1995,6 +2007,282 @@ const BatchWaiter = struct {
     }
 };
 
+/// One cached set of libdispatch objects per network socket: the serial
+/// queue that serializes the socket's completions with the fiber waiting on
+/// them, one readiness source per direction, and one re-armable timer. A
+/// timed batched receive or send then costs no kernel object registration;
+/// only the first wait on a socket pays for source creation.
+///
+/// The entry queue carries exactly one suspension whenever a fiber runs
+/// (the base one from creation, or the one the first completing handler
+/// took), and runs only while the waiting fiber is parked (the fiber
+/// resumes it as it parks). Because the first event handler to run on an
+/// open queue suspends it again, at most one handler completes per open
+/// cycle and the count alternates between one and zero, so teardown can
+/// always drop exactly one suspension. Entry fields are touched by handlers
+/// running on the entry queue and by the fiber while it holds the queue
+/// suspended; those never overlap, so the fields need no atomics.
+const NetEntry = struct {
+    evented: *Evented,
+    queue: c.dispatch.queue_t,
+    handle: net.Socket.Handle,
+    read: ?c.dispatch.source_t = null,
+    write: ?c.dispatch.source_t = null,
+    timer: ?c.dispatch.source_t = null,
+    /// Whether each source is resumed. A source stays resumed after
+    /// completing an operation (a quiet socket stops firing on its own); it
+    /// is suspended when a handler fires with no target so a readable
+    /// socket with no pending receive cannot spin.
+    read_armed: bool = false,
+    write_armed: bool = false,
+    /// Whether the timer is resumed and scheduled for the current wait.
+    timer_armed: bool = false,
+    /// Set while teardown is in flight; handlers must not suspend sources.
+    closed: bool = false,
+    read_target: ?*Io.Operation.Storage = null,
+    write_target: ?*Io.Operation.Storage = null,
+    waiter: ?*EntryWaiter = null,
+
+    const Direction = enum { read, write };
+
+    fn source(entry: *NetEntry, direction: Direction) ?c.dispatch.source_t {
+        return switch (direction) {
+            .read => entry.read,
+            .write => entry.write,
+        };
+    }
+
+    fn target(entry: *NetEntry, direction: Direction) ?*Io.Operation.Storage {
+        return switch (direction) {
+            .read => entry.read_target,
+            .write => entry.write_target,
+        };
+    }
+
+    fn setTarget(entry: *NetEntry, direction: Direction, storage: ?*Io.Operation.Storage) void {
+        switch (direction) {
+            .read => entry.read_target = storage,
+            .write => entry.write_target = storage,
+        }
+    }
+};
+
+/// The fiber's side of a batched wait that runs on a `NetEntry`.
+const EntryWaiter = struct {
+    sleeper: Sleeper,
+
+    fn wake(waiter: *EntryWaiter) void {
+        var sleeper = waiter.sleeper;
+        waiter.* = undefined;
+        Sleeper.wake(&sleeper);
+    }
+};
+
+/// Tag bit distinguishing a `NetEntry` stored in `Batch.userdata` from the
+/// serial queue the legacy path stores there. Both are at least pointer
+/// aligned, so bit 0 is free.
+const batch_userdata_entry_bit: usize = 1;
+
+fn batchUserdataEntry(batch: *Io.Batch) ?*NetEntry {
+    const userdata = batch.userdata orelse return null;
+    const address = @intFromPtr(userdata);
+    if (address & batch_userdata_entry_bit == 0) return null;
+    return @ptrFromInt(address & ~batch_userdata_entry_bit);
+}
+
+fn netEntryGet(ev: *Evented, handle: net.Socket.Handle) ?*NetEntry {
+    if (ev.net_entries.get(handle)) |entry| return entry;
+    const queue = c.dispatch.queue_create_with_target(
+        "org.ziglang.std.Io.Dispatch.NetEntry",
+        .SERIAL(),
+        ev.queue,
+    ) orelse return null;
+    // The base suspension: the queue runs only while a fiber is parked on
+    // this entry.
+    queue.as_object().@"suspend"();
+    const backing = ev.allocator();
+    const entry = backing.create(NetEntry) catch {
+        queue.as_object().@"resume"();
+        queue.as_object().release();
+        return null;
+    };
+    entry.* = .{ .evented = ev, .queue = queue, .handle = handle };
+    ev.net_entries.put(backing, handle, entry) catch {
+        backing.destroy(entry);
+        queue.as_object().@"resume"();
+        queue.as_object().release();
+        return null;
+    };
+    return entry;
+}
+
+/// Frees the entry once its queue has drained already-queued events, so no
+/// handler can touch freed memory. Runs as the last item on the entry queue.
+fn netEntryFree(context: ?*anyopaque) callconv(.c) void {
+    const entry: *NetEntry = @ptrCast(@alignCast(context));
+    const queue = entry.queue;
+    entry.evented.allocator().destroy(entry);
+    queue.as_object().release();
+}
+
+/// Tears an entry down when its socket closes. The sources are canceled (no
+/// further events; the kernel dropped their kevents at `close` anyway) and
+/// released, already-queued events drain into handlers that see `closed`
+/// and do nothing, and the memory is freed after that drain.
+fn netEntryTeardown(entry: *NetEntry) void {
+    entry.closed = true;
+    entry.read_target = null;
+    entry.write_target = null;
+    entry.waiter = null;
+    inline for (.{ "read", "write", "timer" }) |field| {
+        if (@field(entry, field)) |object| {
+            object.cancel();
+            // Balance the base suspension, but only when it is actually
+            // held: a source that completed an operation stays resumed and
+            // must not be resumed again. Resuming here lets a source with
+            // queued events finalize once they drain.
+            if (!@field(entry, field ++ "_armed")) object.as_object().@"resume"();
+            object.as_object().release();
+            @field(entry, field) = null;
+        }
+    }
+    // Drop the one suspension a fiber always leaves held, let the queue
+    // drain, then free.
+    entry.queue.as_object().@"resume"();
+    entry.queue.async(entry, &netEntryFree);
+}
+
+/// Disarms the timer if the current wait armed it, re-suspends the entry
+/// queue (restoring the one suspension a running fiber holds) and wakes the
+/// fiber. Runs on the entry queue as the tail of the first handler to
+/// complete an operation (or of the timer handler).
+fn netEntryFinish(entry: *NetEntry) void {
+    if (entry.timer_armed) {
+        entry.timer_armed = false;
+        entry.timer.?.set_timer(.FOREVER, c.dispatch.TIME_FOREVER, 0);
+        entry.timer.?.as_object().@"suspend"();
+    }
+    entry.queue.as_object().@"suspend"();
+    const waiter = entry.waiter orelse return;
+    entry.waiter = null;
+    waiter.wake();
+}
+
+fn netEntryReadEvent(context: ?*anyopaque) callconv(.c) void {
+    netEntryEvent(context, .read);
+}
+
+fn netEntryWriteEvent(context: ?*anyopaque) callconv(.c) void {
+    netEntryEvent(context, .write);
+}
+
+/// A readiness source of a network entry fired: run the operation it was
+/// armed for, complete it, and finish the wait.
+fn netEntryEvent(context: ?*anyopaque, direction: NetEntry.Direction) void {
+    const entry: *NetEntry = @ptrCast(@alignCast(context));
+    const storage = entry.target(direction) orelse {
+        // A stale fire with nothing pending. Quiesce the source so a
+        // readable (level-triggered) socket cannot spin; the next armed
+        // operation resumes it.
+        if (!entry.closed) {
+            if (entry.source(direction)) |object| {
+                object.as_object().@"suspend"();
+                switch (direction) {
+                    .read => entry.read_armed = false,
+                    .write => entry.write_armed = false,
+                }
+            }
+        }
+        return;
+    };
+    const pending = &storage.pending;
+    const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
+    const batch = operation_userdata.batch;
+    const index: Io.Operation.OptionalIndex = .fromIndex(storage - batch.storage.ptr);
+    const result: Io.Operation.Result = result: switch (pending.tag) {
+        .net_receive => {
+            const operation = &operation_userdata.operation.net_receive;
+            const opt_err, const count = netReceiveNonblocking(
+                entry.handle,
+                operation.messages(),
+                operation.data(),
+                @bitCast(operation.flags),
+            );
+            if (opt_err) |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| break :result .{ .net_receive = .{ e, count } },
+            };
+            break :result .{ .net_receive = .{ null, count } };
+        },
+        .net_send => {
+            const operation = &operation_userdata.operation.net_send;
+            const opt_err, const sent = netSendNonblocking(
+                entry.handle,
+                operation.messages(),
+                @bitCast(operation.flags),
+            );
+            if (opt_err) |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| break :result .{ .net_send = .{ e, sent } },
+            };
+            break :result .{ .net_send = .{ null, sent } };
+        },
+        .net_read => {
+            const operation = &operation_userdata.operation.net_read;
+            break :result .{ .net_read = netReadOnce(
+                entry.handle,
+                operation.data_ptr[0..operation.data_len],
+            ) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| e,
+            } };
+        },
+        .net_write => {
+            const operation = &operation_userdata.operation.net_write;
+            break :result .{ .net_write = netWriteOnce(
+                entry.handle,
+                operation.header_ptr[0..operation.header_len],
+                operation.data_ptr[0..operation.data_len],
+                operation.splat,
+            ) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => |e| e,
+            } };
+        },
+        else => unreachable, // only network operations run on entries
+    };
+
+    switch (pending.node.prev) {
+        .none => batch.pending.head = pending.node.next,
+        else => |prev_index| batch.storage[prev_index.toIndex()].pending.node.next = pending.node.next,
+    }
+    switch (pending.node.next) {
+        .none => batch.pending.tail = pending.node.prev,
+        else => |next_index| batch.storage[next_index.toIndex()].pending.node.prev = pending.node.prev,
+    }
+    switch (batch.completed.tail) {
+        .none => batch.completed.head = index,
+        else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next = index,
+    }
+    storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+    batch.completed.tail = index;
+
+    entry.setTarget(direction, null);
+    netEntryFinish(entry);
+}
+
+/// The entry's timer fired. A fire delivered while no wait is active (a
+/// stale fire from an earlier arm of the re-armed timer) is ignored; the
+/// fiber distinguishes a real timeout from a stale wake by comparing the
+/// deadline, and a stale wake re-arms and goes back to sleep.
+fn netEntryTimerFired(context: ?*anyopaque) callconv(.c) void {
+    const entry: *NetEntry = @ptrCast(@alignCast(context));
+    const waiter = entry.waiter orelse return;
+    entry.waiter = null;
+    netEntryFinish(entry);
+    waiter.wake();
+}
+
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const queue = ev.batchDrainSubmitted(batch, false) catch |err| switch (err) {
@@ -2002,6 +2290,15 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
         error.Canceled => |e| return e,
     } orelse return;
     if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
+    if (batchUserdataEntry(batch)) |entry| {
+        if (batch.completed.head != .none) return; // something completed inline
+        var waiter: EntryWaiter = .{
+            .sleeper = .init(ev.queue, Thread.current().currentFiber()),
+        };
+        entry.waiter = &waiter;
+        ev.yield(.{ .@"resume" = entry.queue.as_object() });
+        return;
+    }
     var waiter: BatchWaiter = .{
         .sleeper = .init(ev.queue, Thread.current().currentFiber()),
         .queue = queue,
@@ -2020,6 +2317,67 @@ fn batchAwaitConcurrent(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const queue = try ev.batchDrainSubmitted(batch, true) orelse return;
     if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
+    if (batchUserdataEntry(batch)) |entry| {
+        const fiber = Thread.current().currentFiber();
+        while (true) {
+            // Create the timer before pointing the entry at the stack
+            // waiter, so a creation failure cannot leave a dangling waiter.
+            var timer_failed = false;
+            const timer: ?c.dispatch.source_t = switch (timeout) {
+                .none => null,
+                else => timer: {
+                    const object = entry.timer orelse created: {
+                        const source = c.dispatch.source_create(.TIMER, 0, .none, entry.queue) orelse {
+                            timer_failed = true;
+                            break :timer null;
+                        };
+                        source.as_object().set_context(entry);
+                        source.set_event_handler(&netEntryTimerFired);
+                        source.as_object().activate();
+                        // Base suspension: the timer delivers only while
+                        // armed for a wait.
+                        source.as_object().@"suspend"();
+                        entry.timer = source;
+                        break :created source;
+                    };
+                    break :timer object;
+                },
+            };
+            if (timer_failed) return error.ConcurrencyUnavailable;
+            if (batch.completed.head != .none) return; // something completed inline
+            var waiter: EntryWaiter = .{
+                .sleeper = .init(ev.queue, fiber),
+            };
+            entry.waiter = &waiter;
+            var when: c.dispatch.time_t = .FOREVER;
+            if (timer) |object| {
+                when = ev.timeFromTimeout(timeout);
+                object.set_timer(when, c.dispatch.TIME_FOREVER, ev.leeway);
+                entry.timer_armed = true;
+                object.as_object().@"resume"();
+            }
+            ev.yield(.{ .@"resume" = entry.queue.as_object() });
+            if (batch.completed.head != .none) return;
+            if (timeout == .none) unreachable; // only sources wake an untimed wait
+            // Woke with nothing completed: either the deadline passed, or a
+            // stale fire from an earlier arm of this entry's timer was
+            // delivered. Only a real deadline returns.
+            const clock = switch (timeout) {
+                .none => unreachable,
+                .duration => |duration| duration.clock,
+                .deadline => |deadline| deadline.clock,
+            };
+            const now_time = ev.timeFromTimeout(.{
+                .duration = .{ .raw = .fromNanoseconds(0), .clock = clock },
+            });
+            if (@intFromEnum(when) <= @intFromEnum(now_time)) {
+                // The operations stay pending on the entry, as on the other
+                // backends: the caller may await again or call `Batch.cancel`.
+                return error.Timeout;
+            }
+            // Stale fire: wait again.
+        }
+    }
     var waiter: BatchWaiter = .{
         .sleeper = .init(ev.queue, Thread.current().currentFiber()),
         .queue = queue,
@@ -2057,28 +2415,96 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
 /// Releases the per-batch serial queue once nothing is pending on it, so a
 /// caller that never calls `Batch.cancel` (`Io.operateTimeout` builds a
 /// fresh `Batch` per call) does not leak one queue per operation. A later
-/// submission on the same batch simply creates a new queue.
+/// submission on the same batch simply creates a new queue. A batch on a
+/// socket entry keeps the entry: it is cached for the socket's lifetime.
 ///
 /// Precondition: the calling fiber owns the batch, so the queue is suspended
 /// (it is suspended whenever the fiber runs); a suspended object must not be
 /// released, so the suspend is balanced first.
 fn batchReleaseIdleQueue(batch: *Io.Batch) void {
     if (batch.pending.head != .none) return;
+    if (batchUserdataEntry(batch)) |entry| {
+        _ = entry;
+        batch.userdata = null;
+        return;
+    }
     const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
     queue.as_object().@"resume"();
     queue.as_object().release();
     batch.userdata = null;
 }
 
-/// Cancels every pending operation of `batch`, waits for their cancel
-/// handlers to run, and releases the batch's serial queue. On return
-/// `batch.userdata` is null and nothing refers to `batch.storage` any
-/// more, so the caller may drop the storage.
+/// Cancels every pending operation of `batch` and releases what the batch
+/// holds. On return `batch.userdata` is null and nothing refers to
+/// `batch.storage` any more, so the caller may drop the storage.
 ///
-/// Precondition: the calling fiber owns the batch, which means the batch
-/// queue is suspended (it is suspended whenever the fiber runs), so
-/// `batch.pending` is stable while it is walked here.
+/// Precondition: the calling fiber owns the batch, which means a batch queue
+/// is suspended (it is suspended whenever the fiber runs), so `batch.pending`
+/// is stable while it is walked here.
 fn batchCancelPending(ev: *Evented, batch: *Io.Batch) void {
+    if (batchUserdataEntry(batch)) |entry| {
+        // The fiber runs, so it holds the entry queue's suspension: the
+        // pending operations can be disarmed synchronously. A dispatch
+        // cancel would be terminal for the cached sources, so the targets
+        // are cleared and the sources suspended instead; a stale event
+        // already queued delivers later into a handler that finds no target
+        // and quiesces the source.
+        var index = batch.pending.head;
+        while (index != .none) {
+            const storage = &batch.storage[index.toIndex()];
+            const pending = &storage.pending;
+            const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
+            assert(operation_userdata.batch == batch);
+            assert(operation_userdata.completion.entry == entry);
+            const direction: NetEntry.Direction = switch (pending.tag) {
+                .net_receive, .net_read => .read,
+                .net_send, .net_write => .write,
+                else => unreachable,
+            };
+            if (entry.target(direction) == storage) {
+                entry.setTarget(direction, null);
+                if (entry.source(direction)) |object| {
+                    const armed = switch (direction) {
+                        .read => entry.read_armed,
+                        .write => entry.write_armed,
+                    };
+                    if (armed) {
+                        switch (direction) {
+                            .read => entry.read_armed = false,
+                            .write => entry.write_armed = false,
+                        }
+                        object.as_object().@"suspend"();
+                    }
+                }
+            }
+            index = pending.node.next;
+        }
+        // Return the storages to the unused list, as the legacy cancel
+        // handler does, so the caller may resubmit or drop them.
+        index = batch.pending.head;
+        while (index != .none) {
+            const storage = &batch.storage[index.toIndex()];
+            const next_index = storage.pending.node.next;
+            const index_value = index;
+            const tail_index = batch.unused.tail;
+            switch (tail_index) {
+                .none => batch.unused.head = index_value,
+                else => batch.storage[tail_index.toIndex()].unused.next = index_value,
+            }
+            storage.* = .{ .unused = .{ .prev = tail_index, .next = .none } };
+            batch.unused.tail = index_value;
+            index = next_index;
+        }
+        batch.pending = .empty;
+        if (entry.timer_armed) {
+            entry.timer_armed = false;
+            entry.timer.?.set_timer(.FOREVER, c.dispatch.TIME_FOREVER, 0);
+            entry.timer.?.as_object().@"suspend"();
+        }
+        entry.waiter = null;
+        batch.userdata = null;
+        return;
+    }
     const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
     if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
     var index = batch.pending.head;
@@ -2087,7 +2513,7 @@ fn batchCancelPending(ev: *Evented, batch: *Io.Batch) void {
         const pending = &storage.pending;
         const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
         assert(operation_userdata.batch == batch);
-        operation_userdata.source.cancel();
+        operation_userdata.completion.source.cancel();
         index = pending.node.next;
     }
     // Park until the last cancel handler (`batchSourceCancel`) releases the
@@ -2104,7 +2530,12 @@ fn batchCancelPending(ev: *Evented, batch: *Io.Batch) void {
 
 const BatchOperationUserdata = extern struct {
     batch: *Io.Batch,
-    source: c.dispatch.source_t,
+    completion: extern union {
+        /// The legacy path arms a fresh source per operation.
+        source: c.dispatch.source_t,
+        /// The per-socket entry path arms the entry's cached source.
+        entry: *NetEntry,
+    },
     operation: extern union {
         file_read_streaming: extern struct {
             data_ptr: [*]const []u8,
@@ -2187,6 +2618,240 @@ const BatchOperationUserdata = extern struct {
     }
 };
 
+/// Returns the entry's source for `direction`, creating it on first use.
+/// The source is created active but suspended, so it delivers events only
+/// while an operation is armed on it.
+fn entryNetSource(entry: *NetEntry, direction: NetEntry.Direction) ?c.dispatch.source_t {
+    if (entry.source(direction)) |object| return object;
+    const created = c.dispatch.source_create(
+        switch (direction) {
+            .read => .READ,
+            .write => .WRITE,
+        },
+        @bitCast(@as(isize, entry.handle)),
+        .none,
+        entry.queue,
+    ) orelse return null;
+    created.as_object().set_context(entry);
+    created.set_event_handler(switch (direction) {
+        .read => &netEntryReadEvent,
+        .write => &netEntryWriteEvent,
+    });
+    created.as_object().activate();
+    created.as_object().@"suspend"();
+    switch (direction) {
+        .read => entry.read = created,
+        .write => entry.write = created,
+    }
+    return created;
+}
+
+/// Fast path of `batchDrainSubmitted` for the common shape: every submitted
+/// operation is a network operation on one socket, at most one per
+/// direction. The operations run on the socket's cached entry, so a wait
+/// creates no queue, no source and no timer. Returns null when the batch
+/// does not fit the shape, the entry's slots are taken by another batch, or
+/// allocation failed; the caller falls back to the legacy path.
+fn batchDrainNetEntry(
+    ev: *Evented,
+    batch: *Io.Batch,
+) Io.Cancelable!?c.dispatch.queue_t {
+    var socket_handle: ?net.Socket.Handle = null;
+    var needs_read = false;
+    var needs_write = false;
+    var index = batch.submitted.head;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const this_socket: net.Socket.Handle, const this_read: bool = switch (storage.submission.operation) {
+            .net_receive => |operation| .{ operation.socket_handle, true },
+            .net_read => |operation| .{ operation.socket_handle, true },
+            .net_send => |operation| .{ operation.socket_handle, false },
+            .net_write => |operation| .{ operation.socket_handle, false },
+            else => return null,
+        };
+        if (socket_handle) |handle| {
+            if (handle != this_socket) return null;
+        } else socket_handle = this_socket;
+        if (this_read) {
+            if (needs_read) return null;
+            needs_read = true;
+        } else {
+            if (needs_write) return null;
+            needs_write = true;
+        }
+        index = storage.submission.node.next;
+    }
+    const handle = socket_handle orelse return null;
+    const entry = netEntryGet(ev, handle) orelse return null;
+    if ((needs_read and entry.read_target != null) or
+        (needs_write and entry.write_target != null)) return null;
+    index = batch.submitted.head;
+    while (index != .none) {
+        const storage = &batch.storage[index.toIndex()];
+        const next_index = storage.submission.node.next;
+        if (@as(?Io.Operation.Result, result: {
+            switch (storage.submission.operation) {
+                .net_receive => |operation| {
+                    // Drain whatever is already queued without blocking; the
+                    // entry's readiness source is armed only if nothing at
+                    // all was available, as in the legacy path.
+                    const opt_err, const count = netReceiveNonblocking(
+                        operation.socket_handle,
+                        operation.message_buffer,
+                        operation.data_buffer,
+                        operation.flags,
+                    );
+                    if (opt_err) |err| switch (err) {
+                        error.WouldBlock => {},
+                        else => |e| break :result .{ .net_receive = .{ e, count } },
+                    } else break :result .{ .net_receive = .{ null, count } };
+                    const object = entryNetSource(entry, .read) orelse
+                        break :result .{ .net_receive = .{ error.SystemResources, 0 } };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_receive,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .completion = .{ .entry = entry },
+                        .operation = .{ .net_receive = .{
+                            .message_ptr = operation.message_buffer.ptr,
+                            .message_len = operation.message_buffer.len,
+                            .data_ptr = operation.data_buffer.ptr,
+                            .data_len = operation.data_buffer.len,
+                            .flags = @bitCast(operation.flags),
+                        } },
+                    };
+                    entry.read_target = storage;
+                    if (!entry.read_armed) {
+                        entry.read_armed = true;
+                        object.as_object().@"resume"();
+                    }
+                    break :result null;
+                },
+                .net_send => |operation| {
+                    const opt_err, const sent = netSendNonblocking(
+                        operation.socket_handle,
+                        operation.messages,
+                        operation.flags,
+                    );
+                    if (opt_err) |err| switch (err) {
+                        error.WouldBlock => {},
+                        else => |e| break :result .{ .net_send = .{ e, sent } },
+                    } else break :result .{ .net_send = .{ null, sent } };
+                    const object = entryNetSource(entry, .write) orelse
+                        break :result .{ .net_send = .{ error.SystemResources, 0 } };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_send,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .completion = .{ .entry = entry },
+                        .operation = .{ .net_send = .{
+                            .message_ptr = operation.messages.ptr,
+                            .message_len = operation.messages.len,
+                            .flags = @bitCast(operation.flags),
+                        } },
+                    };
+                    entry.write_target = storage;
+                    if (!entry.write_armed) {
+                        entry.write_armed = true;
+                        object.as_object().@"resume"();
+                    }
+                    break :result null;
+                },
+                .net_read => |operation| {
+                    const data = for (operation.data, 0..) |buffer, data_index| {
+                        if (buffer.len > 0) break operation.data[data_index..];
+                    } else break :result .{ .net_read = 0 };
+                    const object = entryNetSource(entry, .read) orelse
+                        break :result .{ .net_read = error.SystemResources };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_read,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .completion = .{ .entry = entry },
+                        .operation = .{ .net_read = .{
+                            .data_ptr = data.ptr,
+                            .data_len = data.len,
+                        } },
+                    };
+                    entry.read_target = storage;
+                    if (!entry.read_armed) {
+                        entry.read_armed = true;
+                        object.as_object().@"resume"();
+                    }
+                    break :result null;
+                },
+                .net_write => |operation| {
+                    const data = for (operation.data, 0..) |buffer, data_index| {
+                        if (buffer.len > 0) break operation.data[data_index..];
+                    } else if (operation.header.len > 0)
+                        operation.data[0..1]
+                    else
+                        break :result .{ .net_write = 0 };
+                    const object = entryNetSource(entry, .write) orelse
+                        break :result .{ .net_write = error.SystemResources };
+                    storage.* = .{ .pending = .{
+                        .node = .{ .prev = batch.pending.tail, .next = .none },
+                        .tag = .net_write,
+                        .userdata = undefined,
+                    } };
+                    const operation_userdata: *BatchOperationUserdata =
+                        .fromErased(&storage.pending.userdata);
+                    operation_userdata.* = .{
+                        .batch = batch,
+                        .completion = .{ .entry = entry },
+                        .operation = .{ .net_write = .{
+                            .header_ptr = operation.header.ptr,
+                            .header_len = operation.header.len,
+                            .data_ptr = data.ptr,
+                            .data_len = data.len,
+                            .splat = operation.splat,
+                        } },
+                    };
+                    entry.write_target = storage;
+                    if (!entry.write_armed) {
+                        entry.write_armed = true;
+                        object.as_object().@"resume"();
+                    }
+                    break :result null;
+                },
+                else => return null,
+            }
+        })) |result| {
+            switch (batch.completed.tail) {
+                .none => batch.completed.head = index,
+                else => |tail_index| batch.storage[tail_index.toIndex()].completion.node.next = index,
+            }
+            batch.completed.tail = index;
+            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+        } else {
+            switch (batch.pending.tail) {
+                .none => batch.pending.head = index,
+                else => |tail_index| batch.storage[tail_index.toIndex()].pending.node.next = index,
+            }
+            batch.pending.tail = index;
+        }
+        index = next_index;
+    }
+    batch.submitted = .{ .head = .none, .tail = .none };
+    batch.userdata = @ptrFromInt(@intFromPtr(entry) | batch_userdata_entry_bit);
+    return entry.queue;
+}
+
 /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
 fn batchDrainSubmitted(
     ev: *Evented,
@@ -2194,7 +2859,11 @@ fn batchDrainSubmitted(
     concurrency: bool,
 ) (Io.ConcurrentError || Io.Cancelable)!?c.dispatch.queue_t {
     var index = batch.submitted.head;
-    if (index == .none) return @ptrCast(batch.userdata);
+    if (index == .none) return if (batchUserdataEntry(batch)) |entry|
+        entry.queue
+    else
+        @ptrCast(batch.userdata);
+    if (try batchDrainNetEntry(ev, batch)) |queue| return queue;
     errdefer batch.submitted.head = index;
     const maybe_queue: ?c.dispatch.queue_t = if (batch.userdata) |batch_userdata|
         @ptrCast(batch_userdata)
@@ -2232,7 +2901,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .file_read_streaming = .{
                             .data_ptr = data.ptr,
                             .data_len = data.len,
@@ -2266,7 +2935,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .file_write_streaming = .{
                             .header_ptr = operation.header.ptr,
                             .header_len = operation.header.len,
@@ -2314,7 +2983,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .net_receive = .{
                             .message_ptr = message_buffer.ptr,
                             .message_len = message_buffer.len,
@@ -2359,7 +3028,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .net_send = .{
                             .message_ptr = messages.ptr,
                             .message_len = messages.len,
@@ -2391,7 +3060,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .net_read = .{
                             .data_ptr = data.ptr,
                             .data_len = data.len,
@@ -2425,7 +3094,7 @@ fn batchDrainSubmitted(
                         .fromErased(&storage.pending.userdata);
                     operation_userdata.* = .{
                         .batch = batch,
-                        .source = source,
+                        .completion = .{ .source = source },
                         .operation = .{ .net_write = .{
                             .header_ptr = operation.header.ptr,
                             .header_len = operation.header.len,
@@ -2468,7 +3137,7 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
     const pending = &storage.pending;
     const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
     const batch = operation_userdata.batch;
-    const source = operation_userdata.source;
+    const source = operation_userdata.completion.source;
     const index: Io.Operation.OptionalIndex = .fromIndex(storage - batch.storage.ptr);
     const result: Io.Operation.Result = result: switch (pending.tag) {
         .file_read_streaming => {
@@ -2576,7 +3245,7 @@ fn batchSourceCancel(context: ?*anyopaque) callconv(.c) void {
     const pending = &storage.pending;
     const operation_userdata: *BatchOperationUserdata = .fromErased(&pending.userdata);
     const batch = operation_userdata.batch;
-    const source = operation_userdata.source;
+    const source = operation_userdata.completion.source;
     const index: Io.Operation.OptionalIndex = .fromIndex(storage - batch.storage.ptr);
 
     switch (pending.node.prev) {
@@ -5425,8 +6094,12 @@ fn netWriteFile(
 
 fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    for (sockets) |socket| closeFd(socket.handle);
+    for (sockets) |socket| {
+        closeFd(socket.handle);
+        if (ev.net_entries.fetchRemove(socket.handle)) |removed| {
+            netEntryTeardown(removed.value);
+        }
+    }
 }
 
 fn netShutdown(
