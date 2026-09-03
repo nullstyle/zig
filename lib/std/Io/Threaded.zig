@@ -2809,10 +2809,16 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
         }
     } = .{ .gpa = t.allocator, .batch = b, .slice = &poll_buffer, .len = 0 };
     {
+        var prev_index: Io.Operation.OptionalIndex = .none;
         var index = b.submitted.head;
         while (index != .none) {
             const storage = &b.storage[index.toIndex()];
             const submission = storage.submission;
+            const next_index = submission.node.next;
+            // An operation that completes here leaves the `submitted` list
+            // for `completed`; otherwise it stays submitted and pairs with
+            // the poll entry it adds below.
+            var completed_inline = false;
             switch (submission.operation) {
                 .file_read_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.IN | posix.POLL.ERR),
                 .file_write_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.OUT | posix.POLL.ERR),
@@ -2832,6 +2838,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                         };
                         data_i += msg.data.len;
                     } else .{ null, o.message_buffer.len } };
+                    completed_inline = true;
                     switch (b.completed.tail) {
                         .none => b.completed.head = index,
                         else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
@@ -2861,6 +2868,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                             break :o .{ null, sent };
                         },
                     };
+                    completed_inline = true;
                     switch (b.completed.tail) {
                         .none => b.completed.head = index,
                         else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
@@ -2871,7 +2879,14 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                 .net_read => |o| try poll_storage.add(o.socket_handle, posix.POLL.IN | posix.POLL.ERR),
                 .net_write => |o| try poll_storage.add(o.socket_handle, posix.POLL.OUT | posix.POLL.ERR),
             }
-            index = submission.node.next;
+            if (completed_inline) {
+                switch (prev_index) {
+                    .none => b.submitted.head = next_index,
+                    else => |p| b.storage[p.toIndex()].submission.node.next = next_index,
+                }
+                if (next_index == .none) b.submitted.tail = prev_index;
+            } else prev_index = index;
+            index = next_index;
         }
     }
     switch (poll_storage.len) {
@@ -12482,6 +12497,10 @@ fn netBindIpPosix(
     const family = posixAddressFamily(address);
     const socket_fd = try openSocketPosix(family, options);
     errdefer closeFd(socket_fd);
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOptionPosix(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try posixBind(socket_fd, &storage.any, addr_len);
@@ -12498,6 +12517,10 @@ fn netBindIpWindows(
     if (!have_networking) return error.NetworkDown;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
+    // Windows has no SO_REUSEPORT. SO_REUSEADDR is not a substitute for a
+    // datagram socket: it allows the shared bind but promises nothing about
+    // which socket receives.
+    if (options.reuse_port) return error.OptionUnsupported;
     const family = posixAddressFamily(address);
     const socket_handle = try openSocketAfd(family, options);
     errdefer windows.CloseHandle(socket_handle);
@@ -14256,7 +14279,7 @@ pub const PosixAddress = extern union {
     in6: posix.sockaddr.in6,
 };
 
-const UnixAddress = extern union {
+pub const UnixAddress = extern union {
     any: posix.sockaddr,
     un: posix.sockaddr.un,
 };
@@ -14289,7 +14312,7 @@ pub fn addressToPosix(a: *const IpAddress, storage: *PosixAddress) posix.socklen
     };
 }
 
-fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
+pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
     storage.un.family = posix.AF.UNIX;
     var path_len = switch (native_os) {
         .windows => @min(a.path.len, storage.un.path.len),
@@ -15029,7 +15052,7 @@ const LookupDnsWindows = struct {
     }
 };
 
-fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
+pub fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
     const buf = canonical_name_buffer orelse return null;
     const dest = buf[0..name.len];
     @memcpy(dest, name);

@@ -1024,6 +1024,10 @@ fn netBindIp(
     const family = Io.Threaded.posixAddressFamily(address);
     const socket_fd = try openSocketPosix(k, family, options);
     errdefer closeFd(socket_fd);
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
     try posixBind(k, socket_fd, &storage.any, addr_len);
