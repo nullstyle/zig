@@ -28,9 +28,23 @@ pub const Switch = extern struct { old: *Context, new: *Context };
 /// Fills `s.old` with the current cpu state, and restores the cpu state stored in `s.new`.
 pub inline fn contextSwitch(s: *const Switch) *const Switch {
     return switch (builtin.cpu.arch) {
+        // x30 and x18 are pushed on the outgoing fiber's own stack and popped
+        // once it is resumed at its `0:` label. LLVM names the link register
+        // `lr`; the clobber name `x30` is not mapped and is silently
+        // discarded, so optimized builds kept live values in x30 across the
+        // asm, and after a switch x30 held whatever the other fiber had. The
+        // `lr` clobber below fixes that for LLVM; the push/pop keeps the
+        // switch correct for a backend that does not honour it. x18 is the
+        // platform register: reserved (never allocated) on Apple targets, but
+        // an ordinary scratch register on Linux, where it cannot be named in
+        // the clobber list without an Apple-side diagnostic, so it is saved
+        // the same way. A fresh fiber enters through its entry trampoline and
+        // never executes the pop. `nzcv` is listed because the compiler
+        // otherwise keeps compare results in the flags across the asm.
         .aarch64 => asm volatile (
             \\ ldp x0, x2, [x1]
             \\ ldr x3, [x2, #16]
+            \\ stp x30, x18, [sp, #-16]!
             \\ mov x4, sp
             \\ stp x4, fp, [x0]
             \\ adr x5, 0f
@@ -39,6 +53,7 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
             \\ mov sp, x4
             \\ br x3
             \\0:
+            \\ ldp x30, x18, [sp], #16
             : [received_message] "={x1}" (-> *const Switch),
             : [message_to_send] "{x1}" (s),
             : .{
@@ -71,6 +86,7 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
               .x27 = true,
               .x28 = true,
               .x30 = true,
+              .lr = true,
               .z0 = true,
               .z1 = true,
               .z2 = true,
@@ -122,6 +138,7 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
               .fpcr = true,
               .fpsr = true,
               .ffr = true,
+              .nzcv = true,
               .memory = true,
             }),
         .riscv64 => asm volatile (
