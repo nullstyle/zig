@@ -5274,6 +5274,10 @@ fn netBindIp(
         if (posix.IPV6 == void) return error.OptionUnsupported;
         try setSocketOption(socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @intFromBool(ip6_only));
     }
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOption(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
     try posixBind(socket_fd, &storage.any, addr_len);
