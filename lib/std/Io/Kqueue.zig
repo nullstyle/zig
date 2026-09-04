@@ -103,7 +103,12 @@ const Fiber = struct {
     context: Io.fiber.Context,
     awaiter: ?*Fiber,
     queue_next: ?*Fiber,
+    /// Null while no cancelation request is pending; `Thread.canceling`
+    /// once one is. `checkCancel` consumes a pending request (the contract
+    /// is that only the next cancelation point signals); `recancel`
+    /// re-arms one.
     cancel_thread: ?*Thread,
+    cancel_protection: Io.CancelProtection,
     awaiting_completions: std.bit_set.Static(3),
     /// The fiber's side of a batched wait; lives here so events that arrive
     /// late (after the wait completed or was cancelled) reference memory
@@ -160,31 +165,6 @@ const Fiber = struct {
         return @ptrFromInt(alignment.forward(@intFromPtr(f) + @sizeOf(Fiber)));
     }
 
-    fn enterCancelRegion(fiber: *Fiber, thread: *Thread) error{Canceled}!void {
-        if (@cmpxchgStrong(
-            ?*Thread,
-            &fiber.cancel_thread,
-            null,
-            thread,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| {
-            assert(cancel_thread == Thread.canceling);
-            return error.Canceled;
-        }
-    }
-
-    fn exitCancelRegion(fiber: *Fiber, thread: *Thread) void {
-        if (@cmpxchgStrong(
-            ?*Thread,
-            &fiber.cancel_thread,
-            thread,
-            null,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| assert(cancel_thread == Thread.canceling);
-    }
-
     const Queue = struct { head: *Fiber, tail: *Fiber };
 };
 
@@ -233,6 +213,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
+        .cancel_protection = .unblocked,
         .awaiting_completions = .empty, .batch_waiter = .{},
     };
     const main_thread = &k.threads.allocated[0];
@@ -831,9 +812,9 @@ pub fn io(k: *Kqueue) Io {
             .groupConcurrent = groupConcurrent,
             .groupAwait = groupAwait,
             .groupCancel = groupCancel,
-            .recancel = Io.Threaded.recancel,
-            .swapCancelProtection = Io.Threaded.swapCancelProtection,
-            .checkCancel = Io.Threaded.checkCancel,
+            .recancel = recancel,
+            .swapCancelProtection = swapCancelProtection,
+            .checkCancel = checkCancelVTable,
             .futexWait = Io.Threaded.futexWait,
             .futexWaitUncancelable = Io.Threaded.futexWaitUncancelable,
             .futexWake = Io.Threaded.futexWake,
@@ -982,6 +963,7 @@ fn concurrent(
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
+        .cancel_protection = .unblocked,
         .awaiting_completions = .empty, .batch_waiter = .{},
     };
     closure.* = .{
@@ -1011,6 +993,16 @@ fn await(
     k.recycle(future_fiber);
 }
 
+/// Places a cancelation request on the future's fiber, wakes it if it is
+/// parked in a batch wait so it observes the request at its next
+/// cancelation point, then waits for the future exactly like `await`.
+///
+/// Fibers parked through the untagged single-op path (`waitReady`,
+/// `sleep`) cannot be woken cross-thread: they observe the request at
+/// their next cancelation point after the wait naturally completes. A
+/// future parked that way on an idle resource therefore cancels no
+/// earlier than `await` would have returned (the cooperative posture of
+/// the fiber backends' network waits).
 fn cancel(
     userdata: ?*anyopaque,
     any_future: *Io.AnyFuture,
@@ -1018,17 +1010,69 @@ fn cancel(
     result_alignment: std.mem.Alignment,
 ) void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = any_future;
-    _ = result;
-    _ = result_alignment;
-    @panic("TODO");
+    const future_fiber: *Fiber = @ptrCast(@alignCast(any_future));
+    if (@cmpxchgStrong(
+        ?*Thread,
+        &future_fiber.cancel_thread,
+        null,
+        Thread.canceling,
+        .acq_rel,
+        .acquire,
+    ) == null) {
+        // Request placed. Wake the future if it is parked in a batch
+        // wait: the slot handshake delivers exactly one wake, and a
+        // racing readiness event loses the race by design.
+        const parked = @atomicRmw(?*Fiber, &future_fiber.batch_waiter.parked, .Xchg, Fiber.finished, .acq_rel);
+        if (parked) |p| {
+            if (p != Fiber.finished) k.schedule(.current(), .{ .head = p, .tail = p });
+        }
+    }
+    await(userdata, any_future, result, result_alignment);
 }
 
 fn cancelRequested(userdata: ?*anyopaque) bool {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
     _ = k;
-    return false; // TODO
+    return Thread.current().currentFiber().cancel_thread != null;
+}
+
+/// Consumes a pending cancelation request. Only the next cancelation
+/// point signals; `recancel` re-arms a consumed request.
+fn checkCancel(k: *Kqueue) error{Canceled}!void {
+    _ = k;
+    const fiber = Thread.current().currentFiber();
+    if (fiber.cancel_protection == .blocked) return;
+    if (@atomicRmw(?*Thread, &fiber.cancel_thread, .Xchg, null, .acq_rel) != null) {
+        return error.Canceled;
+    }
+}
+
+fn checkCancelVTable(userdata: ?*anyopaque) Io.Cancelable!void {
+    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    return k.checkCancel();
+}
+
+fn recancel(userdata: ?*anyopaque) void {
+    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    _ = k;
+    const fiber = Thread.current().currentFiber();
+    if (@cmpxchgStrong(
+        ?*Thread,
+        &fiber.cancel_thread,
+        null,
+        Thread.canceling,
+        .acq_rel,
+        .acquire,
+    )) |cancel_thread| assert(cancel_thread == Thread.canceling); // recancel without a consumed request
+}
+
+fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    _ = k;
+    const fiber = Thread.current().currentFiber();
+    const old = fiber.cancel_protection;
+    fiber.cancel_protection = new;
+    return old;
 }
 
 fn groupAsync(
@@ -1085,6 +1129,7 @@ fn groupConcurrent(
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
+        .cancel_protection = .unblocked,
         .awaiting_completions = .empty,
         .batch_waiter = .{},
     };
@@ -1323,6 +1368,7 @@ fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
 /// fiber pointer, unique per waiting fiber.
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    if (timeout != .none) try k.checkCancel();
     const thread: *Thread = .current();
     const fiber = thread.currentFiber();
     const ms: i64 = switch (timeout) {
@@ -2167,6 +2213,7 @@ fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option
 /// ident and filter share one kevent, and so the wake path is the ordinary
 /// fiber path.
 fn waitReady(k: *Kqueue, ident: usize, filter: i16) Io.Cancelable!void {
+    try k.checkCancel();
     const thread: *Thread = .current();
     const fiber = thread.currentFiber();
     const gop = thread.wait_queues.getOrPut(k.gpa, .{
@@ -2385,6 +2432,10 @@ fn batchAwaitConcurrent(
     const fiber = Thread.current().currentFiber();
     const waiter = &fiber.batch_waiter;
     while (true) {
+        // Each iteration's wait is a cancelation point: a request placed
+        // while the fiber ran (or delivered by `cancel`'s slot wake)
+        // surfaces here, before the batch is touched again.
+        try k.checkCancel();
         // Events must find the slot empty while the fiber runs, so a
         // stale event only records the wake; the register_awaiter switch
         // task below parks this fiber atomically and schedules it right
@@ -2493,10 +2544,6 @@ fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
         index = next_index;
     }
     b.submitted = .empty;
-}
-
-fn checkCancel(k: *Kqueue) error{Canceled}!void {
-    if (cancelRequested(k)) return error.Canceled;
 }
 
 pub const KEventError = error{
