@@ -1,0 +1,88 @@
+# zigfork release workflow.
+# `zigfork assemble <config>` copies this file into build/<config> as
+# .github/workflows/zigfork-release.yml. Edit the copy in the zigfork repo, not
+# the one inside the zig tree.
+name: zigfork release
+
+on:
+  push:
+    branches: ["build/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: zigfork-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            os: macos-15
+          - target: x86_64-linux
+            os: ubuntu-24.04
+            wasm: true
+          - target: aarch64-linux
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # `git describe` needs the upstream version tags
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake ninja-build
+
+      - name: Resolve the upstream LLVM bundle
+        id: bundle
+        run: echo "name=$(bash .github/zigfork/build-release.sh --bundle-name ${{ matrix.target }})" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the LLVM bundle
+        uses: actions/cache@v4
+        with:
+          path: ~/deps/${{ steps.bundle.outputs.name }}
+          key: zigfork-bundle-${{ steps.bundle.outputs.name }}
+
+      - name: Build ${{ matrix.target }} release
+        run: bash .github/zigfork/build-release.sh ${{ matrix.target }}
+
+      - name: Build wasm32-wasi release
+        if: matrix.wasm
+        continue-on-error: true
+        run: bash .github/zigfork/build-wasm.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-${{ matrix.target }}
+          path: build-release/out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/zigfork/publish-release.sh dist
