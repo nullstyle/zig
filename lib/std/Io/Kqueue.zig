@@ -71,6 +71,11 @@ const Thread = struct {
     /// against garbage. The call re-executes the address computation on
     /// the current thread; the volatile load cannot be merged across
     /// calls.
+    ///
+    /// Do not copy the Dispatch/Uring `asm` form here: their `self`
+    /// holds the struct itself, so `&self` is the pointer; this `self`
+    /// is already a pointer, and the asm would return the slot's
+    /// address.
     noinline fn current() *Thread {
         return @as(*volatile *Thread, @ptrCast(&self)).*;
     }
