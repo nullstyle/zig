@@ -59,8 +59,15 @@ const Thread = struct {
 
     threadlocal var self: *Thread = undefined;
 
+    /// The load must be volatile: fibers migrate between OS threads inside
+    /// `contextSwitch`, and a non-volatile threadlocal read can be hoisted
+    /// out of a park loop and reused after the switch (a register clobber
+    /// does not invalidate a stack spill, and the compiler is free to
+    /// assume a threadlocal cannot change within a function). A cached
+    /// value made a migrated fiber lock, arm, and park against the thread
+    /// it had left, corrupting that thread's ready queue.
     fn current() *Thread {
-        return self;
+        return @as(*volatile *Thread, @ptrCast(&self)).*;
     }
 
     fn currentFiber(thread: *Thread) *Fiber {
