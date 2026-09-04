@@ -61,7 +61,7 @@ const max_steal_ready_search = 2;
 const max_steal_free_search = 4;
 
 backing_allocator_needs_mutex: bool,
-backing_allocator_mutex: Io.Mutex,
+backing_allocator_lock: SpinLock,
 /// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
 main_fiber_buffer: [
@@ -91,6 +91,23 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
+/// Guards `backing_allocator` when it is not thread-safe. A spinlock rather
+/// than the fiber-aware `Io.Mutex`: an allocation never parks, so a fiber that
+/// allocates between capturing its thread's ring and enqueuing on it (the
+/// batched network paths do) cannot migrate to another thread in between and
+/// submit into a ring whose owner is asleep in `io_uring_enter`.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *SpinLock) void {
+        while (l.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(l: *SpinLock) void {
+        l.locked.store(false, .release);
+    }
+};
+
 const Thread = struct {
     required_align: void align(4),
     thread: std.Thread,
@@ -107,8 +124,15 @@ const Thread = struct {
 
     threadlocal var self: ?*Thread = null;
 
+    /// A fiber can be parked on one OS thread and resumed on another, so the
+    /// thread must be re-read after every context switch. Routing the
+    /// pointer through a volatile asm operand makes it an opaque runtime
+    /// value, so a caller cannot reuse a lookup made before a switch.
     noinline fn current() *Thread {
-        return self.?;
+        return asm volatile (""
+            : [ret] "=r" (-> *Thread),
+            : [in] "0" (self.?),
+            : .{ .memory = true });
     }
 
     fn deinit(thread: *Thread, gpa: Allocator) void {
@@ -619,9 +643,8 @@ pub fn allocator(ev: *Evented) std.mem.Allocator {
 
 fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
 }
 
@@ -633,9 +656,8 @@ fn resize(
     ret_addr: usize,
 ) bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
 }
 
@@ -647,17 +669,15 @@ fn remap(
     ret_addr: usize,
 ) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
 
@@ -819,7 +839,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     errdefer backing_allocator.free(allocated_slice);
     ev.* = .{
         .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
-        .backing_allocator_mutex = .init,
+        .backing_allocator_lock = .{},
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
         .log2_ring_entries = options.log2_ring_entries,
@@ -1194,13 +1214,18 @@ fn idle(ev: *Evented, thread: *Thread) void {
                         break :ready_fiber ready_fiber;
                     },
                     0b01 => {
+                        // A cancel request forwarded from another thread via
+                        // MSG_RING. Bits 0-1 carry this tag; bit 2 says the
+                        // target is a batch request (whose own user data is
+                        // tagged 0b10), otherwise it is a fiber-tagged one.
+                        const target = cqe.user_data & ~@as(usize, 0b111);
                         thread.enqueue().* = .{
                             .opcode = .ASYNC_CANCEL,
                             .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
                             .ioprio = 0,
                             .fd = 0,
                             .off = 0,
-                            .addr = cqe.user_data & ~@as(usize, 0b11),
+                            .addr = if (cqe.user_data & 0b100 != 0) target | 0b10 else target,
                             .len = 0,
                             .rw_flags = 0,
                             .user_data = @backingInt(Completion.Userdata.wakeup),
@@ -1230,7 +1255,14 @@ fn idle(ev: *Evented, thread: *Thread) void {
                             batch_userdata[0] = next;
                         }
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
-                            0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                            // A parked fiber: wake it.
+                            0b00 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                            // The timer already fired and woke the fiber
+                            // (`0b11` below tags the slot `0b01`); it will
+                            // find this completion when it drains. Waking it
+                            // again would schedule a fiber that is already
+                            // queued or running.
+                            0b01 => null,
                             0b10, 0b11 => null,
                         };
                     },
@@ -2107,8 +2139,21 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .net_send => |o| .{
             .net_send = r: {
-                _ = o;
-                break :r .{ error.NetworkDown, 0 }; // TODO
+                const opt_err, const n = ev.netSend(&maybe_sync.cancel_region, o.socket_handle, o.messages, o.flags);
+                break :r .{
+                    if (opt_err) |err| switch (err) {
+                        error.Canceled => |e| if (n == 0) {
+                            return e;
+                        } else {
+                            // Messages already went out; report them and leave
+                            // the cancelation for the next cancel point.
+                            recancel(ev);
+                            break :r .{ null, n };
+                        },
+                        else => |e| e,
+                    } else null,
+                    n,
+                };
             },
         },
         .net_read => |o| .{
@@ -2205,13 +2250,13 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    ev.batchDrainSubmitted(&maybe_sync, batch, false) catch |err| switch (err) {
+    ev.batchDrainSubmitted(&maybe_sync, batch, false, .none) catch |err| switch (err) {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         error.Canceled => |e| return e,
     };
     maybe_sync.leaveSync(ev);
     while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
+        batchDrainReady(ev, batch) catch |err| switch (err) {
             error.Timeout => unreachable, // no timeout
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
@@ -2227,10 +2272,21 @@ fn batchAwaitConcurrent(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    try ev.batchDrainSubmitted(&maybe_sync, batch, true);
+    try ev.batchDrainSubmitted(&maybe_sync, batch, true, timeout);
     maybe_sync.leaveSync(ev);
+    if (batchIsLinked(batch)) {
+        // The timeout rides in the ring linked to the single request; whichever
+        // completes first cancels the other. Nothing is armed or removed here.
+        while (true) {
+            batchDrainReady(ev, batch) catch |err| switch (err) {
+                error.Timeout => |e| return if (batch.completed.head == .none) e,
+            };
+            if (batch.completed.head != .none or batch.pending.head == .none) return;
+            ev.yield(null, .{ .batch_await = batch });
+        }
+    }
     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
+        batchDrainReady(ev, batch) catch |err| switch (err) {
             error.Timeout => unreachable, // no timeout
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
@@ -2285,7 +2341,7 @@ fn batchAwaitConcurrent(
     }
     while (batch.completed.head == .none and batch.pending.head != .none) {
         ev.yield(null, .{ .batch_await = batch });
-        batchDrainReady(batch) catch |err| switch (err) {
+        batchDrainReady(ev, batch) catch |err| switch (err) {
             error.Timeout => |e| return if (batch.completed.head == .none and
                 batch.pending.head != .none) e,
         };
@@ -2314,7 +2370,7 @@ fn batchAwaitConcurrent(
         else => |err| unexpectedErrno(err) catch {},
     }
     while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
+        batchDrainReady(ev, batch) catch |err| switch (err) {
             error.Timeout => return,
         };
         ev.yield(null, .{ .batch_await = batch });
@@ -2327,14 +2383,25 @@ fn batchDrainSubmitted(
     maybe_sync: *CancelRegion.Sync.Maybe,
     batch: *Io.Batch,
     concurrency: bool,
+    timeout: Io.Timeout,
 ) (Io.ConcurrentError || Io.Cancelable)!void {
     var index = batch.submitted.head;
     if (index == .none) return;
     const thread = try maybe_sync.cancelRegion().awaitIoUring();
     errdefer batch.submitted.head = index;
+    // A batch of exactly one network request with a timeout (the shape of
+    // `Io.operateTimeout`) links the timeout to the request in the ring: the
+    // kernel cancels whichever loses, so no timer has to be removed later
+    // (possibly on another thread's ring) and a timed-out request never
+    // lingers to be canceled by hand.
+    const link_spec: ?TimeoutSpec = if (concurrency and batch.submitted.head == batch.submitted.tail)
+        timeoutSpec(timeout)
+    else
+        null;
     while (index != .none) {
         const storage = &batch.storage[index.toIndex()];
         const next_index = storage.submission.node.next;
+        var linked = false;
         if (@as(?Io.Operation.Result, result: switch (storage.submission.operation) {
             .file_read_streaming => |o| {
                 const buffer = for (o.data) |buffer| {
@@ -2402,12 +2469,84 @@ fn batchDrainSubmitted(
             else
                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
             .net_receive => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_receive");
+                // Take what is already queued without blocking; only an empty
+                // queue costs a ring submission.
+                const opt_err, const count = netReceiveNonblocking(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| break :result .{ .net_receive = .{ e, count } },
+                } else break :result .{ .net_receive = .{ null, count } };
+                const context = ev.allocator().create(RecvContext) catch
+                    break :result .{ .net_receive = .{ error.SystemResources, 0 } };
+                context.init(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                storage.* = .{ .pending = .{
+                    .node = .{ .prev = batch.pending.tail, .next = .none },
+                    .tag = .net_receive,
+                    .userdata = undefined,
+                } };
+                storage.pending.userdata[3] = @intFromPtr(context);
+                if (link_spec != null) ev.reserveLinkedPair(thread);
+                thread.enqueue().* = .{
+                    .opcode = .RECVMSG,
+                    .flags = if (link_spec != null) linux.IOSQE_IO_LINK else 0,
+                    .ioprio = 0,
+                    .fd = o.socket_handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&context.msg),
+                    .len = 0,
+                    .rw_flags = posixReceiveFlags(o.flags),
+                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                if (link_spec) |spec| {
+                    context.timespec = spec.ts;
+                    enqueueLinkTimeout(thread, &context.timespec, spec.rw_flags, batch);
+                    linked = true;
+                }
+                break :result null;
             },
             .net_send => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_send");
+                const opt_err, const sent = netSendNonblocking(o.socket_handle, o.messages, o.flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| break :result .{ .net_send = .{ e, sent } },
+                } else break :result .{ .net_send = .{ null, sent } };
+                const context = ev.allocator().create(SendContext) catch
+                    break :result .{ .net_send = .{ error.SystemResources, 0 } };
+                context.init(o.socket_handle, o.messages, o.flags);
+                storage.* = .{ .pending = .{
+                    .node = .{ .prev = batch.pending.tail, .next = .none },
+                    .tag = .net_send,
+                    .userdata = undefined,
+                } };
+                storage.pending.userdata[3] = @intFromPtr(context);
+                if (link_spec != null) ev.reserveLinkedPair(thread);
+                thread.enqueue().* = .{
+                    .opcode = .SENDMSG,
+                    .flags = if (link_spec != null) linux.IOSQE_IO_LINK else 0,
+                    .ioprio = 0,
+                    .fd = o.socket_handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&context.msg),
+                    .len = 0,
+                    .rw_flags = posixSendFlags(o.flags),
+                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                if (link_spec) |spec| {
+                    context.timespec = spec.ts;
+                    enqueueLinkTimeout(thread, &context.timespec, spec.rw_flags, batch);
+                    linked = true;
+                }
+                break :result null;
             },
             .net_read => |o| {
                 _ = o;
@@ -2431,13 +2570,18 @@ fn batchDrainSubmitted(
             }
             batch.pending.tail = index;
             storage.pending.userdata[0] = @intFromPtr(batch);
+            // The ring this operation was submitted on. A fiber woken by the
+            // timer is often rescheduled on another thread, and a cancel must
+            // reach the ring that holds the request (see `batchCancel`).
+            storage.pending.userdata[4] = @as(u32, @bitCast(thread.io_uring.fd));
+            storage.pending.userdata[5] = @intFromBool(linked);
         }
         index = next_index;
     }
     batch.submitted = .{ .head = .none, .tail = .none };
 }
 
-fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
+fn batchDrainReady(ev: *Evented, batch: *Io.Batch) Io.Timeout.Error!void {
     while (@atomicRmw(?*anyopaque, &batch.userdata, .Xchg, null, .acquire)) |head| {
         var next: usize = @intFromPtr(head);
         var timeout = false;
@@ -2517,8 +2661,43 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                     },
                 },
                 .device_io_control => unreachable,
-                .net_receive => @panic("TODO"),
-                .net_send => @panic("TODO"),
+                .net_receive => {
+                    const context: *RecvContext = @ptrFromInt(operation_userdata[3]);
+                    defer ev.allocator().destroy(context);
+                    break :result .{
+                        .net_receive = switch (completion.errno()) {
+                            .SUCCESS => context.complete(@intCast(completion.result)),
+                            // Nothing was received; `Io.operateTimeout` arms again
+                            // when the slot comes back without a result.
+                            .CANCELED, .INTR, .AGAIN => break :result null,
+                            .BADF => |err| .{ errnoBug(err), 0 },
+                            .NFILE => .{ error.SystemFdQuotaExceeded, 0 },
+                            .MFILE => .{ error.ProcessFdQuotaExceeded, 0 },
+                            .FAULT => |err| .{ errnoBug(err), 0 },
+                            .INVAL => |err| .{ errnoBug(err), 0 },
+                            .NOBUFS => .{ error.SystemResources, 0 },
+                            .NOMEM => .{ error.SystemResources, 0 },
+                            .NOTCONN => .{ error.SocketUnconnected, 0 },
+                            .NOTSOCK => |err| .{ errnoBug(err), 0 },
+                            .MSGSIZE => .{ error.MessageOversize, 0 },
+                            .PIPE => .{ error.SocketUnconnected, 0 },
+                            .OPNOTSUPP => |err| .{ errnoBug(err), 0 },
+                            .CONNRESET => .{ error.ConnectionResetByPeer, 0 },
+                            .TIMEDOUT => .{ error.ConnectionTimedOut, 0 },
+                            .NETDOWN => .{ error.NetworkDown, 0 },
+                            else => |err| .{ unexpectedErrno(err), 0 },
+                        },
+                    };
+                },
+                .net_send => {
+                    const context: *SendContext = @ptrFromInt(operation_userdata[3]);
+                    defer ev.allocator().destroy(context);
+                    break :result .{ .net_send = switch (completion.errno()) {
+                        .SUCCESS => context.complete(@intCast(completion.result)),
+                        .CANCELED, .INTR, .AGAIN => break :result null,
+                        else => |err| .{ sendErrno(err), 0 },
+                    } };
+                },
                 .net_read => @panic("TODO"),
                 .net_write => @panic("TODO"),
             })) |result| {
@@ -2543,9 +2722,10 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
+    // A timer armed by an earlier `batchAwaitConcurrent` may still fire while
+    // the batch is being torn down; its marker is simply consumed here.
+    batchDrainReady(ev, batch) catch |err| switch (err) {
+        error.Timeout => {},
     };
     var index = batch.pending.head;
     if (index == .none) return;
@@ -2556,27 +2736,60 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     };
     while (index != .none) {
         const pending = &batch.storage[index.toIndex()].pending;
-        thread.enqueue().* = .{
-            .opcode = .ASYNC_CANCEL,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&pending.userdata) | 0b10,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @backingInt(Completion.Userdata.wakeup),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        const ring_fd: fd_t = @bitCast(@as(u32, @intCast(pending.userdata[4])));
+        if (ring_fd == thread.io_uring.fd) {
+            thread.enqueue().* = .{
+                .opcode = .ASYNC_CANCEL,
+                .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+                .ioprio = 0,
+                .fd = 0,
+                .off = 0,
+                .addr = @intFromPtr(&pending.userdata) | 0b10,
+                .len = 0,
+                .rw_flags = 0,
+                .user_data = @backingInt(Completion.Userdata.wakeup),
+                .buf_index = 0,
+                .personality = 0,
+                .splice_fd_in = 0,
+                .addr3 = 0,
+                .resv = 0,
+            };
+        } else {
+            // The request lives in a ring owned by another thread, and only
+            // that thread may submit to it (single issuer; the register-based
+            // synchronous cancel is refused for the same reason). Forward the
+            // request the way `Fiber.requestCancel` does: a MSG_RING message
+            // tagged 0b01 makes the owning thread issue the ASYNC_CANCEL
+            // itself. Bit 2 marks the target as a batch request. The
+            // canceled completion then lands on that ring and wakes this
+            // fiber through the batch's completion chain.
+            thread.enqueue().* = .{
+                .opcode = .MSG_RING,
+                .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+                .ioprio = 0,
+                .fd = ring_fd,
+                .off = @intFromPtr(&pending.userdata) | 0b101,
+                .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+                .len = 0,
+                .rw_flags = 0,
+                .user_data = @backingInt(Completion.Userdata.wakeup),
+                .buf_index = 0,
+                .personality = 0,
+                .splice_fd_in = 0,
+                .addr3 = 0,
+                .resv = 0,
+            };
+        }
         index = pending.node.next;
     }
-    while (batch.pending.head != .none) batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
-    };
+    // The cancel completions land on this thread's ring, which is only
+    // drained while this fiber is parked, so park until they arrive.
+    while (batch.pending.head != .none) {
+        ev.yield(null, .{ .batch_await = batch });
+        batchDrainReady(ev, batch) catch |err| switch (err) {
+            error.Timeout => {},
+        };
+    }
 }
 
 fn dirCreateDir(
@@ -5018,6 +5231,7 @@ fn netBindIp(
     defer maybe_sync.deinit(ev);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, options);
     errdefer ev.closeAsync(socket_fd);
+    if (options.reuse_port) try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1);
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
@@ -5069,6 +5283,422 @@ fn netSocketCreatePairUnavailable(
     return error.OperationUnsupported;
 }
 
+const TimeoutSpec = struct { ts: linux.kernel_timespec, rw_flags: u32 };
+
+/// The timespec and `TIMEOUT` flags for an `Io.Timeout`; null for `.none`.
+fn timeoutSpec(timeout: Io.Timeout) ?TimeoutSpec {
+    const ns, const clock, const abs = switch (timeout) {
+        .none => return null,
+        .duration => |d| .{ d.raw.toNanoseconds(), d.clock, @as(u32, 0) },
+        .deadline => |d| .{ d.raw.toNanoseconds(), d.clock, @as(u32, linux.IORING_TIMEOUT_ABS) },
+    };
+    return .{
+        .ts = .{
+            .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+            .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+        },
+        .rw_flags = abs | @as(u32, switch (clock) {
+            .real => linux.IORING_TIMEOUT_REALTIME,
+            .boot => linux.IORING_TIMEOUT_BOOTTIME,
+            else => 0,
+        }),
+    };
+}
+
+/// Makes room for a request and its linked timeout so that `enqueue` cannot
+/// submit the request alone in between (which would break the link).
+fn reserveLinkedPair(ev: *Evented, thread: *Thread) void {
+    const entries: u32 = @as(u32, 1) << ev.log2_ring_entries;
+    while (thread.io_uring.sq_ready() + 2 > entries) thread.submit();
+}
+
+/// A `LINK_TIMEOUT` for the request enqueued just before it. Its completion
+/// carries the batch's timeout tag: `ETIME` sets the timeout marker, and
+/// `CANCELED` (the request finished first) is ignored by the handler.
+fn enqueueLinkTimeout(thread: *Thread, timespec: *const linux.kernel_timespec, rw_flags: u32, batch: *Io.Batch) void {
+    thread.enqueue().* = .{
+        .opcode = .LINK_TIMEOUT,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = 0,
+        .off = 0,
+        .addr = @intFromPtr(timespec),
+        .len = 1,
+        .rw_flags = rw_flags,
+        .user_data = @intFromPtr(&batch.userdata) | 0b11,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+}
+
+/// Whether the batch consists of one pending request whose timeout is linked
+/// in the ring (see `batchDrainSubmitted`).
+fn batchIsLinked(batch: *const Io.Batch) bool {
+    const head = batch.pending.head;
+    if (head == .none or head != batch.pending.tail) return false;
+    return batch.storage[head.toIndex()].pending.userdata[5] == 1;
+}
+
+/// Message flags shared by every receive path.
+fn posixReceiveFlags(flags: net.ReceiveFlags) u32 {
+    return linux.MSG.NOSIGNAL |
+        @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
+        @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0);
+}
+
+fn posixSendFlags(flags: net.SendFlags) u32 {
+    return @as(u32, if (flags.confirm) linux.MSG.CONFIRM else 0) |
+        @as(u32, if (flags.dont_route) linux.MSG.DONTROUTE else 0) |
+        @as(u32, if (flags.eor) linux.MSG.EOR else 0) |
+        @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (flags.fastopen) linux.MSG.FASTOPEN else 0) |
+        linux.MSG.NOSIGNAL;
+}
+
+fn incomingFromMsghdr(
+    message: *net.IncomingMessage,
+    storage: *const PosixAddress,
+    data: []u8,
+    msg: *const linux.msghdr,
+) void {
+    message.* = .{
+        .from = addressFromPosix(storage),
+        .data = data,
+        .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+        .flags = .{
+            .eor = msg.flags & linux.MSG.EOR != 0,
+            .trunc = msg.flags & linux.MSG.TRUNC != 0,
+            .ctrunc = msg.flags & linux.MSG.CTRUNC != 0,
+            .oob = msg.flags & linux.MSG.OOB != 0,
+            .errqueue = msg.flags & linux.MSG.ERRQUEUE != 0,
+        },
+    };
+}
+
+fn receiveErrno(err: linux.E) Io.Operation.NetReceive.Error {
+    return switch (err) {
+        .BADF => |e| errnoBug(e),
+        .NFILE => error.SystemFdQuotaExceeded,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .NOTSOCK => |e| errnoBug(e),
+        .MSGSIZE => error.MessageOversize,
+        .PIPE => error.SocketUnconnected,
+        .OPNOTSUPP => |e| errnoBug(e),
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+fn sendErrno(err: linux.E) Io.Operation.NetSend.Error {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .MSGSIZE => error.MessageOversize,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .PIPE => error.SocketUnconnected,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketUnconnected,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .DESTADDRREQ => |e| errnoBug(e), // Not connection-mode and no peer address set.
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        .ISCONN => |e| errnoBug(e), // Connected socket but a recipient was specified.
+        .NOTSOCK => |e| errnoBug(e),
+        .OPNOTSUPP => |e| errnoBug(e), // A flag is inappropriate for the socket type.
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+/// One `recvmsg(2)` with `MSG_DONTWAIT`. Sockets made by this backend are in
+/// blocking mode, so the flag is what keeps a drain from parking the thread.
+fn recvmsgNonblocking(
+    handle: net.Socket.Handle,
+    message: *net.IncomingMessage,
+    data_buffer: []u8,
+    posix_flags: u32,
+) (Io.Operation.NetReceive.Error || error{WouldBlock})!void {
+    var storage: PosixAddress = undefined;
+    var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+    var msg: linux.msghdr = .{
+        .name = &storage.any,
+        .namelen = @sizeOf(PosixAddress),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        .control = message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = undefined,
+    };
+    while (true) {
+        const rc = linux.recvmsg(handle, &msg, posix_flags | linux.MSG.DONTWAIT);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                // With `MSG_TRUNC` the kernel reports the full datagram length.
+                incomingFromMsghdr(message, &storage, data_buffer[0..@min(rc, data_buffer.len)], &msg);
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return receiveErrno(err),
+        }
+    }
+}
+
+/// Receives as many messages as are immediately available, carving
+/// `data_buffer` sequentially (each message's `data` is a slice of it).
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN`, a full `message_buffer`, or an exhausted `data_buffer`
+/// ends the batch normally with the count received so far. Any other error
+/// is reported together with the number of messages already received, which
+/// the caller must still process.
+fn netReceiveNonblocking(
+    handle: net.Socket.Handle,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) struct { ?(Io.Operation.NetReceive.Error || error{WouldBlock}), usize } {
+    const posix_flags = posixReceiveFlags(flags);
+    var data_i: usize = 0;
+    for (message_buffer, 0..) |*message, message_i| {
+        const remaining = data_buffer[data_i..];
+        // No room left for another datagram: stop rather than let `recvmsg`
+        // consume one into a zero-length buffer.
+        if (remaining.len == 0 and message_i != 0) return .{ null, message_i };
+        recvmsgNonblocking(handle, message, remaining, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => return if (message_i == 0) .{ error.WouldBlock, 0 } else .{ null, message_i },
+            else => |e| return .{ e, message_i },
+        };
+        data_i += message.data.len;
+    }
+    return .{ null, message_buffer.len };
+}
+
+/// One `sendmsg(2)` with `MSG_DONTWAIT`.
+fn sendmsgNonblocking(
+    handle: net.Socket.Handle,
+    message: *net.OutgoingMessage,
+    posix_flags: u32,
+) (Io.Operation.NetSend.Error || error{WouldBlock})!void {
+    var addr: PosixAddress = undefined;
+    var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
+    const msg: linux.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = addressToPosix(message.address, &addr),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        // The kernel rejects a non-null control pointer with a zero length.
+        .control = if (message.control.len == 0) null else message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    while (true) {
+        const rc = linux.sendmsg(handle, &msg, posix_flags | linux.MSG.DONTWAIT);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                message.data_len = rc;
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return sendErrno(err),
+        }
+    }
+}
+
+/// Sends as many of `messages` as the socket accepts right now, in order.
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN` ends the batch normally with the count sent so far.
+fn netSendNonblocking(
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?(Io.Operation.NetSend.Error || error{WouldBlock}), usize } {
+    const posix_flags = posixSendFlags(flags);
+    for (messages, 0..) |*message, i| {
+        sendmsgNonblocking(handle, message, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => return if (i == 0) .{ error.WouldBlock, 0 } else .{ null, i },
+            else => |e| return .{ e, i },
+        };
+    }
+    return .{ null, messages.len };
+}
+
+/// Storage for a batched `net_receive` that had to wait in the ring. The
+/// kernel reads the `msghdr`, the `iovec` and the address through pointers,
+/// so they must outlive the submission; the struct is heap-allocated by
+/// `batchDrainSubmitted` and freed by `batchDrainReady`.
+const RecvContext = struct {
+    msg: linux.msghdr,
+    iov: iovec,
+    addr: PosixAddress,
+    /// Storage for the linked timeout's timespec; must outlive the submission.
+    timespec: linux.kernel_timespec,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+    handle: net.Socket.Handle,
+
+    fn init(
+        context: *RecvContext,
+        handle: net.Socket.Handle,
+        message_buffer: []net.IncomingMessage,
+        data_buffer: []u8,
+        flags: net.ReceiveFlags,
+    ) void {
+        context.handle = handle;
+        context.message_buffer = message_buffer;
+        context.data_buffer = data_buffer;
+        context.flags = flags;
+        context.iov = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+        context.msg = .{
+            .name = &context.addr.any,
+            .namelen = @sizeOf(PosixAddress),
+            .iov = (&context.iov)[0..1],
+            .iovlen = 1,
+            .control = message_buffer[0].control.ptr,
+            .controllen = @intCast(message_buffer[0].control.len),
+            .flags = undefined,
+        };
+    }
+
+    /// The ring delivered the first message; take whatever else is queued
+    /// without blocking, as the poll-based backends do on a wake.
+    fn complete(context: *RecvContext, received_len: usize) struct { ?Io.Operation.NetReceive.Error, usize } {
+        const first = &context.message_buffer[0];
+        const first_len = @min(received_len, context.data_buffer.len);
+        incomingFromMsghdr(first, &context.addr, context.data_buffer[0..first_len], &context.msg);
+        const opt_err, const more = netReceiveNonblocking(
+            context.handle,
+            context.message_buffer[1..],
+            context.data_buffer[first_len..],
+            context.flags,
+        );
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, 1 + more },
+        };
+        return .{ null, 1 + more };
+    }
+};
+
+/// Storage for a batched `net_send` whose first message had to wait in the
+/// ring. Same lifetime rules as `RecvContext`.
+const SendContext = struct {
+    msg: linux.msghdr_const,
+    iov: iovec_const,
+    addr: PosixAddress,
+    timespec: linux.kernel_timespec,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+    handle: net.Socket.Handle,
+
+    fn init(
+        context: *SendContext,
+        handle: net.Socket.Handle,
+        messages: []net.OutgoingMessage,
+        flags: net.SendFlags,
+    ) void {
+        const first = &messages[0];
+        context.handle = handle;
+        context.messages = messages;
+        context.flags = flags;
+        context.iov = .{ .base = first.data_ptr, .len = first.data_len };
+        context.msg = .{
+            .name = &context.addr.any,
+            .namelen = addressToPosix(first.address, &context.addr),
+            .iov = (&context.iov)[0..1],
+            .iovlen = 1,
+            .control = if (first.control.len == 0) null else first.control.ptr,
+            .controllen = @intCast(first.control.len),
+            .flags = 0,
+        };
+    }
+
+    fn complete(context: *SendContext, sent_len: usize) struct { ?Io.Operation.NetSend.Error, usize } {
+        context.messages[0].data_len = sent_len;
+        const opt_err, const more = netSendNonblocking(context.handle, context.messages[1..], context.flags);
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, 1 + more },
+        };
+        return .{ null, 1 + more };
+    }
+};
+
+fn netSend(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?net.Socket.SendError, usize } {
+    const posix_flags = posixSendFlags(flags);
+    var i: usize = 0;
+    while (i < messages.len) {
+        const message = &messages[i];
+        sendmsgNonblocking(handle, message, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => {
+                // Send buffer full: let the ring wait for room on this one.
+                var addr: PosixAddress = undefined;
+                var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
+                const msg: linux.msghdr_const = .{
+                    .name = &addr.any,
+                    .namelen = addressToPosix(message.address, &addr),
+                    .iov = (&iov)[0..1],
+                    .iovlen = 1,
+                    .control = if (message.control.len == 0) null else message.control.ptr,
+                    .controllen = @intCast(message.control.len),
+                    .flags = 0,
+                };
+                const thread = cancel_region.awaitIoUring() catch |e| return .{ e, i };
+                thread.enqueue().* = .{
+                    .opcode = .SENDMSG,
+                    .flags = 0,
+                    .ioprio = 0,
+                    .fd = handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&msg),
+                    .len = 0,
+                    .rw_flags = posix_flags,
+                    .user_data = @intFromPtr(cancel_region.fiber),
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                ev.yield(null, .nothing);
+                const completion = cancel_region.completion();
+                switch (completion.errno()) {
+                    .SUCCESS => message.data_len = @intCast(completion.result),
+                    .INTR, .CANCELED => continue, // retry this message
+                    .AGAIN => continue,
+                    else => |e| return .{ sendErrno(e), i },
+                }
+            },
+            else => |e| return .{ e, i },
+        };
+        i += 1;
+    }
+    return .{ null, messages.len };
+}
+
 fn netReceive(
     ev: *Evented,
     cancel_region: *CancelRegion,
@@ -5077,15 +5707,21 @@ fn netReceive(
     data_buffer: []u8,
     flags: net.ReceiveFlags,
 ) struct { ?net.Socket.ReceiveError, usize } {
-    var message_i: usize = 0;
-    var data_i: usize = 0;
-
+    assert(message_buffer.len >= 1);
+    // Take what is queued without blocking.
+    {
+        const opt_err, const count = netReceiveNonblocking(handle, message_buffer, data_buffer, flags);
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, count },
+        } else return .{ null, count };
+    }
+    // Nothing queued: wait for the first message in the ring, then drain the
+    // rest without blocking, as the poll-based backends do on a wake.
+    const message = &message_buffer[0];
     while (true) {
-        if (message_buffer.len - message_i == 0) return .{ null, message_i };
-        const message = &message_buffer[message_i];
-        const remaining_data_buffer = data_buffer[data_i..];
         var storage: PosixAddress = undefined;
-        var iov: iovec = .{ .base = remaining_data_buffer.ptr, .len = remaining_data_buffer.len };
+        var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
         var msg: linux.msghdr = .{
             .name = &storage.any,
             .namelen = @sizeOf(PosixAddress),
@@ -5096,7 +5732,7 @@ fn netReceive(
             .flags = undefined,
         };
 
-        const thread = cancel_region.awaitIoUring() catch |err| return .{ err, message_i };
+        const thread = cancel_region.awaitIoUring() catch |err| return .{ err, 0 };
         thread.enqueue().* = .{
             .opcode = .RECVMSG,
             .flags = 0,
@@ -5105,10 +5741,7 @@ fn netReceive(
             .off = 0,
             .addr = @intFromPtr(&msg),
             .len = 0,
-            .rw_flags = linux.MSG.NOSIGNAL |
-                @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
-                @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
-                @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0),
+            .rw_flags = posixReceiveFlags(flags),
             .user_data = @intFromPtr(cancel_region.fiber),
             .buf_index = 0,
             .personality = 0,
@@ -5120,41 +5753,18 @@ fn netReceive(
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => {
-                const data = remaining_data_buffer[0..@intCast(completion.result)];
-                data_i += data.len;
-                message.* = .{
-                    .from = addressFromPosix(&storage),
-                    .data = data,
-                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
-                    .flags = .{
-                        .eor = msg.flags & linux.MSG.EOR != 0,
-                        .trunc = msg.flags & linux.MSG.TRUNC != 0,
-                        .ctrunc = msg.flags & linux.MSG.CTRUNC != 0,
-                        .oob = msg.flags & linux.MSG.OOB != 0,
-                        .errqueue = msg.flags & linux.MSG.ERRQUEUE != 0,
-                    },
+                const data = data_buffer[0..@min(@as(usize, @intCast(completion.result)), data_buffer.len)];
+                incomingFromMsghdr(message, &storage, data, &msg);
+                const opt_err, const more = netReceiveNonblocking(handle, message_buffer[1..], data_buffer[data.len..], flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| return .{ e, 1 + more },
                 };
-                message_i += 1;
-                continue;
+                return .{ null, 1 + more };
             },
-            .AGAIN => unreachable,
+            .AGAIN => continue, // a foreign nonblocking socket; wait again
             .INTR, .CANCELED => {},
-            .BADF => |err| return .{ errnoBug(err), message_i },
-            .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
-            .MFILE => return .{ error.ProcessFdQuotaExceeded, message_i },
-            .FAULT => |err| return .{ errnoBug(err), message_i },
-            .INVAL => |err| return .{ errnoBug(err), message_i },
-            .NOBUFS => return .{ error.SystemResources, message_i },
-            .NOMEM => return .{ error.SystemResources, message_i },
-            .NOTCONN => return .{ error.SocketUnconnected, message_i },
-            .NOTSOCK => |err| return .{ errnoBug(err), message_i },
-            .MSGSIZE => return .{ error.MessageOversize, message_i },
-            .PIPE => return .{ error.SocketUnconnected, message_i },
-            .OPNOTSUPP => |err| return .{ errnoBug(err), message_i },
-            .CONNRESET => return .{ error.ConnectionResetByPeer, message_i },
-            .TIMEDOUT => return .{ error.ConnectionTimedOut, message_i },
-            .NETDOWN => return .{ error.NetworkDown, message_i },
-            else => |err| return .{ unexpectedErrno(err), message_i },
+            else => |err| return .{ receiveErrno(err), 0 },
         }
     }
 }
@@ -5287,11 +5897,33 @@ fn bind(
             .ACCES => return error.AccessDenied,
             .ADDRINUSE => return error.AddressInUse,
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .INVAL => |err| return errnoBug(err), // invalid parameters
+            // Kernels before 6.11 have no `IORING_OP_BIND` and reject the
+            // opcode with EINVAL. `bind(2)` never blocks, so fall back to it;
+            // a genuine EINVAL surfaces from the syscall instead.
+            .INVAL, .OPNOTSUPP => return bindSync(socket_fd, addr, addr_len),
             .NOTSOCK => |err| return errnoBug(err), // invalid `sockfd`
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
             .ADDRNOTAVAIL => return error.AddressUnavailable,
             .FAULT => |err| return errnoBug(err), // invalid `addr` pointer
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn bindSync(socket_fd: fd_t, addr: *const linux.sockaddr, addr_len: linux.socklen_t) !void {
+    while (true) {
+        switch (linux.errno(linux.bind(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .FAULT => |err| return errnoBug(err),
             .NOMEM => return error.SystemResources,
             else => |err| return unexpectedErrno(err),
         }
