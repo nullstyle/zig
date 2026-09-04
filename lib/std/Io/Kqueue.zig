@@ -1366,24 +1366,125 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     yield(k, null, .nothing);
 }
 
+/// Sets `O_NONBLOCK` and `FD_CLOEXEC` on an existing socket. Kqueue-driven
+/// sockets must not block the worker thread; `accept` has no per-call
+/// `MSG_DONTWAIT`, so a listening socket (and each accepted socket) needs
+/// the flag applied here.
+fn setSocketFlagsPosix(k: *Kqueue, socket_fd: posix.fd_t) error{ Unexpected, Canceled }!void {
+    var fl_flags: usize = while (true) {
+        try k.checkCancel();
+        const rc = posix.system.fcntl(socket_fd, posix.F.GETFL, @as(usize, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            .CANCELED => return error.Canceled,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    fl_flags |= @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
+    while (true) {
+        try k.checkCancel();
+        switch (posix.errno(posix.system.fcntl(socket_fd, posix.F.SETFL, fl_flags))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .CANCELED => return error.Canceled,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+    while (true) {
+        try k.checkCancel();
+        switch (posix.errno(posix.system.fcntl(socket_fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .CANCELED => return error.Canceled,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
 fn netListenIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = address;
-    _ = options;
-    @panic("TODO");
+    const family = Io.Threaded.posixAddressFamily(address);
+    const socket_fd = try openSocketPosix(k, family, .{
+        .mode = options.mode,
+        .protocol = options.protocol,
+    });
+    errdefer closeFd(socket_fd);
+    try setSocketFlagsPosix(k, socket_fd);
+
+    if (options.reuse_address) {
+        try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+        if (@hasDecl(posix.SO, "REUSEPORT"))
+            try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
+
+    var storage: Io.Threaded.PosixAddress = undefined;
+    var addr_len = Io.Threaded.addressToPosix(address, &storage);
+    try posixBind(k, socket_fd, &storage.any, addr_len);
+
+    const backlog: c_uint = if (options.kernel_backlog > std.math.maxInt(c_uint))
+        std.math.maxInt(c_uint)
+    else
+        @intCast(options.kernel_backlog);
+    while (true) {
+        try k.checkCancel();
+        switch (posix.errno(posix.system.listen(socket_fd, backlog))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            .CANCELED => return error.Canceled,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+
+    try posixGetSockName(k, socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
-fn netAccept(userdata: ?*anyopaque, server: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {
+
+fn netAccept(
+    userdata: ?*anyopaque,
+    server: net.Socket.Handle,
+    options: net.Server.AcceptOptions,
+) net.Server.AcceptError!net.Socket {
+    _ = options;
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = server;
-    _ = options;
-    @panic("TODO");
+    while (true) {
+        var storage: Io.Threaded.PosixAddress = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(Io.Threaded.PosixAddress);
+        const rc = posix.system.accept(server, &storage.any, &addr_len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const socket_fd: posix.fd_t = @intCast(rc);
+                errdefer closeFd(socket_fd);
+                try setSocketFlagsPosix(k, socket_fd);
+                return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
+            },
+            .INTR => continue,
+            // The listening socket is nonblocking; park until a connection
+            // is pending.
+            .AGAIN => try waitReady(k, @bitCast(@as(isize, server)), std.c.EVFILT.READ),
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .CONNABORTED => return error.ConnectionAborted,
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => return error.SocketNotListening,
+            .NOTSOCK => |err| return errnoBug(err),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .OPNOTSUPP => |err| return errnoBug(err),
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
 }
+
 fn netBindIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
