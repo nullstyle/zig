@@ -256,23 +256,40 @@ pub fn deinit(k: *Kqueue) void {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
     }
-    // A worker erases its own `Thread` struct as it exits (`threadEntry`
-    // calls `Thread.deinit`), so the join handles are snapshotted before
-    // the exit signal; afterwards the structs may already be garbage.
+    // Wake every thread with the exit event directly from this fiber's
+    // thread; a kevent change needs no context switch. The previous
+    // design parked this fiber via `yield(null, .exit)` and ran the
+    // triggers from the idle context, which left this thread's idle loop
+    // spinning through the window where workers erased their `Thread`
+    // structs — its ready-fiber search then dereferenced them.
+    for (k.threads.allocated[0..active_threads]) |*thread| {
+        triggerWakeupEvent(thread.kq_fd, @backingInt(Completion.UserData.exit));
+    }
+    // Join the workers before touching any `Thread` or the fiber pool: a
+    // worker still inside `idle` can be scheduling fibers or recycling
+    // into the pool. Workers retire their queues with the `finished`
+    // lock before exiting, so the join is the final synchronization
+    // point; all per-thread cleanup happens here, after it. The calling
+    // fiber may itself have migrated to a worker (a group handoff or a
+    // stolen wake moves fibers between threads), so never join — or
+    // otherwise wait on — the current thread: it keeps running the
+    // caller through the rest of teardown and the process exit, on the
+    // caller's stack, and is never joined.
     const gpa = k.gpa;
-    const join_handles = gpa.alloc(std.Thread, active_threads) catch @panic("OOM joining kqueue threads");
-    defer gpa.free(join_handles);
-    for (k.threads.allocated[0..active_threads], join_handles) |*thread, *handle| handle.* = thread.thread;
-    k.yield(null, .exit);
-    const main_thread = &k.threads.allocated[0];
+    const current_thread: *Thread = .current();
+    // Index 0 is the calling OS thread's own struct and is never joinable:
+    // either it is the current thread, or it already exited via
+    // `mainIdle`'s `pthread_exit` after the main fiber migrated here.
+    for (k.threads.allocated[1..active_threads]) |*thread| {
+        if (thread != current_thread) thread.thread.join();
+    }
     while (k.fiber_pool.load(.acquire)) |fiber| {
         k.fiber_pool.store(fiber.queue_next, .monotonic);
         gpa.free(fiber.allocatedSlice());
     }
-    main_thread.deinit(gpa);
+    for (k.threads.allocated[0..active_threads]) |*thread| thread.deinit(gpa);
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(k.threads.allocated.ptr));
     const idle_stack_end_offset = std.mem.alignForward(usize, k.threads.allocated.len * @sizeOf(Thread) + idle_stack_size, std.heap.page_size_max);
-    for (join_handles[1..active_threads]) |handle| handle.join();
     gpa.free(allocated_ptr[0..idle_stack_end_offset]);
     k.* = undefined;
 }
@@ -457,14 +474,24 @@ fn schedule(k: *Kqueue, thread: *Thread, ready_queue: Fiber.Queue) void {
         ready_queue.head,
         .acq_rel,
         .acquire,
-    )) |old_head| ready_queue.tail.queue_next = old_head;
+    )) |old_head| {
+        // Never splice the lock sentinel into the chain: retry until the
+        // owner's pop stores the real head. (A fiber linked with
+        // `queue_next == finished` would store the sentinel back as the
+        // queue itself, and the next pop would treat it as a fiber.)
+        if (old_head != Fiber.finished) ready_queue.tail.queue_next = old_head;
+    }
 }
 
 fn mainIdle(k: *Kqueue, message: *const SwitchMessage) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Io.fiber.Context)))) noreturn {
     message.handle(k);
     k.idle(&k.threads.allocated[0]);
-    k.yield(@ptrCast(&k.main_fiber_buffer), .nothing);
-    unreachable; // switched to dead fiber
+    // `idle` only returns on the exit event, by which time the main fiber
+    // may have migrated to a worker and be running `deinit` there.
+    // Resuming it here would execute one stack on two threads, so this
+    // thread's part in the process is over: the main fiber finishes the
+    // teardown (and the process) wherever it happens to be running.
+    posix.system.pthread_exit(@ptrFromInt(0));
 }
 
 fn threadEntry(k: *Kqueue, index: u32) void {
@@ -472,7 +499,23 @@ fn threadEntry(k: *Kqueue, index: u32) void {
     Thread.self = thread;
     std.log.debug("created thread idle {*}", .{&thread.idle_context});
     k.idle(thread);
-    thread.deinit(k.gpa);
+    // Retire the queue with the permanent `finished` lock: steal searches
+    // skip it and cross-thread pushes fail their null-expected CAS. The
+    // `Thread` struct itself stays valid — its fd and wait map are closed
+    // by `deinit` after joining — so a peer that is mid-`findReadyFiber`
+    // or `schedule` when this thread exits never races freed or poisoned
+    // memory. (Erasing the struct here, as this used to do, left the
+    // struct readable through `threads.allocated[0..active]` while its
+    // fields turned to `undefined`: the steal loop then treated the
+    // poison as a fiber pointer and faulted reading `queue_next`.)
+    if (@cmpxchgStrong(
+        ?*Fiber,
+        &thread.ready_queue,
+        null,
+        Fiber.finished,
+        .release,
+        .monotonic,
+    )) |stray| assert(stray == Fiber.finished); // push after the exit event: pending async
 }
 
 /// Backend state for an `Io.Group`. The awaiter owns this memory: member
@@ -517,16 +560,6 @@ const batch_userdata_tag: usize = 1;
 /// scheduling itself when a wake already landed. Several events can
 /// therefore arrive for one wait (a readiness plus the timer plus stale
 /// registrations from before a migration) and exactly one wake happens.
-///
-/// REMAINING KNOWN CRASH, deeper than this waiter: with one server and
-/// two client fibers on a shared instance (`--loops 1 --clients 2`), the
-/// process faults in `findReadyFiber` reading `ready_fiber.queue_next`
-/// with the queue's own lock sentinel (8) as the head — the ready-queue
-/// lock state leaks between operations somewhere in the scheduler. Both
-/// this waiter and its predecessor (armed/fired CAS) reproduce it, at
-/// the same site, while `ev-thread` (one instance per thread) does not;
-/// the single-fiber and suite shapes pass. Until the scheduler bug is
-/// found, prefer one Kqueue instance per thread.
 const BatchWaiter = struct {
     /// null while the fiber runs; the fiber while it is parked; the
     /// `finished` sentinel once an event has claimed the wake.
@@ -637,7 +670,6 @@ const SwitchMessage = struct {
 
     const PendingTask = union(enum) {
         nothing,
-        reschedule,
         recycle: *Fiber,
         register_awaiter: *?*Fiber,
         /// Parks the switching fiber in a batch waiter slot. Unlike
@@ -647,7 +679,6 @@ const SwitchMessage = struct {
         /// schedule itself — without overwriting the sentinel, which later
         /// stale events must keep seeing.
         register_batch_waiter: *?*Fiber,
-        exit,
     };
 
     fn handle(message: *const SwitchMessage, k: *Kqueue) void {
@@ -655,11 +686,6 @@ const SwitchMessage = struct {
         thread.current_context = message.contexts.new;
         switch (message.pending_task) {
             .nothing => {},
-            .reschedule => if (message.contexts.old != &thread.idle_context) {
-                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                assert(prev_fiber.queue_next == null);
-                k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-            },
             .recycle => |fiber| {
                 k.recycle(fiber);
             },
@@ -683,11 +709,6 @@ const SwitchMessage = struct {
                     // A wake already landed; the sentinel stays so stale
                     // events keep no-op'ing.
                     k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-                }
-            },
-            .exit => {
-                for (k.threads.allocated[0..@atomicLoad(u32, &k.threads.active, .acquire)]) |*each_thread| {
-                    triggerWakeupEvent(each_thread.kq_fd, @backingInt(Completion.UserData.exit));
                 }
             },
         }
