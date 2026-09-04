@@ -59,13 +59,6 @@ const Thread = struct {
 
     threadlocal var self: *Thread = undefined;
 
-    /// The load must be volatile: fibers migrate between OS threads inside
-    /// `contextSwitch`, and a non-volatile threadlocal read can be hoisted
-    /// out of a park loop and reused after the switch (a register clobber
-    /// does not invalidate a stack spill, and the compiler is free to
-    /// assume a threadlocal cannot change within a function). A cached
-    /// value made a migrated fiber lock, arm, and park against the thread
-    /// it had left, corrupting that thread's ready queue.
     fn current() *Thread {
         return @as(*volatile *Thread, @ptrCast(&self)).*;
     }
@@ -327,7 +320,11 @@ fn registerWakeupEvent(kq_fd: posix.fd_t) void {
         .{
             .ident = 0,
             .filter = std.c.EVFILT.USER,
-            .flags = std.c.EV.ADD,
+            // EV_CLEAR re-arms the knote after each delivery. Without it a
+            // triggered user event stays ready, every kevent() call returns
+            // immediately, and idle threads busy-spin (a healthy benchmark
+            // run burned ~2 minutes of CPU across idle workers).
+            .flags = std.c.EV.ADD | std.c.EV.CLEAR,
             .fflags = 0,
             .data = 0,
             .udata = @backingInt(Completion.UserData.wakeup),
