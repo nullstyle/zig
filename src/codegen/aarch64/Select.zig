@@ -9772,31 +9772,45 @@ pub const Value = struct {
                         while (part_it.next()) |part_vi| {
                             const part_offset, const part_size = part_vi.position(isel);
                             const part_mat = try part_vi.matReg(isel);
-                            try isel.emit(if (part_vi.isVector(isel)) emit: {
-                                assert(part_offset == 0 and part_size == vi_size);
-                                break :emit switch (vi_size) {
-                                    else => unreachable,
-                                    2 => if (isel.target.cpu.has(.aarch64, .fullfp16))
-                                        .fmov(ra.h(), .{ .register = part_mat.ra.h() })
-                                    else
-                                        .dup(ra.h(), part_mat.ra.@"h[]"(0)),
-                                    4 => .fmov(ra.s(), .{ .register = part_mat.ra.s() }),
-                                    8 => .fmov(ra.d(), .{ .register = part_mat.ra.d() }),
-                                    16 => .orr(ra.@"16b"(), part_mat.ra.@"16b"(), .{ .register = part_mat.ra.@"16b"() }),
-                                };
+                            if (part_vi.isVector(isel)) {
+                                if (part_offset == 0 and part_size == vi_size) {
+                                    try isel.emit(switch (vi_size) {
+                                        else => unreachable,
+                                        2 => if (isel.target.cpu.has(.aarch64, .fullfp16))
+                                            .fmov(ra.h(), .{ .register = part_mat.ra.h() })
+                                        else
+                                            .dup(ra.h(), part_mat.ra.@"h[]"(0)),
+                                        4 => .fmov(ra.s(), .{ .register = part_mat.ra.s() }),
+                                        8 => .fmov(ra.d(), .{ .register = part_mat.ra.d() }),
+                                        16 => .orr(ra.@"16b"(), part_mat.ra.@"16b"(), .{ .register = part_mat.ra.@"16b"() }),
+                                    });
+                                } else {
+                                    // A vector value the register allocator split
+                                    // across several registers (for example a
+                                    // size-4 vector in two 2-byte parts): move
+                                    // this part into the destination register
+                                    // one byte element at a time.
+                                    var byte_index: u64 = 0;
+                                    while (byte_index < part_size) : (byte_index += 1) {
+                                        try isel.emit(.ins(
+                                            ra.@"b[]"(@intCast(part_offset + byte_index)),
+                                            part_mat.ra.@"b[]"(@intCast(byte_index)),
+                                        ));
+                                    }
+                                }
                             } else switch (vi_size) {
                                 else => unreachable,
-                                1...4 => .bfm(ra.w(), part_mat.ra.w(), .{
+                                1...4 => try isel.emit(.bfm(ra.w(), part_mat.ra.w(), .{
                                     .N = .word,
                                     .immr = @as(u5, @truncate(32 - 8 * part_offset)),
                                     .imms = @intCast(8 * part_size - 1),
-                                }),
-                                5...8 => .bfm(ra.x(), part_mat.ra.x(), .{
+                                })),
+                                5...8 => try isel.emit(.bfm(ra.x(), part_mat.ra.x(), .{
                                     .N = .doubleword,
                                     .immr = @as(u6, @truncate(64 - 8 * part_offset)),
                                     .imms = @intCast(8 * part_size - 1),
-                                }),
-                            });
+                                })),
+                            }
                             try part_mat.finish(isel);
                         }
                         vi = def_vi;
@@ -10238,6 +10252,60 @@ pub const Value = struct {
                                 _ = vi.addPart(isel, child_size - 8, 1);
                             } else unreachable,
                             else => return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)}),
+                        }
+                    },
+                    .vector_type => |vector_type| {
+                        // A vector iterates like an array of its element
+                        // type; the part-combining below already marks
+                        // SIMD-sized parts as vectors, so a large vector
+                        // splits into 16-byte loads and stores.
+                        const min_part_log2_stride: u5 = if (size > 16) 4 else if (size > 8) 3 else 0;
+                        if (vector_type.len > Value.max_parts and
+                            (@divCeil(size, @as(u64, 1) << min_part_log2_stride)) > Value.max_parts)
+                            return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)});
+                        const alignment = vi.alignment(isel);
+                        const Part = struct { offset: u64, size: u64 };
+                        var parts: [Value.max_parts]Part = undefined;
+                        var parts_len: Value.PartsLen = 0;
+                        const elem_ty: ZigType = .fromInterned(vector_type.child);
+                        const elem_size = elem_ty.abiSize(zcu);
+                        const elem_signedness = if (ty.isAbiInt(zcu)) elem_signedness: {
+                            const elem_int_info = elem_ty.intInfo(zcu);
+                            break :elem_signedness if (elem_int_info.bits <= 16) elem_int_info.signedness else null;
+                        } else null;
+                        const elem_is_vector = elem_size <= 16 and
+                            CallAbiIterator.homogeneousAggregateBaseType(zcu, elem_ty.toIntern()) != null;
+                        var elem_end: u64 = 0;
+                        for (0..@intCast(vector_type.len)) |_| {
+                            const elem_begin = elem_end;
+                            if (elem_begin >= offset + size) break;
+                            elem_end = elem_begin + elem_size;
+                            if (elem_end <= offset) continue;
+                            if (offset >= elem_begin and offset + size <= elem_begin + elem_size) {
+                                ty = elem_ty;
+                                ty_size = elem_size;
+                                offset -= elem_begin;
+                                continue :type_key ip.indexToKey(elem_ty.toIntern());
+                            }
+                            if (parts_len > 0) combine: {
+                                const prev_part = &parts[parts_len - 1];
+                                const combined_size = elem_end - prev_part.offset;
+                                if (combined_size > @as(u64, 1) << @min(
+                                    min_part_log2_stride,
+                                    alignment.toLog2Units(),
+                                    @ctz(prev_part.offset),
+                                )) break :combine;
+                                prev_part.size = combined_size;
+                                continue;
+                            }
+                            parts[parts_len] = .{ .offset = elem_begin, .size = elem_size };
+                            parts_len += 1;
+                        }
+                        vi.setParts(isel, parts_len);
+                        for (parts[0..parts_len]) |part| {
+                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            if (elem_signedness) |signedness| subpart_vi.setSignedness(isel, signedness);
+                            if (elem_is_vector) subpart_vi.setIsVector(isel);
                         }
                     },
                     .array_type => |array_type| {
