@@ -59,7 +59,19 @@ const Thread = struct {
 
     threadlocal var self: *Thread = undefined;
 
-    fn current() *Thread {
+    /// Reading the identity is a call that cannot be inlined, and its
+    /// load is volatile: fibers migrate between OS threads inside
+    /// `contextSwitch`, but the compiler is free to assume a threadlocal
+    /// cannot change within a function. A non-volatile read, or an
+    /// inlined one whose thread-pointer address computation gets hoisted
+    /// out of a park loop and spilled across the switch (a register
+    /// clobber does not invalidate a stack spill), makes a migrated
+    /// fiber read the OLD thread's slot — memory the thread library
+    /// frees when that thread exits — and then lock, arm, and park
+    /// against garbage. The call re-executes the address computation on
+    /// the current thread; the volatile load cannot be merged across
+    /// calls.
+    noinline fn current() *Thread {
         return @as(*volatile *Thread, @ptrCast(&self)).*;
     }
 
