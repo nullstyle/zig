@@ -216,7 +216,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .empty, .batch_waiter = .{ .fiber = undefined, .state = .init(.canceled) },
+        .awaiting_completions = .empty, .batch_waiter = .{},
     };
     const main_thread = &k.threads.allocated[0];
     Thread.self = main_thread;
@@ -497,33 +497,45 @@ const GroupState = struct {
 /// pointer (both at least 4-aligned).
 const batch_userdata_tag: usize = 1;
 
-/// The waiting fiber's side of a batched await. The events for the batch's
-/// operations (and its timer) carry `&fiber.batch_waiter | 1` as udata; the
-/// idle loop only flips `armed` to `fired` (once) and schedules the fiber.
-/// All batch bookkeeping happens on the fiber itself, which makes the
-/// cancel path safe: a fiber that has moved on leaves `canceled`/`fired`
-/// behind and late events do nothing.
+/// The waiting fiber's side of a batched await, using the same
+/// register_awaiter handshake `Future.await` uses, which makes stale
+/// events harmless: an event swaps `parked` to the `finished` sentinel
+/// and schedules the fiber only when it was actually parked, and the
+/// fiber parks by swapping itself into the slot from the switch task
+/// (scheduling itself immediately when a wake already landed). A late
+/// event for an earlier wait of the same fiber therefore causes at most
+/// a spurious wake — the fiber re-drains its submitted operations
+/// nonblocking and re-parks — and can never schedule a running fiber.
 ///
-/// KNOWN LIMITATION (verified crashing under an 8x16 loop load): this is
-/// only sound on a single-threaded instance (`InitOptions.n_threads = 1`).
-/// A fiber parks with its kevents registered on the current thread's kq;
-/// work stealing can resume it elsewhere, and a stale event still in the
-/// old thread's kevent return buffer carries the same waiter address the
-/// fiber's NEXT wait re-arms — it flips `armed` and schedules a fiber that
-/// is running on another thread, corrupting it. The single-operation path
-/// does not share this hazard because `wait_queues` gives it exactly-once
-/// delivery; a fiber must not sit in several wait_queues entries at once,
-/// so batching cannot reuse that mechanism as-is. Fixing the shared
-/// instance needs per-wait identity (generation tokens or fresh waiter
-/// nodes) — until then, prefer one instance per thread.
+/// `kq_fd` records where this wait's kevents were registered; after a
+/// work-stealing migration the fiber's deletes must target that kq, not
+/// its current one.
+///
+/// The wake side swaps the `finished` sentinel into `parked` and
+/// schedules the fiber only when it took the fiber from the slot; the
+/// park side claims the slot from empty with a CAS in the switch task,
+/// scheduling itself when a wake already landed. Several events can
+/// therefore arrive for one wait (a readiness plus the timer plus stale
+/// registrations from before a migration) and exactly one wake happens.
+///
+/// REMAINING KNOWN CRASH, deeper than this waiter: with one server and
+/// two client fibers on a shared instance (`--loops 1 --clients 2`), the
+/// process faults in `findReadyFiber` reading `ready_fiber.queue_next`
+/// with the queue's own lock sentinel (8) as the head — the ready-queue
+/// lock state leaks between operations somewhere in the scheduler. Both
+/// this waiter and its predecessor (armed/fired CAS) reproduce it, at
+/// the same site, while `ev-thread` (one instance per thread) does not;
+/// the single-fiber and suite shapes pass. Until the scheduler bug is
+/// found, prefer one Kqueue instance per thread.
 const BatchWaiter = struct {
-    fiber: *Fiber,
-    state: std.atomic.Value(State),
+    /// null while the fiber runs; the fiber while it is parked; the
+    /// `finished` sentinel once an event has claimed the wake.
+    parked: ?*Fiber = null,
     /// Absolute deadline on the awake clock, when the wait is timed.
     /// Nanoseconds; i64 keeps `Fiber`'s alignment unchanged.
     when_ns: ?i64 = null,
-
-    const State = enum(u8) { armed, fired, canceled };
+    /// The kqueue descriptor this wait's kevents were registered on.
+    kq_fd: posix.fd_t = -1,
 };
 
 const Completion = struct {
@@ -568,16 +580,18 @@ fn idle(k: *Kqueue, thread: *Thread) void {
                 if (event.udata & batch_userdata_tag != 0) {
                     // A batched operation (or its timer) fired. The fiber
                     // performs all bookkeeping after it wakes; here it is
-                    // only woken, once.
+                    // only woken, and only if it was parked.
                     const waiter: *BatchWaiter = @ptrFromInt(event.udata & ~batch_userdata_tag);
-                    if (waiter.state.cmpxchgStrong(.armed, .fired, .acq_rel, .monotonic) == null) {
+                    const parked = @atomicRmw(?*Fiber, &waiter.parked, .Xchg, Fiber.finished, .acq_rel);
+                    if (parked) |ready_fiber| {
+                        if (ready_fiber == Fiber.finished) continue;
                         if (maybe_ready_fiber == null) {
-                            maybe_ready_fiber = waiter.fiber;
+                            maybe_ready_fiber = ready_fiber;
                         } else if (maybe_ready_queue) |*ready_queue| {
-                            ready_queue.tail.queue_next = waiter.fiber;
-                            ready_queue.tail = waiter.fiber;
+                            ready_queue.tail.queue_next = ready_fiber;
+                            ready_queue.tail = ready_fiber;
                         } else {
-                            maybe_ready_queue = .{ .head = waiter.fiber, .tail = waiter.fiber };
+                            maybe_ready_queue = .{ .head = ready_fiber, .tail = ready_fiber };
                         }
                     }
                     continue;
@@ -626,6 +640,13 @@ const SwitchMessage = struct {
         reschedule,
         recycle: *Fiber,
         register_awaiter: *?*Fiber,
+        /// Parks the switching fiber in a batch waiter slot. Unlike
+        /// `register_awaiter`, this only claims the slot when it is empty:
+        /// a wake that landed between arming the kevents and the switch
+        /// has already left the `finished` sentinel, and the fiber must
+        /// schedule itself — without overwriting the sentinel, which later
+        /// stale events must keep seeing.
+        register_batch_waiter: *?*Fiber,
         exit,
     };
 
@@ -647,6 +668,22 @@ const SwitchMessage = struct {
                 assert(prev_fiber.queue_next == null);
                 if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
                     k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+            },
+            .register_batch_waiter => |slot| {
+                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
+                assert(prev_fiber.queue_next == null);
+                if (@cmpxchgStrong(
+                    ?*Fiber,
+                    slot,
+                    null,
+                    prev_fiber,
+                    .acq_rel,
+                    .acquire,
+                ) != null) {
+                    // A wake already landed; the sentinel stays so stale
+                    // events keep no-op'ing.
+                    k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                }
             },
             .exit => {
                 for (k.threads.allocated[0..@atomicLoad(u32, &k.threads.active, .acquire)]) |*each_thread| {
@@ -903,7 +940,7 @@ fn concurrent(
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .empty, .batch_waiter = .{ .fiber = undefined, .state = .init(.canceled) },
+        .awaiting_completions = .empty, .batch_waiter = .{},
     };
     closure.* = .{
         .kqueue = k,
@@ -1007,7 +1044,7 @@ fn groupConcurrent(
         .queue_next = null,
         .cancel_thread = null,
         .awaiting_completions = .empty,
-        .batch_waiter = .{ .fiber = undefined, .state = .init(.canceled) },
+        .batch_waiter = .{},
     };
     closure.* = .{
         .kqueue = k,
@@ -2036,9 +2073,8 @@ fn waitReady(k: *Kqueue, ident: usize, filter: i16) Io.Cancelable!void {
 /// Adds or deletes the calling fiber's batch timer. The timer's ident is
 /// the fiber pointer (unique per waiting fiber; fd idents are small), its
 /// udata the tagged batch waiter.
-fn batchTimerChange(k: *Kqueue, fiber: *Fiber, ms: i64, delete: bool) void {
-    _ = k;
-    const thread: *Thread = .current();
+fn batchTimerChange(kq_fd: posix.fd_t, fiber: *Fiber, ms: i64, delete: bool) void {
+    if (kq_fd < 0) return;
     const changes = [_]posix.Kevent{
         .{
             .ident = @intFromPtr(fiber),
@@ -2051,7 +2087,7 @@ fn batchTimerChange(k: *Kqueue, fiber: *Fiber, ms: i64, delete: bool) void {
     };
     // A delete of an already-consumed timer is fine (ENOENT); any other
     // failure only pessimises scheduling.
-    _ = kevent(thread.kq_fd, &changes, &.{}, null) catch {};
+    _ = kevent(kq_fd, &changes, &.{}, null) catch {};
 }
 
 /// Tries every submitted operation without blocking. Operations that
@@ -2203,16 +2239,21 @@ fn batchAwaitConcurrent(
     timeout: Io.Timeout,
 ) Io.Batch.AwaitConcurrentError!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    const thread: *Thread = .current();
-    const fiber = thread.currentFiber();
+    const fiber = Thread.current().currentFiber();
     const waiter = &fiber.batch_waiter;
     while (true) {
+        // Events must find the slot empty while the fiber runs, so a
+        // stale event only records the wake; the register_awaiter switch
+        // task below parks this fiber atomically and schedules it right
+        // away when a wake already landed.
+        @atomicStore(?*Fiber, &waiter.parked, null, .release);
         try batchDrainSubmitted(k, b);
         if (b.submitted.head == .none) return; // everything completed
         if (b.completed.head != .none) return; // something completed inline
-        // Arm the waiter (re-arming consumed one-shots is an EV_ADD
-        // refresh) and the timer.
-        waiter.* = .{ .fiber = fiber, .state = .init(.armed) };
+        // Re-arming consumed one-shots is an EV_ADD refresh. The drain ran
+        // on this thread, so this wait's kevents live on its kq; after a
+        // work-stealing migration the deletes must still target it.
+        waiter.kq_fd = Thread.current().kq_fd;
         var when_ns: ?i64 = null;
         if (timeout != .none) {
             when_ns = switch (timeout) {
@@ -2230,13 +2271,13 @@ fn batchAwaitConcurrent(
                     break :ms @divTrunc(remaining, std.time.ns_per_ms);
                 },
             };
-            batchTimerChange(k, fiber, ms, false);
+            batchTimerChange(waiter.kq_fd, fiber, ms, false);
         }
-        yield(k, null, .nothing);
-        // A stale wake (an event for an earlier arm of this waiter, or a
+        yield(k, null, .{ .register_batch_waiter = &waiter.parked });
+        // A stale wake (an event for an earlier wait of this fiber, or a
         // spurious one) just goes back to sleep after the deadline check.
         if (b.submitted.head == .none) {
-            if (timeout != .none) batchTimerChange(k, fiber, 0, true);
+            if (timeout != .none) batchTimerChange(waiter.kq_fd, fiber, 0, true);
             return;
         }
         if (timeout != .none) {
@@ -2255,13 +2296,12 @@ fn batchAwaitConcurrent(
 }
 
 fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    const thread: *Thread = .current();
-    const fiber = thread.currentFiber();
-    // The fiber runs, so in-flight events can only arrive later; leaving
-    // `fired` behind makes them no-ops.
-    fiber.batch_waiter.state.store(.fired, .release);
-    if (fiber.batch_waiter.when_ns != null) batchTimerChange(k, fiber, 0, true);
+    _ = userdata;
+    const fiber = Thread.current().currentFiber();
+    // The fiber runs (slot empty), so in-flight events can only arrive
+    // later and find the `finished` sentinel: no-ops.
+    _ = @atomicRmw(?*Fiber, &fiber.batch_waiter.parked, .Xchg, Fiber.finished, .acq_rel);
+    if (fiber.batch_waiter.when_ns != null) batchTimerChange(fiber.batch_waiter.kq_fd, fiber, 0, true);
     var changes: [changes_buffer_len]posix.Kevent = undefined;
     var changes_len: usize = 0;
     var index = b.submitted.head;
@@ -2292,8 +2332,8 @@ fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
         changes_len += 1;
         index = submission.node.next;
     }
-    if (changes_len != 0) {
-        _ = kevent(thread.kq_fd, changes[0..changes_len], &.{}, null) catch {};
+    if (changes_len != 0 and fiber.batch_waiter.kq_fd >= 0) {
+        _ = kevent(fiber.batch_waiter.kq_fd, changes[0..changes_len], &.{}, null) catch {};
     }
     // Return the storages to the unused list, as the other backends do.
     index = b.submitted.head;
