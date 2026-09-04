@@ -20,6 +20,14 @@ gpa: Allocator,
 mutex: Io.Mutex,
 main_fiber_buffer: [@sizeOf(Fiber) + Fiber.max_result_size]u8 align(@alignOf(Fiber)),
 threads: Thread.List,
+/// Finished fibers, kept for reuse. Fibers are pooled rather than freed
+/// because kevents that fired before their wait was satisfied (or
+/// cancelled) can still be delivered later, and their udata points at the
+/// fiber or its batch waiter: freed memory would turn that late delivery
+/// into use-after-free. A pooled fiber's waiter is reinitialized on reuse,
+/// so a late event at worst causes a spurious wake the waiter's state
+/// machine absorbs.
+fiber_pool: std.atomic.Value(?*Fiber),
 
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 const idle_stack_size = 256 * 1024;
@@ -80,6 +88,10 @@ const Fiber = struct {
     queue_next: ?*Fiber,
     cancel_thread: ?*Thread,
     awaiting_completions: std.bit_set.Static(3),
+    /// The fiber's side of a batched wait; lives here so events that arrive
+    /// late (after the wait completed or was cancelled) reference memory
+    /// that is stable for the fiber's whole life.
+    batch_waiter: BatchWaiter,
 
     const finished: ?*Fiber = @ptrFromInt(@alignOf(Thread));
 
@@ -101,6 +113,16 @@ const Fiber = struct {
     );
 
     fn allocate(k: *Kqueue) error{OutOfMemory}!*Fiber {
+        var head = k.fiber_pool.load(.acquire);
+        while (head) |fiber| {
+            const next = fiber.queue_next;
+            if (k.fiber_pool.cmpxchgWeak(head, next, .acquire, .acquire)) |actual| {
+                head = actual;
+                continue;
+            }
+            fiber.queue_next = null;
+            return fiber;
+        }
         return @ptrCast(try k.gpa.alignedAlloc(u8, .of(Fiber), allocation_size));
     }
 
@@ -152,7 +174,14 @@ const Fiber = struct {
 fn recycle(k: *Kqueue, fiber: *Fiber) void {
     std.log.debug("recyling {*}", .{fiber});
     assert(fiber.queue_next == null);
-    k.gpa.free(fiber.allocatedSlice());
+    // The `.recycle` switch task runs on the destination thread, so the
+    // pool is a lock-free stack.
+    var head = k.fiber_pool.load(.monotonic);
+    while (true) {
+        fiber.queue_next = head;
+        if (k.fiber_pool.cmpxchgWeak(head, fiber, .release, .monotonic) == null) return;
+        head = k.fiber_pool.load(.monotonic);
+    }
 }
 
 pub const InitOptions = struct {
@@ -173,6 +202,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .gpa = gpa,
         .mutex = .init,
         .main_fiber_buffer = undefined,
+        .fiber_pool = .init(null),
         .threads = .{
             .allocated = @ptrCast(allocated_slice[0..threads_size]),
             .reserved = 1,
@@ -186,7 +216,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .empty,
+        .awaiting_completions = .empty, .batch_waiter = .{},
     };
     const main_thread = &k.threads.allocated[0];
     Thread.self = main_thread;
@@ -215,6 +245,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .wait_queues = .empty,
     };
     errdefer closeFd(main_thread.kq_fd);
+    registerWakeupEvent(main_thread.kq_fd);
     std.log.debug("created main idle {*}", .{&main_thread.idle_context});
     std.log.debug("created main {*}", .{main_fiber});
 }
@@ -225,13 +256,23 @@ pub fn deinit(k: *Kqueue) void {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
     }
+    // A worker erases its own `Thread` struct as it exits (`threadEntry`
+    // calls `Thread.deinit`), so the join handles are snapshotted before
+    // the exit signal; afterwards the structs may already be garbage.
+    const gpa = k.gpa;
+    const join_handles = gpa.alloc(std.Thread, active_threads) catch @panic("OOM joining kqueue threads");
+    defer gpa.free(join_handles);
+    for (k.threads.allocated[0..active_threads], join_handles) |*thread, *handle| handle.* = thread.thread;
     k.yield(null, .exit);
     const main_thread = &k.threads.allocated[0];
-    const gpa = k.gpa;
+    while (k.fiber_pool.load(.acquire)) |fiber| {
+        k.fiber_pool.store(fiber.queue_next, .monotonic);
+        gpa.free(fiber.allocatedSlice());
+    }
     main_thread.deinit(gpa);
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(k.threads.allocated.ptr));
     const idle_stack_end_offset = std.mem.alignForward(usize, k.threads.allocated.len * @sizeOf(Thread) + idle_stack_size, std.heap.page_size_max);
-    for (k.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
+    for (join_handles[1..active_threads]) |handle| handle.join();
     gpa.free(allocated_ptr[0..idle_stack_end_offset]);
     k.* = undefined;
 }
@@ -251,6 +292,43 @@ pub fn createFileDescriptor() CreateFileDescriptorError!posix.fd_t {
         .NFILE => return error.SystemFdQuotaExceeded,
         else => |err| return posix.unexpectedErrno(err),
     }
+}
+
+/// Registers the thread's persistent EVFILT_USER event. FreeBSD 15 does
+/// not deliver an event whose EV_ADD and NOTE_TRIGGER arrive in the same
+/// kevent call, so the wakeup and exit paths register the knote once here
+/// and submit trigger-only changes afterwards.
+fn registerWakeupEvent(kq_fd: posix.fd_t) void {
+    const changes = [_]posix.Kevent{
+        .{
+            .ident = 0,
+            .filter = std.c.EVFILT.USER,
+            .flags = std.c.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = @backingInt(Completion.UserData.wakeup),
+        },
+    };
+    assert(0 == (kevent(kq_fd, &changes, &.{}, null) catch |err| {
+        // TODO handle EINTR for cancellation purposes
+        @panic(@errorName(err)); // TODO
+    }));
+}
+
+/// Submits a trigger-only change for the thread's persistent EVFILT_USER
+/// event. The change's udata replaces the registered knote's.
+fn triggerWakeupEvent(kq_fd: posix.fd_t, udata: usize) void {
+    const changes = [_]posix.Kevent{
+        .{
+            .ident = 0,
+            .filter = std.c.EVFILT.USER,
+            .flags = 0,
+            .fflags = std.c.NOTE.TRIGGER,
+            .data = 0,
+            .udata = udata,
+        },
+    };
+    _ = kevent(kq_fd, &changes, &.{}, null) catch {};
 }
 
 fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
@@ -325,21 +403,8 @@ fn schedule(k: *Kqueue, thread: *Thread, ready_queue: Fiber.Queue) void {
             .release,
             .monotonic,
         )) |_| continue;
-        const changes = [_]posix.Kevent{
-            .{
-                .ident = 0,
-                .filter = std.c.EVFILT.USER,
-                .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                .fflags = std.c.NOTE.TRIGGER,
-                .data = 0,
-                .udata = @backingInt(Completion.UserData.wakeup),
-            },
-        };
         // If an error occurs it only pessimises scheduling.
-        _ = kevent(idle_search_thread.kq_fd, &changes, &.{}, null) catch |err| {
-            // TODO handle EINTR for cancellation purposes
-            @panic(@errorName(err)); // TODO
-        };
+        triggerWakeupEvent(idle_search_thread.kq_fd, @backingInt(Completion.UserData.wakeup));
         return;
     }
     spawn_thread: {
@@ -369,6 +434,7 @@ fn schedule(k: *Kqueue, thread: *Thread, ready_queue: Fiber.Queue) void {
             .steal_ready_search_index = 0,
             .wait_queues = .empty,
         };
+        registerWakeupEvent(new_thread.kq_fd);
         new_thread.thread = std.Thread.spawn(.{
             .stack_size = idle_stack_size,
             .allocator = k.gpa,
@@ -409,6 +475,69 @@ fn threadEntry(k: *Kqueue, index: u32) void {
     thread.deinit(k.gpa);
 }
 
+/// Backend state for an `Io.Group`. The awaiter owns this memory: member
+/// fibers only read it, and the last one swaps the `finished` sentinel
+/// into `awaiter` (the same handshake `Future.await` uses), so a group
+/// await that is registering concurrently either finds the sentinel in
+/// its own switch task or is woken by the exiting member. `await`
+/// destroys the state after it is woken; `cancel` runs the same path.
+///
+/// There is no per-fiber cancellation on this backend yet, so `cancel`
+/// waits for the members to run to completion, like the Evented network
+/// waits elsewhere (no cancellation points).
+const GroupState = struct {
+    token: *Io.Group,
+    members: std.atomic.Value(usize),
+    awaiter: ?*Fiber,
+
+    const finished: ?*Fiber = Fiber.finished;
+};
+
+/// Tag bit in kevent `udata` distinguishing a batch waiter from a fiber
+/// pointer (both at least 4-aligned).
+const batch_userdata_tag: usize = 1;
+
+/// The waiting fiber's side of a batched await, using the same
+/// register_awaiter handshake `Future.await` uses, which makes stale
+/// events harmless: an event swaps `parked` to the `finished` sentinel
+/// and schedules the fiber only when it was actually parked, and the
+/// fiber parks by swapping itself into the slot from the switch task
+/// (scheduling itself immediately when a wake already landed). A late
+/// event for an earlier wait of the same fiber therefore causes at most
+/// a spurious wake — the fiber re-drains its submitted operations
+/// nonblocking and re-parks — and can never schedule a running fiber.
+///
+/// `kq_fd` records where this wait's kevents were registered; after a
+/// work-stealing migration the fiber's deletes must target that kq, not
+/// its current one.
+///
+/// The wake side swaps the `finished` sentinel into `parked` and
+/// schedules the fiber only when it took the fiber from the slot; the
+/// park side claims the slot from empty with a CAS in the switch task,
+/// scheduling itself when a wake already landed. Several events can
+/// therefore arrive for one wait (a readiness plus the timer plus stale
+/// registrations from before a migration) and exactly one wake happens.
+///
+/// REMAINING KNOWN CRASH, deeper than this waiter: with one server and
+/// two client fibers on a shared instance (`--loops 1 --clients 2`), the
+/// process faults in `findReadyFiber` reading `ready_fiber.queue_next`
+/// with the queue's own lock sentinel (8) as the head — the ready-queue
+/// lock state leaks between operations somewhere in the scheduler. Both
+/// this waiter and its predecessor (armed/fired CAS) reproduce it, at
+/// the same site, while `ev-thread` (one instance per thread) does not;
+/// the single-fiber and suite shapes pass. Until the scheduler bug is
+/// found, prefer one Kqueue instance per thread.
+const BatchWaiter = struct {
+    /// null while the fiber runs; the fiber while it is parked; the
+    /// `finished` sentinel once an event has claimed the wake.
+    parked: ?*Fiber = null,
+    /// Absolute deadline on the awake clock, when the wait is timed.
+    /// Nanoseconds; i64 keeps `Fiber`'s alignment unchanged.
+    when_ns: ?i64 = null,
+    /// The kqueue descriptor this wait's kevents were registered on.
+    kq_fd: posix.fd_t = -1,
+};
+
 const Completion = struct {
     const UserData = enum(usize) {
         unused,
@@ -448,6 +577,25 @@ fn idle(k: *Kqueue, thread: *Thread) void {
                 return;
             },
             _ => {
+                if (event.udata & batch_userdata_tag != 0) {
+                    // A batched operation (or its timer) fired. The fiber
+                    // performs all bookkeeping after it wakes; here it is
+                    // only woken, and only if it was parked.
+                    const waiter: *BatchWaiter = @ptrFromInt(event.udata & ~batch_userdata_tag);
+                    const parked = @atomicRmw(?*Fiber, &waiter.parked, .Xchg, Fiber.finished, .acq_rel);
+                    if (parked) |ready_fiber| {
+                        if (ready_fiber == Fiber.finished) continue;
+                        if (maybe_ready_fiber == null) {
+                            maybe_ready_fiber = ready_fiber;
+                        } else if (maybe_ready_queue) |*ready_queue| {
+                            ready_queue.tail.queue_next = ready_fiber;
+                            ready_queue.tail = ready_fiber;
+                        } else {
+                            maybe_ready_queue = .{ .head = ready_fiber, .tail = ready_fiber };
+                        }
+                    }
+                    continue;
+                }
                 const event_head_fiber: *Fiber = @ptrFromInt(event.udata);
                 const event_tail_fiber = thread.wait_queues.fetchSwapRemove(.{
                     .ident = event.ident,
@@ -492,6 +640,13 @@ const SwitchMessage = struct {
         reschedule,
         recycle: *Fiber,
         register_awaiter: *?*Fiber,
+        /// Parks the switching fiber in a batch waiter slot. Unlike
+        /// `register_awaiter`, this only claims the slot when it is empty:
+        /// a wake that landed between arming the kevents and the switch
+        /// has already left the `finished` sentinel, and the fiber must
+        /// schedule itself — without overwriting the sentinel, which later
+        /// stale events must keep seeing.
+        register_batch_waiter: *?*Fiber,
         exit,
     };
 
@@ -514,21 +669,26 @@ const SwitchMessage = struct {
                 if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
                     k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
             },
-            .exit => for (k.threads.allocated[0..@atomicLoad(u32, &k.threads.active, .acquire)]) |*each_thread| {
-                const changes = [_]posix.Kevent{
-                    .{
-                        .ident = 0,
-                        .filter = std.c.EVFILT.USER,
-                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                        .fflags = std.c.NOTE.TRIGGER,
-                        .data = 0,
-                        .udata = @backingInt(Completion.UserData.exit),
-                    },
-                };
-                _ = kevent(each_thread.kq_fd, &changes, &.{}, null) catch |err| {
-                    // TODO handle EINTR for cancellation purposes
-                    @panic(@errorName(err)); // TODO
-                };
+            .register_batch_waiter => |slot| {
+                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
+                assert(prev_fiber.queue_next == null);
+                if (@cmpxchgStrong(
+                    ?*Fiber,
+                    slot,
+                    null,
+                    prev_fiber,
+                    .acq_rel,
+                    .acquire,
+                ) != null) {
+                    // A wake already landed; the sentinel stays so stale
+                    // events keep no-op'ing.
+                    k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                }
+            },
+            .exit => {
+                for (k.threads.allocated[0..@atomicLoad(u32, &k.threads.active, .acquire)]) |*each_thread| {
+                    triggerWakeupEvent(each_thread.kq_fd, @backingInt(Completion.UserData.exit));
+                }
             },
         }
     }
@@ -580,6 +740,11 @@ const AsyncClosure = struct {
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     result_align: Alignment,
     already_awaited: bool,
+    /// When set, this fiber is an `Io.Group` member rather than a future:
+    /// `group_start` runs instead of `start`, and the group teardown runs
+    /// instead of the awaiter handshake.
+    group: ?*GroupState = null,
+    group_start: ?*const fn (context: *const anyopaque) void = null,
 
     fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
         return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
@@ -589,6 +754,10 @@ const AsyncClosure = struct {
         message.handle(closure.kqueue);
         const fiber = closure.fiber;
         std.log.debug("{*} performing async", .{fiber});
+        if (closure.group) |state| {
+            closure.group_start.?(closure.contextPointer());
+            return groupFinish(closure.kqueue, fiber, state);
+        }
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
         const awaiter = @atomicRmw(?*Fiber, &fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
         const ready_awaiter = r: {
@@ -610,50 +779,110 @@ const AsyncClosure = struct {
 pub fn io(k: *Kqueue) Io {
     return .{
         .userdata = k,
-        .vtable = &.{
+                .vtable = &.{
+            .crashHandler = Io.Threaded.crashHandler,
             .async = async,
             .concurrent = concurrent,
             .await = await,
             .cancel = cancel,
-
             .groupAsync = groupAsync,
             .groupConcurrent = groupConcurrent,
             .groupAwait = groupAwait,
             .groupCancel = groupCancel,
-
+            .recancel = Io.Threaded.recancel,
+            .swapCancelProtection = Io.Threaded.swapCancelProtection,
+            .checkCancel = Io.Threaded.checkCancel,
+            .futexWait = Io.Threaded.futexWait,
+            .futexWaitUncancelable = Io.Threaded.futexWaitUncancelable,
+            .futexWake = Io.Threaded.futexWake,
+            .operate = operate,
+            .batchAwaitAsync = batchAwaitAsync,
+            .batchAwaitConcurrent = batchAwaitConcurrent,
+            .batchCancel = batchCancel,
             .dirCreateDir = dirCreateDir,
             .dirCreateDirPath = dirCreateDirPath,
             .dirCreateDirPathOpen = dirCreateDirPathOpen,
+            .dirOpenDir = dirOpenDir,
             .dirStat = dirStat,
             .dirStatFile = dirStatFile,
-
-            .fileStat = fileStat,
             .dirAccess = dirAccess,
             .dirCreateFile = dirCreateFile,
+            .dirCreateFileAtomic = Io.Threaded.dirCreateFileAtomic,
             .dirOpenFile = dirOpenFile,
-            .dirOpenDir = dirOpenDir,
             .dirClose = dirClose,
+            .dirRead = Io.noDirRead,  // TODO(kqueue) local impl
+            .dirRealPath = Io.Threaded.dirRealPathPosix,
+            .dirRealPathFile = Io.Threaded.dirRealPathFilePosix,
+            .dirDeleteFile = Io.Threaded.dirDeleteFilePosix,
+            .dirDeleteDir = Io.Threaded.dirDeleteDirPosix,
+            .dirRename = Io.Threaded.dirRenamePosix,
+            .dirRenamePreserve = Io.failingDirRenamePreserve,  // TODO(kqueue) local impl
+            .dirSymLink = Io.Threaded.dirSymLinkPosix,
+            .dirReadLink = Io.Threaded.dirReadLink,
+            .dirSetOwner = Io.Threaded.dirSetOwnerPosix,
+            .dirSetFileOwner = Io.Threaded.dirSetFileOwner,
+            .dirSetPermissions = Io.Threaded.dirSetPermissionsPosix,
+            .dirSetFilePermissions = Io.failingDirSetFilePermissions,  // TODO(kqueue) local impl
+            .dirSetTimestamps = Io.Threaded.dirSetTimestamps,
+            .dirHardLink = Io.Threaded.dirHardLink,
+            .fileStat = fileStat,
+            .fileLength = Io.failingFileLength,  // TODO(kqueue) local impl
             .fileClose = fileClose,
-            .fileWriteStreaming = fileWriteStreaming,
             .fileWritePositional = fileWritePositional,
-            .fileReadStreaming = fileReadStreaming,
+            .fileWriteFileStreaming = Io.noFileWriteFileStreaming,  // TODO(kqueue) local impl
+            .fileWriteFilePositional = Io.noFileWriteFilePositional,  // TODO(kqueue) local impl
             .fileReadPositional = fileReadPositional,
             .fileSeekBy = fileSeekBy,
             .fileSeekTo = fileSeekTo,
-
+            .fileSync = Io.Threaded.fileSyncPosix,
+            .fileIsTty = Io.unreachableFileIsTty,  // TODO(kqueue) local impl
+            .fileEnableAnsiEscapeCodes = Io.unreachableFileEnableAnsiEscapeCodes,  // TODO(kqueue) local impl
+            .fileSupportsAnsiEscapeCodes = Io.unreachableFileSupportsAnsiEscapeCodes,  // TODO(kqueue) local impl
+            .fileSetLength = Io.Threaded.fileSetLength,
+            .fileSetOwner = Io.failingFileSetOwner,  // TODO(kqueue) local impl
+            .fileSetPermissions = Io.Threaded.fileSetPermissions,
+            .fileSetTimestamps = Io.Threaded.fileSetTimestamps,
+            .fileLock = Io.Threaded.fileLock,
+            .fileTryLock = Io.Threaded.fileTryLock,
+            .fileUnlock = Io.Threaded.fileUnlock,
+            .fileDowngradeLock = Io.Threaded.fileDowngradeLock,
+            .fileRealPath = Io.Threaded.fileRealPathPosix,
+            .fileHardLink = Io.Threaded.fileHardLink,
+            .fileMemoryMapCreate = Io.failingFileMemoryMapCreate,  // TODO(kqueue) local impl
+            .fileMemoryMapDestroy = Io.unreachableFileMemoryMapDestroy,  // TODO(kqueue) local impl
+            .fileMemoryMapSetLength = Io.unreachableFileMemoryMapSetLength,  // TODO(kqueue) local impl
+            .fileMemoryMapRead = Io.Threaded.fileMemoryMapRead,
+            .fileMemoryMapWrite = Io.Threaded.fileMemoryMapWrite,
+            .processExecutableOpen = Io.failingProcessExecutableOpen,  // TODO(kqueue) local impl
+            .processExecutablePath = Io.failingProcessExecutablePath,  // TODO(kqueue) local impl
+            .lockStderr = Io.unreachableLockStderr,  // TODO(kqueue) local impl
+            .tryLockStderr = Io.noTryLockStderr,  // TODO(kqueue) local impl
+            .unlockStderr = Io.unreachableUnlockStderr,  // TODO(kqueue) local impl
+            .processCurrentPath = Io.failingProcessCurrentPath,  // TODO(kqueue) local impl
+            .processSetCurrentDir = Io.Threaded.processSetCurrentDir,
+            .processSetCurrentPath = Io.Threaded.processSetCurrentPath,
+            .processReplace = Io.failingProcessReplace,  // TODO(kqueue) local impl
+            .processReplacePath = Io.Threaded.processReplacePath,
+            .processSpawn = Io.Threaded.processSpawnPosix,
+            .processSpawnPath = Io.Threaded.processSpawnPath,
+            .childWait = Io.Threaded.childWait,
+            .childKill = Io.unreachableChildKill,  // TODO(kqueue) local impl
+            .progressParentFile = Io.failingProgressParentFile,  // TODO(kqueue) local impl
             .now = now,
+            .clockResolution = Io.failingClockResolution,  // TODO(kqueue) local impl
             .sleep = sleep,
-
+            .random = Io.noRandom,  // TODO(kqueue) local impl
+            .randomSecure = Io.Threaded.randomSecure,
             .netListenIp = netListenIp,
-            .netListenUnix = netListenUnix,
             .netAccept = netAccept,
             .netBindIp = netBindIp,
             .netConnectIp = netConnectIp,
+            .netListenUnix = netListenUnix,
             .netConnectUnix = netConnectUnix,
+            .netSocketCreatePair = Io.failingNetSocketCreatePair,
+            .netWriteFile = Io.failingNetWriteFile,
+            .netClose = netClose,
             .netShutdown = netShutdown,
-            .netRead = netRead,
-            .netSend = netSend,
-            .netReceive = netReceive,
             .netInterfaceNameResolve = netInterfaceNameResolve,
             .netInterfaceName = netInterfaceName,
             .netLookup = netLookup,
@@ -711,7 +940,7 @@ fn concurrent(
         .awaiter = null,
         .queue_next = null,
         .cancel_thread = null,
-        .awaiting_completions = .empty,
+        .awaiting_completions = .empty, .batch_waiter = .{},
     };
     closure.* = .{
         .kqueue = k,
@@ -767,13 +996,9 @@ fn groupAsync(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
+    groupConcurrent(userdata, type_erased, context, context_alignment, start) catch {
+        start(context.ptr);
+    };
 }
 
 fn groupConcurrent(
@@ -783,29 +1008,90 @@ fn groupConcurrent(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
+    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
+    assert(context.len <= Fiber.max_context_size); // TODO
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
+    const state: *GroupState = s: {
+        if (type_erased.token.load(.acquire)) |token| break :s @ptrCast(@alignCast(token));
+        const created = k.gpa.create(GroupState) catch return error.ConcurrencyUnavailable;
+        created.* = .{ .token = type_erased, .members = .init(0), .awaiter = null };
+        if (type_erased.token.cmpxchgStrong(null, created, .acq_rel, .acquire)) |existing| {
+            k.gpa.destroy(created);
+            break :s @ptrCast(@alignCast(existing));
+        }
+        break :s created;
+    };
+    _ = state.members.fetchAdd(1, .monotonic);
+    errdefer _ = state.members.fetchSub(1, .monotonic);
+    const fiber = Fiber.allocate(k) catch return error.ConcurrencyUnavailable;
+    const closure: *AsyncClosure = .fromFiber(fiber);
+    fiber.* = .{
+        .required_align = {},
+        .context = switch (builtin.cpu.arch) {
+            .x86_64 => .{
+                .rsp = @intFromPtr(closure) - @sizeOf(usize),
+                .rbp = 0,
+                .rip = @intFromPtr(&fiberEntry),
+            },
+            .aarch64 => .{
+                .sp = @intFromPtr(closure),
+                .fp = 0,
+                .pc = @intFromPtr(&fiberEntry),
+            },
+            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+        },
+        .awaiter = null,
+        .queue_next = null,
+        .cancel_thread = null,
+        .awaiting_completions = .empty,
+        .batch_waiter = .{},
+    };
+    closure.* = .{
+        .kqueue = k,
+        .fiber = fiber,
+        .start = undefined,
+        .result_align = .@"1",
+        .already_awaited = false,
+        .group = state,
+        .group_start = start,
+    };
+    @memcpy(closure.contextPointer(), context);
+
+    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
+}
+
+/// The last act of a group member fiber: count itself out and, when it is
+/// the last member, hand the group's completion to the awaiting fiber (or
+/// leave the sentinel for an await that registers later). The fiber then
+/// recycles itself on the destination thread's switch task.
+fn groupFinish(k: *Kqueue, fiber: *Fiber, state: *GroupState) noreturn {
+    const old = state.members.fetchSub(1, .acq_rel);
+    if (old == 1) {
+        const parked = @atomicRmw(?*Fiber, &state.awaiter, .Xchg, GroupState.finished, .acq_rel);
+        if (parked) |awaiter| {
+            k.yield(awaiter, .{ .recycle = fiber });
+        }
+    }
+    k.yield(null, .{ .recycle = fiber });
+    unreachable; // switched to dead fiber
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = initial_token;
-    @panic("TODO");
+    const state: *GroupState = @ptrCast(@alignCast(initial_token));
+    // The register_awaiter switch task swaps this fiber into the slot, or
+    // finds `finished` (set by the last member) and schedules it directly;
+    // the exiting member that finds the fiber in the slot schedules it.
+    k.yield(null, .{ .register_awaiter = &state.awaiter });
+    type_erased.token.store(null, .release);
+    k.gpa.destroy(state);
 }
 
 fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = group;
-    _ = token;
-    @panic("TODO");
+    // No per-fiber cancellation on this backend yet: network waits are not
+    // cancellation points, so members run to completion (the same posture
+    // as the Dispatch backend's network operations). Cancel waits.
+    groupAwait(userdata, group, token) catch {};
 }
 
 fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
@@ -984,17 +1270,63 @@ fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.Seek
     @panic("TODO");
 }
 
-fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
+fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
     _ = k;
-    _ = clock;
-    @panic("TODO");
+    return Io.Threaded.nowPosix(clock);
 }
-fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.SleepError!void {
+
+/// Parks the fiber on a one-shot EVFILT_TIMER registered through the same
+/// `wait_queues` path the readiness waits use; the timer's ident is the
+/// fiber pointer, unique per waiting fiber.
+fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = timeout;
-    @panic("TODO");
+    const thread: *Thread = .current();
+    const fiber = thread.currentFiber();
+    const ms: i64 = switch (timeout) {
+        .none => return,
+        .duration => |duration| @intCast(@max(0, duration.raw.toMilliseconds())),
+        .deadline => |deadline| ms: {
+            const now_ts = Io.Threaded.nowPosix(deadline.clock);
+            const remaining_ns: i128 = @as(i128, deadline.raw.toNanoseconds()) - now_ts.toNanoseconds();
+            if (remaining_ns <= 0) break :ms 0;
+            break :ms @intCast(@min(@as(i128, std.math.maxInt(i64)), @divTrunc(remaining_ns, std.time.ns_per_ms)));
+        },
+    };
+    const ident: usize = @intFromPtr(fiber);
+    const filter = std.c.EVFILT.TIMER;
+    const gop = thread.wait_queues.getOrPut(k.gpa, .{
+        .ident = ident,
+        .filter = filter,
+    }) catch {
+        // Out of memory for the registration: block the thread the plain
+        // way. Other fibers on this worker stall for the duration; this is
+        // the never-taken fallback.
+        var one_event: [1]posix.Kevent = undefined;
+        const ts: posix.timespec = .{
+            .sec = @divTrunc(ms, 1000),
+            .nsec = @intCast(@mod(ms, 1000) * std.time.ns_per_ms),
+        };
+        _ = kevent(thread.kq_fd, &.{}, &one_event, &ts) catch {};
+        return;
+    };
+    assert(!gop.found_existing); // one sleep per fiber at a time
+    gop.value_ptr.* = fiber;
+    const changes = [_]posix.Kevent{
+        .{
+            .ident = ident,
+            .filter = filter,
+            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = @max(1, ms),
+            .udata = @intFromPtr(fiber),
+        },
+    };
+    assert(0 == (kevent(thread.kq_fd, &changes, &.{}, null) catch |err| {
+        // TODO handle EINTR for cancellation purposes
+        @panic(@errorName(err)); // TODO
+    }));
+    yield(k, null, .nothing);
 }
 
 fn netListenIp(
@@ -1024,6 +1356,10 @@ fn netBindIp(
     const family = Io.Threaded.posixAddressFamily(address);
     const socket_fd = try openSocketPosix(k, family, options);
     errdefer closeFd(socket_fd);
+    if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
     try posixBind(k, socket_fd, &storage.any, addr_len);
@@ -1152,7 +1488,7 @@ fn netSendOne(
             },
             .INTR => continue,
             .CANCELED => return error.Canceled,
-            .AGAIN => @panic("TODO register kevent"),
+            .AGAIN => try waitReady(k, @bitCast(@as(i32, handle)), std.c.EVFILT.WRITE),
 
             .ACCES => return error.AccessDenied,
             .ALREADY => return error.FastOpenAlreadyInProgress,
@@ -1178,22 +1514,266 @@ fn netSendOne(
     }
 }
 
-fn netReceive(
-    userdata: ?*anyopaque,
+/// Non-blocking send of as many messages as the socket accepts right now.
+fn netSendManyNonblocking(
     handle: net.Socket.Handle,
-    message_buffer: []net.IncomingMessage,
-    data_buffer: []u8,
-    flags: net.ReceiveFlags,
-    timeout: Io.Timeout,
-) struct { ?net.Socket.ReceiveTimeoutError, usize } {
+    messages: []net.OutgoingMessage,
+) union(enum) { full, partial: usize, blocked, err: net.Socket.SendError } {
+    var i: usize = 0;
+    while (i < messages.len) : (i += 1) {
+        netSendOneNonblocking(handle, &messages[i]) catch |err| return switch (err) {
+            error.WouldBlock => if (i == 0) .blocked else .{ .partial = i },
+            else => |e| .{ .err = e },
+        };
+    }
+    return .full;
+}
+
+fn netSendOneNonblocking(handle: net.Socket.Handle, message: *net.OutgoingMessage) (net.Socket.SendError || error{WouldBlock})!void {
+    var addr: Io.Threaded.PosixAddress = undefined;
+    var iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
+    const msg: posix.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = Io.Threaded.addressToPosix(message.address, &addr),
+        .iov = (&iovec)[0..1],
+        .iovlen = 1,
+        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    const rc = posix.system.sendmsg(handle, &msg, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {
+            message.data_len = @intCast(rc);
+            return;
+        },
+        .INTR => return, // treated as zero sent; the caller retries
+        .CANCELED => return error.Canceled,
+        .AGAIN => return error.WouldBlock,
+        .ACCES => return error.AccessDenied,
+        .ALREADY => return error.FastOpenAlreadyInProgress,
+        .BADF => |err| return errnoBug(err),
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .DESTADDRREQ => |err| return errnoBug(err),
+        .FAULT => |err| return errnoBug(err),
+        .INVAL => |err| return errnoBug(err),
+        .ISCONN => |err| return errnoBug(err),
+        .MSGSIZE => return error.MessageOversize,
+        .NOBUFS => return error.SystemResources,
+        .NOMEM => return error.SystemResources,
+        .NOTSOCK => |err| return errnoBug(err),
+        .OPNOTSUPP => |err| return errnoBug(err),
+        .PIPE => return error.SocketUnconnected,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOTCONN => return error.SocketUnconnected,
+        .NETDOWN => return error.NetworkDown,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+/// One blocking operation; the batch machinery above is the concurrent
+/// path. Network operations retry through `waitReady`; file operations
+/// block the worker thread (no file async yet on this backend).
+fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = handle;
-    _ = message_buffer;
-    _ = data_buffer;
-    _ = flags;
-    _ = timeout;
-    @panic("TODO");
+    switch (operation) {
+        .net_receive => |*o| {
+            var data_i: usize = 0;
+            var msg_i: usize = 0;
+            while (msg_i < o.message_buffer.len) {
+                const message = &o.message_buffer[msg_i];
+                const remaining = o.data_buffer[data_i..];
+                Io.Threaded.netReceivePosix(o.socket_handle, message, remaining, o.flags, true) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    error.WouldBlock => {
+                        if (msg_i != 0) return .{ .net_receive = .{ null, msg_i } };
+                        try waitReady(k, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.READ);
+                        continue;
+                    },
+                    else => |e| return .{ .net_receive = .{ e, 0 } },
+                };
+                data_i += message.data.len;
+                msg_i += 1;
+            }
+            return .{ .net_receive = .{ null, msg_i } };
+        },
+        .net_send => |*o| return .{ .net_send = r: {
+            var i: usize = 0;
+            while (i < o.messages.len) : (i += 1) {
+                netSendOneNonblocking(o.socket_handle, &o.messages[i]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (i != 0) break :r .{ null, i };
+                        try waitReady(k, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.WRITE);
+                        i -%= 1;
+                        continue;
+                    },
+                    else => |e| break :r .{ e, i },
+                };
+            }
+            break :r .{ null, o.messages.len };
+        } },
+        .net_read => |*o| {
+            while (true) {
+                const rc = posix.system.read(o.socket_handle, o.data[0].ptr, o.data[0].len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return .{ .net_read = @intCast(rc) },
+                    .INTR => continue,
+                    .CANCELED => return error.Canceled,
+                    .AGAIN => try waitReady(k, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.READ),
+                    else => |e| return .{ .net_read = readErrorMap(e) },
+                }
+            }
+        },
+        .net_write => |*o| {
+            while (true) {
+                const rc = posix.system.write(o.socket_handle, o.data[0].ptr, o.data[0].len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => return .{ .net_write = @intCast(rc) },
+                    .INTR => continue,
+                    .CANCELED => return error.Canceled,
+                    .AGAIN => try waitReady(k, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.WRITE),
+                    else => |e| return .{ .net_write = writeErrorMap(e) },
+                }
+            }
+        },
+        .file_read_streaming => |o| return .{
+            .file_read_streaming = fileReadStreamingBlocking(o.file, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
+        .file_write_streaming => |o| return .{
+            .file_write_streaming = fileWriteStreamingBlocking(o.file, o.header, o.data, o.splat) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
+        // No device_io_control path on this backend yet; the result is a
+        // value, so report failure through the payload.
+        .device_io_control => return .{ .device_io_control = -1 },
+    }
+}
+
+/// The error half of `Io.Operation.Result`'s `net_read`/`net_write`
+/// payloads: like `net.Stream.Reader.Error` without the cancelable
+/// members, which the callers handle before mapping.
+const NetRWError = error{
+    AccessDenied,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    NetworkDown,
+    SocketUnconnected,
+    SystemResources,
+    Unexpected,
+};
+
+/// The error half of `Io.Operation.Result`'s `net_read` payload: like
+/// `net.Stream.Reader.Error` without the cancelable members.
+const NetReadError = error{
+    AccessDenied,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    NetworkDown,
+    SocketUnconnected,
+    SystemResources,
+    Unexpected,
+};
+
+fn readErrorMap(e: posix.E) NetReadError {
+    return switch (e) {
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        .ACCES => error.AccessDenied,
+        else => error.Unexpected,
+    };
+}
+
+const NetWriteError = error{
+    AddressFamilyUnsupported,
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    FastOpenAlreadyInProgress,
+    HostUnreachable,
+    NetworkDown,
+    NetworkUnreachable,
+    SocketNotBound,
+    SocketUnconnected,
+    SystemResources,
+    Unexpected,
+};
+
+fn writeErrorMap(e: posix.E) NetWriteError {
+    return switch (e) {
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .DESTADDRREQ => error.SocketNotBound,
+        else => error.Unexpected,
+    };
+}
+
+/// Blocking streaming read; the file operations on this backend have no
+/// evented path yet, so the worker thread blocks. The batch drain treats
+/// file operations the same way through `operate`'s fallback shape.
+fn fileReadStreamingBlocking(file: File, data: []const []u8) File.ReadStreamingError!usize {
+    var total: usize = 0;
+    for (data) |buffer| {
+        var done: usize = 0;
+        while (done < buffer.len) {
+            const rc = posix.system.read(file.handle, buffer.ptr + done, buffer.len - done);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return total;
+                    done += @intCast(rc);
+                    total += @intCast(rc);
+                },
+                .INTR => continue,
+                .INVAL, .FAULT, .BADF, .ISDIR => return error.Unexpected,
+                .IO => return error.InputOutput,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                else => return error.Unexpected,
+            }
+        }
+    }
+    return total;
+}
+
+fn fileWriteStreamingBlocking(file: File, header: []const u8, data: []const []const u8, splat: usize) File.Writer.Error!usize {
+    var total: usize = 0;
+    for (header) |_| {}
+    var writes: usize = if (splat == 0) 1 else splat;
+    while (writes > 0) : (writes -= 1) {
+        for (data) |buffer| {
+            var done: usize = 0;
+            while (done < buffer.len) {
+                const rc = posix.system.write(file.handle, buffer.ptr + done, buffer.len - done);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        done += @intCast(rc);
+                        total += @intCast(rc);
+                    },
+                    .INTR => continue,
+                    .INVAL, .FAULT, .BADF, .NOTSOCK => return error.Unexpected,
+                    .IO => return error.InputOutput,
+                    .NOBUFS, .NOMEM => return error.SystemResources,
+                    .PIPE => return error.BrokenPipe,
+                    else => return error.Unexpected,
+                }
+            }
+        }
+    }
+    return total;
 }
 
 fn netRead(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
@@ -1219,37 +1799,7 @@ fn netRead(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Strea
             .INTR => continue,
             .CANCELED => return error.Canceled,
             .AGAIN => {
-                const thread: *Thread = .current();
-                const fiber = thread.currentFiber();
-                const ident: u32 = @bitCast(fd);
-                const filter = std.c.EVFILT.READ;
-                const gop = thread.wait_queues.getOrPut(k.gpa, .{
-                    .ident = ident,
-                    .filter = filter,
-                }) catch return error.SystemResources;
-                if (gop.found_existing) {
-                    const tail_fiber = gop.value_ptr.*;
-                    assert(tail_fiber.queue_next == null);
-                    tail_fiber.queue_next = fiber;
-                    gop.value_ptr.* = fiber;
-                } else {
-                    gop.value_ptr.* = fiber;
-                    const changes = [_]posix.Kevent{
-                        .{
-                            .ident = ident,
-                            .filter = filter,
-                            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                            .fflags = 0,
-                            .data = 0,
-                            .udata = @intFromPtr(fiber),
-                        },
-                    };
-                    assert(0 == (kevent(thread.kq_fd, &changes, &.{}, null) catch |err| {
-                        // TODO handle EINTR for cancellation purposes
-                        @panic(@errorName(err)); // TODO
-                    }));
-                }
-                yield(k, null, .nothing);
+                try waitReady(k, @bitCast(@as(isize, fd)), std.c.EVFILT.READ);
                 continue;
             },
 
@@ -1268,12 +1818,28 @@ fn netRead(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Strea
     }
 }
 
+fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
+    _ = userdata;
+    for (sockets) |socket| closeFd(socket.handle);
+}
+
 fn netShutdown(userdata: ?*anyopaque, handle: net.Socket.Handle, how: net.ShutdownHow) net.ShutdownError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = handle;
-    _ = how;
-    @panic("TODO");
+    _ = userdata;
+    const posix_how: i32 = switch (how) {
+        .recv => posix.SHUT.RD,
+        .send => posix.SHUT.WR,
+        .both => posix.SHUT.RDWR,
+    };
+    while (true) {
+        switch (posix.errno(posix.system.shutdown(handle, posix_how))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .BADF, .NOTSOCK, .INVAL => |err| return errnoBug(err),
+            .NOTCONN => return error.SocketUnconnected,
+            .NOBUFS => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
 }
 
 fn netInterfaceNameResolve(
@@ -1451,6 +2017,339 @@ fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option
             else => |err| return posix.unexpectedErrno(err),
         }
     }
+}
+
+/// Parks the calling fiber until `ident`/`filter` becomes ready. Registers
+/// through the thread's `wait_queues` so several fibers waiting on the same
+/// ident and filter share one kevent, and so the wake path is the ordinary
+/// fiber path.
+fn waitReady(k: *Kqueue, ident: usize, filter: i16) Io.Cancelable!void {
+    const thread: *Thread = .current();
+    const fiber = thread.currentFiber();
+    const gop = thread.wait_queues.getOrPut(k.gpa, .{
+        .ident = ident,
+        .filter = filter,
+    }) catch {
+        // Out of memory for the registration: block this worker thread on
+        // the readiness directly. Other fibers on it stall; this is the
+        // never-taken fallback.
+        const changes = [_]posix.Kevent{.{
+            .ident = ident,
+            .filter = filter,
+            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        }};
+        var one_event: [1]posix.Kevent = undefined;
+        _ = kevent(thread.kq_fd, &changes, &one_event, null) catch {};
+        return;
+    };
+    if (gop.found_existing) {
+        const tail_fiber = gop.value_ptr.*;
+        assert(tail_fiber.queue_next == null);
+        tail_fiber.queue_next = fiber;
+        gop.value_ptr.* = fiber;
+    } else {
+        gop.value_ptr.* = fiber;
+        const changes = [_]posix.Kevent{
+            .{
+                .ident = ident,
+                .filter = filter,
+                .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                .fflags = 0,
+                .data = 0,
+                .udata = @intFromPtr(fiber),
+            },
+        };
+        assert(0 == (kevent(thread.kq_fd, &changes, &.{}, null) catch |err| {
+            // TODO handle EINTR for cancellation purposes
+            @panic(@errorName(err)); // TODO
+        }));
+    }
+    yield(k, null, .nothing);
+}
+
+/// Adds or deletes the calling fiber's batch timer. The timer's ident is
+/// the fiber pointer (unique per waiting fiber; fd idents are small), its
+/// udata the tagged batch waiter.
+fn batchTimerChange(kq_fd: posix.fd_t, fiber: *Fiber, ms: i64, delete: bool) void {
+    if (kq_fd < 0) return;
+    const changes = [_]posix.Kevent{
+        .{
+            .ident = @intFromPtr(fiber),
+            .filter = std.c.EVFILT.TIMER,
+            .flags = if (delete) std.c.EV.DELETE else std.c.EV.ADD | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = ms,
+            .udata = @intFromPtr(&fiber.batch_waiter) | batch_userdata_tag,
+        },
+    };
+    // A delete of an already-consumed timer is fine (ENOENT); any other
+    // failure only pessimises scheduling.
+    _ = kevent(kq_fd, &changes, &.{}, null) catch {};
+}
+
+/// Tries every submitted operation without blocking. Operations that
+/// complete move to `completed`; the others are (re-)armed as one-shot
+/// readiness kevents carrying the tagged batch waiter, and stay in
+/// `submitted` for the next wake.
+fn batchDrainSubmitted(k: *Kqueue, b: *Io.Batch) Io.Cancelable!void {
+    const thread: *Thread = .current();
+    const fiber = thread.currentFiber();
+    var changes: [changes_buffer_len]posix.Kevent = undefined;
+    var changes_len: usize = 0;
+    var prev_index: Io.Operation.OptionalIndex = .none;
+    var index = b.submitted.head;
+    while (index != .none) {
+        const storage = &b.storage[index.toIndex()];
+        const submission = storage.submission;
+        const next_index = submission.node.next;
+        var completed_inline = false;
+        const result: Io.Operation.Result = switch (submission.operation) {
+            .net_receive => |*o| r: {
+                var data_i: usize = 0;
+                var msg_i: usize = 0;
+                break :r drain: for (o.message_buffer) |*message| {
+                    const remaining = o.data_buffer[data_i..];
+                    Io.Threaded.netReceivePosix(o.socket_handle, message, remaining, o.flags, true) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        error.WouldBlock => {
+                            if (msg_i != 0) break :drain .{ .net_receive = .{ null, msg_i } };
+                            arm(k, &changes, &changes_len, fiber, o.socket_handle, std.c.EVFILT.READ);
+                            break :r .{ .net_receive = .{ error.SystemResources, 0 } };
+                        },
+                        else => |e| break :drain .{ .net_receive = .{ e, 0 } },
+                    };
+                    data_i += message.data.len;
+                    msg_i += 1;
+                } else .{ .net_receive = .{ null, msg_i } };
+            },
+            .net_send => |*o| r: {
+                const sent = netSendManyNonblocking(o.socket_handle, o.messages);
+                switch (sent) {
+                    .full => break :r .{ .net_send = .{ null, o.messages.len } },
+                    .partial => |n| break :r .{ .net_send = .{ null, n } },
+                    .blocked => {
+                        arm(k, &changes, &changes_len, fiber, o.socket_handle, std.c.EVFILT.WRITE);
+                        break :r .{ .net_send = .{ error.SystemResources, 0 } };
+                    },
+                    .err => |e| break :r .{ .net_send = .{ e, 0 } },
+                }
+            },
+            .net_read => |*o| r: {
+                const rc = posix.system.read(o.socket_handle, o.data[0].ptr, o.data[0].len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break :r .{ .net_read = @intCast(rc) },
+                    .INTR => break :r .{ .net_read = 0 },
+                    .CANCELED => return error.Canceled,
+                    .AGAIN => {
+                        arm(k, &changes, &changes_len, fiber, o.socket_handle, std.c.EVFILT.READ);
+                        break :r .{ .net_read = error.SystemResources };
+                    },
+                    else => |e| break :r .{ .net_read = readErrorMap(e) },
+                }
+            },
+            .net_write => |*o| r: {
+                const rc = posix.system.write(o.socket_handle, o.data[0].ptr, o.data[0].len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break :r .{ .net_write = @intCast(rc) },
+                    .INTR => break :r .{ .net_write = 0 },
+                    .CANCELED => return error.Canceled,
+                    .AGAIN => {
+                        arm(k, &changes, &changes_len, fiber, o.socket_handle, std.c.EVFILT.WRITE);
+                        break :r .{ .net_write = error.SystemResources };
+                    },
+                    else => |e| break :r .{ .net_write = writeErrorMap(e) },
+                }
+            },
+            else => .{ .device_io_control = 0 },
+        };
+        completed_inline = !isArmedResult(result);
+        if (completed_inline) {
+            // unlink from submitted, append to completed
+            switch (prev_index) {
+                .none => b.submitted.head = next_index,
+                else => |p| b.storage[p.toIndex()].submission.node.next = next_index,
+            }
+            if (next_index == .none) b.submitted.tail = prev_index;
+            switch (b.completed.tail) {
+                .none => b.completed.head = index,
+                else => |tail| b.storage[tail.toIndex()].completion.node.next = index,
+            }
+            storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+            b.completed.tail = index;
+        } else prev_index = index;
+        index = next_index;
+    }
+    if (changes_len != 0) {
+        assert(0 == (kevent(thread.kq_fd, changes[0..changes_len], &.{}, null) catch |err| {
+            // TODO handle EINTR for cancellation purposes
+            @panic(@errorName(err)); // TODO
+        }));
+    }
+}
+
+/// The result a still-armed operation reports to hold its place: it is
+/// replaced on completion; the caller never sees it unless the wait is
+/// dropped without cancelling (a contract violation on other backends
+/// too).
+fn isArmedResult(result: Io.Operation.Result) bool {
+    return switch (result) {
+        .net_receive => |r| r[0] != null and r[0].? == error.SystemResources and r[1] == 0,
+        .net_send => |r| r[0] != null and r[0].? == error.SystemResources and r[1] == 0,
+        .net_read, .net_write => |e| e == error.SystemResources,
+        else => false,
+    };
+}
+
+fn arm(
+    k: *Kqueue,
+    changes: *[changes_buffer_len]posix.Kevent,
+    changes_len: *usize,
+    fiber: *Fiber,
+    handle: net.Socket.Handle,
+    filter: i16,
+) void {
+    _ = k;
+    if (changes_len.* == changes.len) return; // XXX overflow: batch larger than buffer
+    changes[changes_len.*] = .{
+        .ident = @bitCast(@as(isize, handle)),
+        .filter = filter,
+        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+        .fflags = 0,
+        .data = 0,
+        .udata = @intFromPtr(&fiber.batch_waiter) | batch_userdata_tag,
+    };
+    changes_len.* += 1;
+}
+
+fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+    // The fiber backend is inherently concurrent, and `.none` never times
+    // out, so the wider error set cannot actually occur.
+    return batchAwaitConcurrent(userdata, b, .none) catch |err| switch (err) {
+        error.ConcurrencyUnavailable, error.Timeout => unreachable,
+        error.Canceled => |e| return e,
+    };
+}
+
+fn batchAwaitConcurrent(
+    userdata: ?*anyopaque,
+    b: *Io.Batch,
+    timeout: Io.Timeout,
+) Io.Batch.AwaitConcurrentError!void {
+    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const fiber = Thread.current().currentFiber();
+    const waiter = &fiber.batch_waiter;
+    while (true) {
+        // Events must find the slot empty while the fiber runs, so a
+        // stale event only records the wake; the register_awaiter switch
+        // task below parks this fiber atomically and schedules it right
+        // away when a wake already landed.
+        @atomicStore(?*Fiber, &waiter.parked, null, .release);
+        try batchDrainSubmitted(k, b);
+        if (b.submitted.head == .none) return; // everything completed
+        if (b.completed.head != .none) return; // something completed inline
+        // Re-arming consumed one-shots is an EV_ADD refresh. The drain ran
+        // on this thread, so this wait's kevents live on its kq; after a
+        // work-stealing migration the deletes must still target it.
+        waiter.kq_fd = Thread.current().kq_fd;
+        var when_ns: ?i64 = null;
+        if (timeout != .none) {
+            when_ns = switch (timeout) {
+                .none => null,
+                .duration => |duration| @as(i64, @intCast(Io.Threaded.nowPosix(duration.clock).toNanoseconds() + duration.raw.toNanoseconds())),
+                .deadline => |deadline| @intCast(deadline.raw.toNanoseconds()),
+            };
+            waiter.when_ns = when_ns;
+            const ms: i64 = switch (timeout) {
+                .none => unreachable,
+                .duration => |duration| @max(1, duration.raw.toMilliseconds()),
+                .deadline => |deadline| ms: {
+                    const remaining: i64 = @intCast(when_ns.? - Io.Threaded.nowPosix(deadline.clock).toNanoseconds());
+                    if (remaining <= 0) break :ms 1;
+                    break :ms @divTrunc(remaining, std.time.ns_per_ms);
+                },
+            };
+            batchTimerChange(waiter.kq_fd, fiber, ms, false);
+        }
+        yield(k, null, .{ .register_batch_waiter = &waiter.parked });
+        // A stale wake (an event for an earlier wait of this fiber, or a
+        // spurious one) just goes back to sleep after the deadline check.
+        if (b.submitted.head == .none) {
+            if (timeout != .none) batchTimerChange(waiter.kq_fd, fiber, 0, true);
+            return;
+        }
+        if (timeout != .none) {
+            const now_ns = Io.Threaded.nowPosix(.awake).toNanoseconds();
+            if (now_ns < when_ns.?) {
+                // Stale timer fire: the wait continues. Delete nothing; the
+                // timer was consumed by firing.
+                continue;
+            }
+            // The deadline passed with operations still armed: they stay
+            // submitted and armed, as on the other backends, for a later
+            // await or `Batch.cancel`.
+            return error.Timeout;
+        }
+    }
+}
+
+fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
+    _ = userdata;
+    const fiber = Thread.current().currentFiber();
+    // The fiber runs (slot empty), so in-flight events can only arrive
+    // later and find the `finished` sentinel: no-ops.
+    _ = @atomicRmw(?*Fiber, &fiber.batch_waiter.parked, .Xchg, Fiber.finished, .acq_rel);
+    if (fiber.batch_waiter.when_ns != null) batchTimerChange(fiber.batch_waiter.kq_fd, fiber, 0, true);
+    var changes: [changes_buffer_len]posix.Kevent = undefined;
+    var changes_len: usize = 0;
+    var index = b.submitted.head;
+    while (index != .none) {
+        const storage = &b.storage[index.toIndex()];
+        const submission = storage.submission;
+        const filter: i16 = switch (submission.operation) {
+            .net_receive, .net_read => std.c.EVFILT.READ,
+            .net_send, .net_write => std.c.EVFILT.WRITE,
+            else => break,
+        };
+        const handle: net.Socket.Handle = switch (submission.operation) {
+            .net_receive => |o| o.socket_handle,
+            .net_send => |o| o.socket_handle,
+            .net_read => |o| o.socket_handle,
+            .net_write => |o| o.socket_handle,
+            else => break,
+        };
+        if (changes_len == changes.len) break;
+        changes[changes_len] = .{
+            .ident = @bitCast(@as(isize, handle)),
+            .filter = filter,
+            .flags = std.c.EV.DELETE,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        };
+        changes_len += 1;
+        index = submission.node.next;
+    }
+    if (changes_len != 0 and fiber.batch_waiter.kq_fd >= 0) {
+        _ = kevent(fiber.batch_waiter.kq_fd, changes[0..changes_len], &.{}, null) catch {};
+    }
+    // Return the storages to the unused list, as the other backends do.
+    index = b.submitted.head;
+    while (index != .none) {
+        const storage = &b.storage[index.toIndex()];
+        const next_index = storage.submission.node.next;
+        const tail_index = b.unused.tail;
+        switch (tail_index) {
+            .none => b.unused.head = index,
+            else => |tail| b.storage[tail.toIndex()].unused.next = index,
+        }
+        storage.* = .{ .unused = .{ .prev = tail_index, .next = .none } };
+        b.unused.tail = index;
+        index = next_index;
+    }
+    b.submitted = .empty;
 }
 
 fn checkCancel(k: *Kqueue) error{Canceled}!void {
