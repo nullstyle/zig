@@ -561,11 +561,30 @@ pub fn operateTimeout(io: Io, operation: Operation, timeout: Timeout) OperateTim
     if (timeout == .none) return io.vtable.operate(io.userdata, operation);
     var storage: [1]Operation.Storage = undefined;
     var batch: Batch = .init(&storage);
-    batch.addAt(0, operation);
-    try batch.awaitConcurrent(io, timeout);
-    const completion = batch.next().?;
-    assert(completion.index == 0);
-    return completion.result;
+    while (true) {
+        batch.addAt(0, operation);
+        batch.awaitConcurrent(io, timeout) catch |err| {
+            // `storage` is about to go out of scope; the implementation may
+            // still hold references to it for the pending operation (a
+            // readiness source pointing at the storage, for instance), so
+            // tear it down first.
+            batch.cancel(io);
+            // An operation that completed while it was being canceled still
+            // holds its result: a datagram was consumed, or a message was
+            // sent. That result must reach the caller; the error would lose
+            // it.
+            if (batch.next()) |completion| return completion.result;
+            return err;
+        };
+        if (batch.next()) |completion| {
+            assert(completion.index == 0);
+            return completion.result;
+        }
+        // The operation left the batch without a result. An implementation
+        // reports that when a stale cancel request matched the request, or
+        // when the kernel interrupted it before it did anything. Nothing was
+        // performed, so arm it again.
+    }
 }
 
 /// Submits many operations together without waiting for all of them to
