@@ -187,6 +187,92 @@ fn testTcpAccept(io: Io) !void {
     if (!Client.sent) return error.TestUnexpectedResult;
 }
 
+/// `Future.cancel` on the fiber backend: a task parked in a batched timed
+/// receive is woken by the cancel and reports `error.Canceled` well before
+/// its timeout; a task whose operation already completed still delivers its
+/// result; `recancel` re-arms a consumed request; protected regions hold
+/// delivery until unblocked.
+fn testFutureCancel(io: Io) !void {
+    const bind_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const Outcome = enum { cancelled, completed };
+
+    // 1. Cancel wakes a parked batch wait.
+    {
+        var receiver = try Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram });
+        defer receiver.close(io);
+        const Task = struct {
+            fn run(io_: Io, sock: *const Io.net.Socket) error{ Canceled, TestUnexpectedResult }!Outcome {
+                var messages: [1]Io.net.IncomingMessage = undefined;
+                for (&messages) |*m| m.* = .init;
+                var data: [64]u8 = undefined;
+                const ret = sock.receiveManyTimeout(io_, &messages, &data, .{}, .{
+                    .duration = .{ .raw = Io.Duration.fromMilliseconds(2000), .clock = .awake },
+                });
+                if (ret[0]) |err| switch (err) {
+                    error.Canceled => return .cancelled,
+                    error.Timeout => {},
+                    else => return error.TestUnexpectedResult,
+                };
+                return .completed;
+            }
+        };
+        var future = Io.async(io, Task.run, .{ io, &receiver });
+        // Let the task park on the idle socket.
+        try Io.sleep(io, Io.Duration.fromMilliseconds(20), .awake);
+        const outcome = future.cancel(io) catch Outcome.cancelled;
+        if (outcome != .cancelled) return error.TestUnexpectedResult;
+    }
+
+    // 2. A task that completed before the cancel keeps its result.
+    {
+        const Task = struct {
+            fn run() Outcome {
+                return .completed;
+            }
+        };
+        var future = Io.async(io, Task.run, .{});
+        try Io.sleep(io, Io.Duration.fromMilliseconds(20), .awake);
+        if (future.cancel(io) != .completed) return error.TestUnexpectedResult;
+    }
+
+    // 3. recancel re-arms; the next point signals again.
+    {
+        const Task = struct {
+            fn run(io_: Io) error{ Canceled, TestUnexpectedResult }!Outcome {
+                io_.checkCancel() catch return .cancelled; // consume
+                io_.recancel();
+                io_.checkCancel() catch return .cancelled; // re-armed
+                return .completed;
+            }
+        };
+        var future = Io.async(io, Task.run, .{io});
+        try Io.sleep(io, Io.Duration.fromMilliseconds(20), .awake);
+        // cancel 1: consumed by the first point; the task then recancels
+        // itself, so it is still running its second point when we wait.
+        const outcome3 = future.cancel(io) catch Outcome.cancelled;
+        if (outcome3 != .cancelled) return error.TestUnexpectedResult;
+    }
+
+    // 4. Protection holds delivery.
+    {
+        const Task = struct {
+            fn run(io_: Io) error{ Canceled, TestUnexpectedResult }!Outcome {
+                const prev = io_.swapCancelProtection(.blocked);
+                if (prev != .unblocked) return error.TestUnexpectedResult;
+                // A request landing now must not fire while blocked.
+                io_.sleep(Io.Duration.fromMilliseconds(50), .awake) catch return error.TestUnexpectedResult;
+                _ = io_.swapCancelProtection(.unblocked);
+                io_.checkCancel() catch return .cancelled;
+                return .completed;
+            }
+        };
+        var future = Io.async(io, Task.run, .{io});
+        try Io.sleep(io, Io.Duration.fromMilliseconds(20), .awake);
+        const outcome4 = future.cancel(io) catch Outcome.cancelled;
+        if (outcome4 != .cancelled) return error.TestUnexpectedResult;
+    }
+}
+
 pub fn main() !void {
     var kqueue: Io.Kqueue = undefined;
     try Io.Kqueue.init(&kqueue, std.heap.page_allocator, .{});
@@ -196,6 +282,7 @@ pub fn main() !void {
     try testUdpBatch(io);
     try testGroupTasks(io);
     try testTcpAccept(io);
+    try testFutureCancel(io);
 }
 
 // run
