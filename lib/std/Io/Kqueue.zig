@@ -503,6 +503,19 @@ const batch_userdata_tag: usize = 1;
 /// All batch bookkeeping happens on the fiber itself, which makes the
 /// cancel path safe: a fiber that has moved on leaves `canceled`/`fired`
 /// behind and late events do nothing.
+///
+/// KNOWN LIMITATION (verified crashing under an 8x16 loop load): this is
+/// only sound on a single-threaded instance (`InitOptions.n_threads = 1`).
+/// A fiber parks with its kevents registered on the current thread's kq;
+/// work stealing can resume it elsewhere, and a stale event still in the
+/// old thread's kevent return buffer carries the same waiter address the
+/// fiber's NEXT wait re-arms — it flips `armed` and schedules a fiber that
+/// is running on another thread, corrupting it. The single-operation path
+/// does not share this hazard because `wait_queues` gives it exactly-once
+/// delivery; a fiber must not sit in several wait_queues entries at once,
+/// so batching cannot reuse that mechanism as-is. Fixing the shared
+/// instance needs per-wait identity (generation tokens or fresh waiter
+/// nodes) — until then, prefer one instance per thread.
 const BatchWaiter = struct {
     fiber: *Fiber,
     state: std.atomic.Value(State),
