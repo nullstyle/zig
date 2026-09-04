@@ -153,6 +153,40 @@ fn testGroupTasks(io: Io) !void {
     try empty.await(io);
 }
 
+/// `netListenIp` + `netAccept`: a stream listener whose accept parks on
+/// the idle listener (the client fiber has not connected yet), then wakes
+/// when the connection arrives, and receives the client's payload.
+fn testTcpAccept(io: Io) !void {
+    const bind_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try Io.net.IpAddress.listen(&bind_address, io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const listen_address = listener.socket.address;
+
+    const Client = struct {
+        var sent = false;
+        fn run(io_: Io, target: Io.net.IpAddress) error{Canceled}!void {
+            var sock = Io.net.IpAddress.connect(&target, io_, .{ .mode = .stream }) catch return;
+            defer sock.close(io_);
+            // `connect` returns on EINPROGRESS (TCP fast open posture);
+            // let the handshake finish before sending.
+            Io.sleep(io_, Io.Duration.fromMilliseconds(20), .awake) catch {};
+            sock.socket.send(io_, &target, "ping") catch return;
+            sent = true;
+        }
+    };
+    var group: Io.Group = .init;
+    try group.concurrent(io, Client.run, .{ io, listen_address });
+    // Usually parks: the client has not connected yet.
+    var server = try listener.accept(io);
+    defer server.close(io);
+    var buf: [4]u8 = undefined;
+    var slices = [1][]u8{buf[0..]};
+    const n = try server.read(io, &slices);
+    try group.await(io);
+    if (n != 4 or !std.mem.eql(u8, buf[0..4], "ping")) return error.TestUnexpectedResult;
+    if (!Client.sent) return error.TestUnexpectedResult;
+}
+
 pub fn main() !void {
     var kqueue: Io.Kqueue = undefined;
     try Io.Kqueue.init(&kqueue, std.heap.page_allocator, .{});
@@ -161,6 +195,7 @@ pub fn main() !void {
     try testUdpPing(io);
     try testUdpBatch(io);
     try testGroupTasks(io);
+    try testTcpAccept(io);
 }
 
 // run
