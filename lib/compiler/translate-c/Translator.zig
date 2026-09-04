@@ -2707,7 +2707,13 @@ fn transIntCast(t: *Translator, operand: ZigNode, src_qt: QualType, dest_qt: Qua
                 .rhs = casted,
             });
         }
-        return ZigTag.bit_cast.create(t.arena, casted);
+        // The bitcast's result type cannot always be inferred from context
+        // (a shift amount wraps its operand in `@intCast`, which does not
+        // constrain its operand), so pin it to the destination type.
+        return ZigTag.as.create(t.arena, .{
+            .lhs = try t.transTypeIntWidthOf(dest_qt, t.signedness(dest_qt) == .signed),
+            .rhs = try ZigTag.bit_cast.create(t.arena, casted),
+        });
     }
     return casted;
 }
