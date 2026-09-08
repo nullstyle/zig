@@ -317,6 +317,19 @@ pub const IpAddress = union(enum) {
         /// Windows and systems without SO_REUSEPORT return
         /// `error.OptionUnsupported`.
         reuse_port: bool = false,
+        /// Allows several sockets to bind the same address and port, with
+        /// unicast flows distributed among them by the kernel. This implies
+        /// port reuse; `reuse_port` need not also be set. Every socket joining
+        /// the group must request load balancing before binding.
+        ///
+        /// Uses SO_REUSEPORT on Linux and SO_REUSEPORT_LB on FreeBSD. Other
+        /// systems return `error.OptionUnsupported`. Distribution is based
+        /// on flow addresses and ports. With unchanged group membership,
+        /// one flow stays on one socket; this does not promise equal traffic
+        /// or round-robin delivery.
+        /// The same-user restriction described by `reuse_port` still applies
+        /// on Linux. Plain `reuse_port` keeps its existing platform behavior.
+        reuse_port_load_balance: bool = false,
         mode: Socket.Mode,
         protocol: ?Protocol = null,
     };

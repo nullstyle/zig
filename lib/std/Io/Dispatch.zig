@@ -6016,6 +6016,7 @@ fn netBindIp(
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
+    if (options.reuse_port_load_balance) return error.OptionUnsupported;
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     const family = Io.Threaded.posixAddressFamily(address);
