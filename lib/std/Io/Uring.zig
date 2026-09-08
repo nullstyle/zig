@@ -184,6 +184,11 @@ const Fiber = struct {
     },
     cancel_status: CancelStatus,
     cancel_protection: CancelProtection,
+    /// A batch wait has several tagged requests rather than one request
+    /// identified by this fiber. Protect the registration's stack lifetime
+    /// while another thread requests cancellation.
+    batch_wait_mutex: SpinLock = .{},
+    cancel_batch: ?*Io.Batch = null,
     name: if (tracy.enable) [*:0]const u8 else void,
 
     var next_name: u64 = 0;
@@ -387,6 +392,14 @@ const Fiber = struct {
             .acquire,
         );
         assert(!cancel_status.requested);
+        fiber.batch_wait_mutex.lock();
+        if (fiber.cancel_batch) |batch| {
+            const ready = signalBatch(batch);
+            fiber.batch_wait_mutex.unlock();
+            if (ready) |f| _ = ev.schedule(.current(), .{ .head = f, .tail = f });
+            return;
+        }
+        fiber.batch_wait_mutex.unlock();
         switch (cancel_status.awaiting) {
             .nothing => {},
             .group => {
@@ -400,37 +413,7 @@ const Fiber = struct {
             _ => |awaiting| {
                 const awaiting_io_uring_fd = awaiting.toIoUringFd();
                 const thread: *Thread = .current();
-                thread.enqueue().* = if (thread.io_uring.fd == awaiting_io_uring_fd) .{
-                    .opcode = .ASYNC_CANCEL,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = 0,
-                    .off = 0,
-                    .addr = @intFromPtr(fiber),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.wakeup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                } else .{
-                    .opcode = .MSG_RING,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = awaiting_io_uring_fd,
-                    .off = @intFromPtr(fiber) | 0b01,
-                    .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.cleanup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
+                cancelRequest(thread, awaiting_io_uring_fd, @intFromPtr(fiber), false);
             },
         }
     }
@@ -1215,26 +1198,11 @@ fn idle(ev: *Evented, thread: *Thread) void {
                     },
                     0b01 => {
                         // A cancel request forwarded from another thread via
-                        // MSG_RING. Bits 0-1 carry this tag; bit 2 says the
-                        // target is a batch request (whose own user data is
-                        // tagged 0b10), otherwise it is a fiber-tagged one.
-                        const target = cqe.user_data & ~@as(usize, 0b111);
-                        thread.enqueue().* = .{
-                            .opcode = .ASYNC_CANCEL,
-                            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                            .ioprio = 0,
-                            .fd = 0,
-                            .off = 0,
-                            .addr = if (cqe.user_data & 0b100 != 0) target | 0b10 else target,
-                            .len = 0,
-                            .rw_flags = 0,
-                            .user_data = @backingInt(Completion.Userdata.wakeup),
-                            .buf_index = 0,
-                            .personality = 0,
-                            .splice_fd_in = 0,
-                            .addr3 = 0,
-                            .resv = 0,
-                        };
+                        // MSG_RING. Its result carries the original two tag
+                        // bits, preserving every pointer bit in user_data.
+                        const flags: u32 = @bitCast(cqe.res);
+                        const target = (cqe.user_data & ~@as(usize, 0b11)) | (flags & 0b11);
+                        cancelRequest(thread, thread.io_uring.fd, target, flags & 0b100 != 0);
                         break :ready_fiber null;
                     },
                     0b10 => {
@@ -1266,18 +1234,35 @@ fn idle(ev: *Evented, thread: *Thread) void {
                             0b10, 0b11 => null,
                         };
                     },
-                    0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                    0b11 => if (cqe.user_data & 0b100 != 0) timer: {
+                        const timer: *BatchTimeout = @ptrFromInt(cqe.user_data & ~@as(usize, 0b111));
+                        const done: u8 = switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                            .TIME, .CANCELED => BatchTimeout.timer_done,
+                            .SUCCESS, .NOENT, .ALREADY => BatchTimeout.cancel_done,
+                            else => |err| {
+                                unexpectedErrno(err) catch {};
+                                break :timer null;
+                            },
+                        };
+                        const ready = signalBatch(timer.batch);
+                        // Last access to the context: a fiber already running
+                        // may destroy it as soon as both completions arrive.
+                        _ = timer.done.fetchOr(done, .release);
+                        break :timer ready;
+                    } else switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
                         .SUCCESS => unreachable, // no event count specified
                         .TIME => {
                             const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
+                            const fiber = @atomicRmw(usize, context, .Or, 0b01, .acquire);
                             break :ready_fiber switch (@as(u2, @truncate(fiber))) {
-                                else => unreachable, // timeout completed multiple times
                                 0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
-                                0b10 => null,
+                                0b01, 0b10, 0b11 => null,
                             };
                         },
-                        .CANCELED => null, // user data may have been invalidated
+                        // A linked request can finish just before its timeout
+                        // tries to cancel it. Both results mean no timeout
+                        // remains; user data may already have been invalidated.
+                        .CANCELED, .NOENT => null,
                         else => |err| unexpectedErrno(err) catch null,
                     },
                 })) |ready_fiber| {
@@ -2246,6 +2231,91 @@ fn deviceIoControl(
     }
 }
 
+/// Cancel on the request's owning ring. MSG_RING's result preserves the
+/// target's low tag bits; stealing another pointer bit loses 4-aligned
+/// fiber addresses and cannot represent standalone batch timers.
+fn cancelRequest(thread: *Thread, ring_fd: fd_t, target: usize, acknowledge: bool) void {
+    const local = ring_fd == thread.io_uring.fd;
+    thread.enqueue().* = .{
+        .opcode = if (local) .ASYNC_CANCEL else .MSG_RING,
+        .flags = if (local and acknowledge) 0 else linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = if (local) 0 else ring_fd,
+        .off = if (local) 0 else (target & ~@as(usize, 0b11)) | 0b01,
+        .addr = if (local) target else @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+        .len = if (local) 0 else @as(u32, @intCast(target & 0b11)) | (if (acknowledge) @as(u32, 0b100) else 0),
+        .rw_flags = 0,
+        .user_data = if (local and acknowledge) target else @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+}
+
+/// The marker is idempotent: readiness, cancellation and a timeout may all
+/// arrive for one park, but only the first one schedules the waiting fiber.
+fn signalBatch(batch: *Io.Batch) ?*Fiber {
+    const previous = @atomicRmw(usize, @as(*usize, @ptrCast(&batch.userdata)), .Or, 0b01, .acq_rel);
+    return if (previous & 0b11 == 0) @ptrFromInt(previous) else null;
+}
+
+fn awaitBatch(ev: *Evented, batch: *Io.Batch, cancel_region: *CancelRegion) Io.Cancelable!void {
+    try cancel_region.await(.nothing);
+    const fiber = cancel_region.fiber;
+    if (cancel_region.status.requested) {
+        fiber.batch_wait_mutex.lock();
+        fiber.cancel_batch = batch;
+        if (@atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .acquire).requested) {
+            assert(signalBatch(batch) == null); // not parked yet
+        }
+        fiber.batch_wait_mutex.unlock();
+    }
+    ev.yield(null, .{ .batch_await = batch });
+    fiber.batch_wait_mutex.lock();
+    fiber.cancel_batch = null;
+    fiber.batch_wait_mutex.unlock();
+    cancel_region.await(.nothing) catch |err| {
+        // Consume the cancellation wake while retaining any real results.
+        // A caller may handle Canceled and await this same batch again.
+        batchDrainReady(ev, batch) catch {};
+        return err;
+    };
+}
+
+/// Unlike a linked timeout, this independent request must be quiescent
+/// before batchAwaitConcurrent returns. Wait for its cancel acknowledgment
+/// too, so a late cancel cannot match a later timer at the same address.
+const BatchTimeout = struct {
+    batch: *Io.Batch,
+    timespec: linux.kernel_timespec,
+    ring_fd: fd_t,
+    done: std.atomic.Value(u8) = .init(0),
+
+    const timer_done = 1;
+    const cancel_done = 2;
+
+    fn userData(timer: *BatchTimeout) usize {
+        comptime assert(@alignOf(BatchTimeout) >= 8);
+        return @intFromPtr(timer) | 0b111;
+    }
+
+    fn deinit(timer: *BatchTimeout, ev: *Evented) void {
+        var required: u8 = timer_done;
+        if (timer.done.load(.acquire) & timer_done == 0) {
+            required |= cancel_done;
+            cancelRequest(.current(), timer.ring_fd, timer.userData(), true);
+        }
+        while (timer.done.load(.acquire) != required) {
+            batchDrainReady(ev, timer.batch) catch {};
+            if (timer.done.load(.acquire) == required) break;
+            ev.yield(null, .{ .batch_await = timer.batch });
+        }
+        batchDrainReady(ev, timer.batch) catch {};
+    }
+};
+
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
@@ -2260,7 +2330,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
             error.Timeout => unreachable, // no timeout
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
-        ev.yield(null, .{ .batch_await = batch });
+        try awaitBatch(ev, batch, &maybe_sync.cancel_region);
     }
 }
 
@@ -2274,106 +2344,47 @@ fn batchAwaitConcurrent(
     defer maybe_sync.deinit(ev);
     try ev.batchDrainSubmitted(&maybe_sync, batch, true, timeout);
     maybe_sync.leaveSync(ev);
-    if (batchIsLinked(batch)) {
-        // The timeout rides in the ring linked to the single request; whichever
-        // completes first cancels the other. Nothing is armed or removed here.
+    if (batchIsLinked(batch) or timeout == .none) {
         while (true) {
             batchDrainReady(ev, batch) catch |err| switch (err) {
                 error.Timeout => |e| return if (batch.completed.head == .none) e,
             };
             if (batch.completed.head != .none or batch.pending.head == .none) return;
-            ev.yield(null, .{ .batch_await = batch });
+            try awaitBatch(ev, batch, &maybe_sync.cancel_region);
         }
     }
-    const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
-        batchDrainReady(ev, batch) catch |err| switch (err) {
-            error.Timeout => unreachable, // no timeout
-        };
-        if (batch.completed.head != .none or batch.pending.head == .none) return;
-        switch (timeout) {
-            .none => ev.yield(null, .{ .batch_await = batch }),
-            .duration => |duration| {
-                const ns = duration.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    duration.clock,
-                    0,
-                };
-            },
-            .deadline => |deadline| {
-                const ns = deadline.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    deadline.clock,
-                    linux.IORING_TIMEOUT_ABS,
-                };
-            },
-        }
-    };
-    {
-        const thread = try maybe_sync.cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .TIMEOUT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&timespec),
-            .len = 1,
-            .rw_flags = timeout_flags | @as(u32, switch (clock) {
-                .real => linux.IORING_TIMEOUT_REALTIME,
-                else => 0,
-                .boot => linux.IORING_TIMEOUT_BOOTTIME,
-            }),
-            .user_data = @intFromPtr(&batch.userdata) | 0b11,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-    }
-    while (batch.completed.head == .none and batch.pending.head != .none) {
-        ev.yield(null, .{ .batch_await = batch });
-        batchDrainReady(ev, batch) catch |err| switch (err) {
-            error.Timeout => |e| return if (batch.completed.head == .none and
-                batch.pending.head != .none) e,
-        };
-    }
+    batchDrainReady(ev, batch) catch unreachable; // no timer armed yet
+    if (batch.completed.head != .none or batch.pending.head == .none) return;
+    const spec = timeoutSpec(timeout).?;
     const thread = try maybe_sync.cancel_region.awaitIoUring();
+    var timer: BatchTimeout = .{
+        .batch = batch,
+        .timespec = spec.ts,
+        .ring_fd = thread.io_uring.fd,
+    };
     thread.enqueue().* = .{
-        .opcode = .TIMEOUT_REMOVE,
+        .opcode = .TIMEOUT,
         .flags = 0,
         .ioprio = 0,
         .fd = 0,
         .off = 0,
-        .addr = @intFromPtr(&batch.userdata) | 0b11,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(maybe_sync.cancel_region.fiber),
+        .addr = @intFromPtr(&timer.timespec),
+        .len = 1,
+        .rw_flags = spec.rw_flags,
+        .user_data = timer.userData(),
         .buf_index = 0,
         .personality = 0,
         .splice_fd_in = 0,
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
-    switch (maybe_sync.cancel_region.errno()) {
-        .SUCCESS => return,
-        .BUSY, .NOENT => {},
-        else => |err| unexpectedErrno(err) catch {},
-    }
+    defer timer.deinit(ev);
     while (true) {
         batchDrainReady(ev, batch) catch |err| switch (err) {
-            error.Timeout => return,
+            error.Timeout => |e| return if (batch.completed.head == .none) e,
         };
-        ev.yield(null, .{ .batch_await = batch });
+        if (batch.completed.head != .none or batch.pending.head == .none) return;
+        try awaitBatch(ev, batch, &maybe_sync.cancel_region);
     }
 }
 
@@ -2587,13 +2598,9 @@ fn batchDrainReady(ev: *Evented, batch: *Io.Batch) Io.Timeout.Error!void {
         var timeout = false;
         while (cond: switch (@as(u2, @truncate(next))) {
             0b00 => if (timeout) return error.Timeout else false,
-            0b01 => {
-                assert(!timeout);
-                return error.Timeout;
-            },
+            0b01 => return error.Timeout,
             0b10 => true,
             0b11 => {
-                assert(!timeout);
                 timeout = true;
                 break :cond true;
             },
@@ -2737,49 +2744,7 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     while (index != .none) {
         const pending = &batch.storage[index.toIndex()].pending;
         const ring_fd: fd_t = @bitCast(@as(u32, @intCast(pending.userdata[4])));
-        if (ring_fd == thread.io_uring.fd) {
-            thread.enqueue().* = .{
-                .opcode = .ASYNC_CANCEL,
-                .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                .ioprio = 0,
-                .fd = 0,
-                .off = 0,
-                .addr = @intFromPtr(&pending.userdata) | 0b10,
-                .len = 0,
-                .rw_flags = 0,
-                .user_data = @backingInt(Completion.Userdata.wakeup),
-                .buf_index = 0,
-                .personality = 0,
-                .splice_fd_in = 0,
-                .addr3 = 0,
-                .resv = 0,
-            };
-        } else {
-            // The request lives in a ring owned by another thread, and only
-            // that thread may submit to it (single issuer; the register-based
-            // synchronous cancel is refused for the same reason). Forward the
-            // request the way `Fiber.requestCancel` does: a MSG_RING message
-            // tagged 0b01 makes the owning thread issue the ASYNC_CANCEL
-            // itself. Bit 2 marks the target as a batch request. The
-            // canceled completion then lands on that ring and wakes this
-            // fiber through the batch's completion chain.
-            thread.enqueue().* = .{
-                .opcode = .MSG_RING,
-                .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                .ioprio = 0,
-                .fd = ring_fd,
-                .off = @intFromPtr(&pending.userdata) | 0b101,
-                .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                .len = 0,
-                .rw_flags = 0,
-                .user_data = @backingInt(Completion.Userdata.wakeup),
-                .buf_index = 0,
-                .personality = 0,
-                .splice_fd_in = 0,
-                .addr3 = 0,
-                .resv = 0,
-            };
-        }
+        cancelRequest(thread, ring_fd, @intFromPtr(&pending.userdata) | 0b10, false);
         index = pending.node.next;
     }
     // The cancel completions land on this thread's ring, which is only
