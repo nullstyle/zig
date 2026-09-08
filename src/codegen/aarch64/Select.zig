@@ -10260,15 +10260,14 @@ pub const Value = struct {
                         }
                     },
                     .vector_type => |vector_type| {
-                        // A vector iterates like an array of its element
-                        // type; the part-combining below already marks
-                        // SIMD-sized parts as vectors, so a large vector
-                        // splits into 16-byte loads and stores.
+                        // Partition contiguous storage by register boundaries.
+                        // addPart preserves the actual alignment of each part;
+                        // using it to limit grouping would overflow max_parts
+                        // for large arrays of byte-aligned elements.
                         const min_part_log2_stride: u5 = if (size > 16) 4 else if (size > 8) 3 else 0;
                         if (vector_type.len > Value.max_parts and
                             (@divCeil(size, @as(u64, 1) << min_part_log2_stride)) > Value.max_parts)
                             return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)});
-                        const alignment = vi.alignment(isel);
                         const Part = struct { offset: u64, size: u64 };
                         var parts: [Value.max_parts]Part = undefined;
                         var parts_len: Value.PartsLen = 0;
@@ -10297,12 +10296,13 @@ pub const Value = struct {
                                 const combined_size = elem_end - prev_part.offset;
                                 if (combined_size > @as(u64, 1) << @min(
                                     min_part_log2_stride,
-                                    alignment.toLog2Units(),
                                     @ctz(prev_part.offset),
                                 )) break :combine;
                                 prev_part.size = combined_size;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{ .offset = elem_begin, .size = elem_size };
                             parts_len += 1;
                         }
@@ -10314,12 +10314,13 @@ pub const Value = struct {
                         }
                     },
                     .array_type => |array_type| {
+                        // As for vectors, grouping is independent of the
+                        // storage alignment, which addPart preserves.
                         const min_part_log2_stride: u5 = if (size > 16) 4 else if (size > 8) 3 else 0;
                         const array_len = array_type.lenIncludingSentinel();
                         if (array_len > Value.max_parts and
                             (@divCeil(size, @as(u64, 1) << min_part_log2_stride)) > Value.max_parts)
                             return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)});
-                        const alignment = vi.alignment(isel);
                         const Part = struct { offset: u64, size: u64 };
                         var parts: [Value.max_parts]Part = undefined;
                         var parts_len: Value.PartsLen = 0;
@@ -10348,12 +10349,13 @@ pub const Value = struct {
                                 const combined_size = elem_end - prev_part.offset;
                                 if (combined_size > @as(u64, 1) << @min(
                                     min_part_log2_stride,
-                                    alignment.toLog2Units(),
                                     @ctz(prev_part.offset),
                                 )) break :combine;
                                 prev_part.size = combined_size;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{ .offset = elem_begin, .size = elem_size };
                             parts_len += 1;
                         }
