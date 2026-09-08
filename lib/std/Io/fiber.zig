@@ -41,9 +41,12 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
         // the same way. A fresh fiber enters through its entry trampoline and
         // never executes the pop. `nzcv` is listed because the compiler
         // otherwise keeps compare results in the flags across the asm.
+        // Branch through x16 so BTI treats the transfer as call-compatible:
+        // fresh fibers enter functions with `bti c`, and resumed fibers land
+        // on the matching hint below (a nop on CPUs without BTI).
         .aarch64 => asm volatile (
             \\ ldp x0, x2, [x1]
-            \\ ldr x3, [x2, #16]
+            \\ ldr x16, [x2, #16]
             \\ stp x30, x18, [sp, #-16]!
             \\ mov x4, sp
             \\ stp x4, fp, [x0]
@@ -51,8 +54,9 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
             \\ ldp x4, fp, [x2]
             \\ str x5, [x0, #16]
             \\ mov sp, x4
-            \\ br x3
+            \\ br x16
             \\0:
+            \\ hint #34
             \\ ldp x30, x18, [sp], #16
             : [received_message] "={x1}" (-> *const Switch),
             : [message_to_send] "{x1}" (s),
