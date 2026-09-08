@@ -247,6 +247,9 @@ fn testInterfaceResolve(io: Io) !void {
     name.bytes[3] = 0;
     const iface = try name.resolve(io);
     if (iface.index == 0) return error.TestUnexpectedResult;
+    const reversed = try iface.name(io);
+    try expectEqualStrings("lo0", reversed.toSlice());
+    try std.testing.expectError(error.InterfaceNotFound, (Io.net.Interface{ .index = std.math.maxInt(u32) }).name(io));
 }
 
 fn testHostLookup(io: Io) !void {

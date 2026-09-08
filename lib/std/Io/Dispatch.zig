@@ -6224,12 +6224,13 @@ fn netInterfaceName(
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = interface;
-    // TODO implement via sysctl(NET_RT_IFLIST); the SDK textstub does not
-    // export `if_indextoname` for arm64-macos, so the libc route is not
-    // linkable with zig's linker.
-    return error.Unexpected;
+    try checkCancel(ev);
+    const libc = struct {
+        extern "c" fn if_indextoname(c_uint, [*]u8) ?[*:0]u8;
+    };
+    var name: net.Interface.Name = undefined;
+    if (libc.if_indextoname(interface.index, &name.bytes) == null) return error.InterfaceNotFound;
+    return name;
 }
 
 fn netLookup(
