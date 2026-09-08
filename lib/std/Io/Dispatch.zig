@@ -695,6 +695,7 @@ const SwitchMessage = struct {
         futex_wait: *Futex.Waiter,
         futex_wake: *Futex.Waker,
         sleep_wait: *SleepWaiter,
+        wait_ready: *WaitReadyWaiter,
         after: c.dispatch.time_t,
         destroy,
         exit,
@@ -760,6 +761,14 @@ const SwitchMessage = struct {
                 }
                 queue.async(waiter, &SleepWaiter.start);
             },
+            .wait_ready => |waiter| {
+                waiter.sleeper =
+                    .init(ev.queue, @alignCast(@fieldParentPtr("context", message.contexts.old)));
+                const queue = waiter.cancelable.queue;
+                if (waiter.sleeper.fiber.cancel_protection.check() == .blocked)
+                    waiter.cancelable = .blocked;
+                queue.async(waiter, &WaitReadyWaiter.start);
+            },
             .after => |when| {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 when.after(ev.queue, fiber, &Fiber.@"resume");
@@ -818,12 +827,15 @@ const Cancelable = struct {
             @branchHint(.unlikely);
             return;
         }
-        const cancel_status = @atomicRmw(Fiber.CancelStatus, &fiber.cancel_status, .And, .{
-            .requested = true,
-            .awaiting = .nothing,
-        }, .monotonic);
-        assert(cancel_status.awaiting.toCancelable() == cancelable);
-        if (cancel_status.requested) return error.CancelRequested;
+        // If cancellation won, its queued callback still owns this waiter.
+        // Keep the registration intact until that callback consumes it.
+        if (@cmpxchgStrong(Fiber.CancelStatus, &fiber.cancel_status, .{
+            .requested = false,
+            .awaiting = .fromCancelable(cancelable),
+        }, .unrequested, .monotonic, .monotonic)) |cancel_status| {
+            assert(cancel_status.requested and cancel_status.awaiting.toCancelable() == cancelable);
+            return error.CancelRequested;
+        }
     }
 
     fn async(cancelable: *Cancelable) void {
@@ -1778,19 +1790,22 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .device_io_control => |*o| return .{ .device_io_control = try deviceIoControl(o) },
         .net_receive => |*o| return .{
-            .net_receive = r: {
-                const opt_err, const count = ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
-                if (opt_err) |err| break :r .{ err, count } else break :r .{ null, count };
-            },
+            .net_receive = try ev.netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags),
         },
         .net_send => |o| return .{
-            .net_send = ev.netSend(o.socket_handle, o.messages, o.flags),
+            .net_send = try ev.netSend(o.socket_handle, o.messages, o.flags),
         },
         .net_read => |o| return .{
-            .net_read = ev.netRead(o.socket_handle, o.data),
+            .net_read = ev.netRead(o.socket_handle, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
         },
         .net_write => |o| return .{
-            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat),
+            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
         },
     }
 }
@@ -1980,11 +1995,42 @@ const BatchWaiter = struct {
     sleeper: Sleeper,
     queue: c.dispatch.queue_t,
     timer: ?c.dispatch.source_t = null,
+    cancelable: Cancelable = .blocked,
+    finishing: bool = false,
 
     const already_signaled: c.dispatch.source_t = @ptrFromInt(1);
 
+    /// The owning fiber holds `queue` suspended until it parks, so a
+    /// cancellation callback cannot race registration or access its stack.
+    fn enter(waiter: *BatchWaiter, fiber: *Fiber) Io.Cancelable!void {
+        if (fiber.cancel_protection.check() == .unblocked)
+            waiter.cancelable = .{ .queue = waiter.queue, .cancel = &canceled };
+        waiter.cancelable.enter(fiber) catch |err| switch (err) {
+            error.CancelRequested => return waiter.cancelable.acknowledge(fiber),
+        };
+    }
+
     fn signal(context: ?*anyopaque) callconv(.c) void {
         const waiter: *BatchWaiter = @ptrCast(@alignCast(context));
+        if (waiter.finishing) return;
+        waiter.finishing = true;
+        waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
+            // Leave the queue running until the cancellation callback has
+            // relinquished its reference to this stack waiter.
+            error.CancelRequested => return,
+        };
+        waiter.finish();
+    }
+
+    fn canceled(context: ?*anyopaque) callconv(.c) void {
+        const cancelable: *Cancelable = @ptrCast(@alignCast(context));
+        const waiter: *BatchWaiter = @fieldParentPtr("cancelable", cancelable);
+        cancelable.requested(waiter.sleeper.fiber);
+        waiter.finishing = true;
+        waiter.finish();
+    }
+
+    fn finish(waiter: *BatchWaiter) void {
         if (waiter.timer) |timer| {
             if (timer != already_signaled) timer.cancel();
         } else {
@@ -2001,9 +2047,8 @@ const BatchWaiter = struct {
     }
 
     fn wake(waiter: *BatchWaiter) void {
-        var sleeper = waiter.sleeper;
-        waiter.* = undefined;
-        Sleeper.wake(&sleeper);
+        // The resumed fiber still reads the cancellation result.
+        Sleeper.wake(&waiter.sleeper);
     }
 };
 
@@ -2016,9 +2061,9 @@ const BatchWaiter = struct {
 /// The entry queue carries exactly one suspension whenever a fiber runs
 /// (the base one from creation, or the one the first completing handler
 /// took), and runs only while the waiting fiber is parked (the fiber
-/// resumes it as it parks). Because the first event handler to run on an
-/// open queue suspends it again, at most one handler completes per open
-/// cycle and the count alternates between one and zero, so teardown can
+/// resumes it as it parks). The completing handler suspends it again, or
+/// leaves that to the cancellation callback when cancellation owns the
+/// waiter. The count alternates between one and zero, so teardown can
 /// always drop exactly one suspension. Entry fields are touched by handlers
 /// running on the entry queue and by the fiber while it holds the queue
 /// suspended; those never overlap, so the fields need no atomics.
@@ -2070,11 +2115,45 @@ const NetEntry = struct {
 /// The fiber's side of a batched wait that runs on a `NetEntry`.
 const EntryWaiter = struct {
     sleeper: Sleeper,
+    entry: *NetEntry,
+    cancelable: Cancelable = .blocked,
+    finishing: bool = false,
+
+    fn enter(waiter: *EntryWaiter, fiber: *Fiber) Io.Cancelable!void {
+        if (fiber.cancel_protection.check() == .unblocked)
+            waiter.cancelable = .{ .queue = waiter.entry.queue, .cancel = &canceled };
+        waiter.cancelable.enter(fiber) catch |err| switch (err) {
+            error.CancelRequested => return waiter.cancelable.acknowledge(fiber),
+        };
+    }
+
+    fn finish(waiter: *EntryWaiter) void {
+        if (waiter.finishing) return;
+        waiter.finishing = true;
+        waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
+            error.CancelRequested => return,
+        };
+        waiter.wake();
+    }
+
+    fn canceled(context: ?*anyopaque) callconv(.c) void {
+        const cancelable: *Cancelable = @ptrCast(@alignCast(context));
+        const waiter: *EntryWaiter = @fieldParentPtr("cancelable", cancelable);
+        cancelable.requested(waiter.sleeper.fiber);
+        waiter.finishing = true;
+        waiter.wake();
+    }
 
     fn wake(waiter: *EntryWaiter) void {
-        var sleeper = waiter.sleeper;
-        waiter.* = undefined;
-        Sleeper.wake(&sleeper);
+        const entry = waiter.entry;
+        if (entry.timer_armed) {
+            entry.timer_armed = false;
+            entry.timer.?.set_timer(.FOREVER, c.dispatch.TIME_FOREVER, 0);
+            entry.timer.?.as_object().@"suspend"();
+        }
+        entry.queue.as_object().@"suspend"();
+        entry.waiter = null;
+        Sleeper.wake(&waiter.sleeper);
     }
 };
 
@@ -2154,18 +2233,11 @@ fn netEntryTeardown(entry: *NetEntry) void {
 
 /// Disarms the timer if the current wait armed it, re-suspends the entry
 /// queue (restoring the one suspension a running fiber holds) and wakes the
-/// fiber. Runs on the entry queue as the tail of the first handler to
-/// complete an operation (or of the timer handler).
+/// fiber. If cancellation owns the waiter, its callback finishes the wake
+/// after releasing the cancellation reference to the fiber's stack.
 fn netEntryFinish(entry: *NetEntry) void {
-    if (entry.timer_armed) {
-        entry.timer_armed = false;
-        entry.timer.?.set_timer(.FOREVER, c.dispatch.TIME_FOREVER, 0);
-        entry.timer.?.as_object().@"suspend"();
-    }
-    entry.queue.as_object().@"suspend"();
     const waiter = entry.waiter orelse return;
-    entry.waiter = null;
-    waiter.wake();
+    waiter.finish();
 }
 
 fn netEntryReadEvent(context: ?*anyopaque) callconv(.c) void {
@@ -2277,36 +2349,40 @@ fn netEntryEvent(context: ?*anyopaque, direction: NetEntry.Direction) void {
 /// deadline, and a stale wake re-arms and goes back to sleep.
 fn netEntryTimerFired(context: ?*anyopaque) callconv(.c) void {
     const entry: *NetEntry = @ptrCast(@alignCast(context));
-    const waiter = entry.waiter orelse return;
-    entry.waiter = null;
     netEntryFinish(entry);
-    waiter.wake();
 }
 
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    try checkCancel(ev);
     const queue = ev.batchDrainSubmitted(batch, false) catch |err| switch (err) {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         error.Canceled => |e| return e,
     } orelse return;
     if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
+    if (batch.completed.head != .none) return;
+    const fiber = Thread.current().currentFiber();
     if (batchUserdataEntry(batch)) |entry| {
-        if (batch.completed.head != .none) return; // something completed inline
         var waiter: EntryWaiter = .{
-            .sleeper = .init(ev.queue, Thread.current().currentFiber()),
+            .sleeper = undefined,
+            .entry = entry,
         };
+        try waiter.enter(fiber);
+        waiter.sleeper = .init(ev.queue, fiber);
         entry.waiter = &waiter;
         ev.yield(.{ .@"resume" = entry.queue.as_object() });
-        return;
+        return waiter.cancelable.acknowledge(fiber);
     }
     var waiter: BatchWaiter = .{
-        .sleeper = .init(ev.queue, Thread.current().currentFiber()),
+        .sleeper = undefined,
         .queue = queue,
     };
-    if (batch.completed.head != .none) BatchWaiter.signal(&waiter);
+    try waiter.enter(fiber);
+    waiter.sleeper = .init(ev.queue, fiber);
     queue.as_object().set_context(&waiter);
     ev.yield(.{ .@"resume" = queue.as_object() });
     batchReleaseIdleQueue(batch);
+    try waiter.cancelable.acknowledge(fiber);
 }
 
 fn batchAwaitConcurrent(
@@ -2315,10 +2391,15 @@ fn batchAwaitConcurrent(
     timeout: Io.Timeout,
 ) Io.Batch.AwaitConcurrentError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    try checkCancel(ev);
     const queue = try ev.batchDrainSubmitted(batch, true) orelse return;
     if (batch.pending.head == .none) return batchReleaseIdleQueue(batch);
+    if (batch.completed.head != .none) return;
+    const fiber = Thread.current().currentFiber();
     if (batchUserdataEntry(batch)) |entry| {
-        const fiber = Thread.current().currentFiber();
+        // Preserve one deadline across stale timer wakes. Dispatch time_t
+        // values are opaque encodings, and wall times sort backwards.
+        const deadline = timeout.toTimestamp(ev.io());
         while (true) {
             // Create the timer before pointing the entry at the stack
             // waiter, so a creation failure cannot leave a dangling waiter.
@@ -2346,31 +2427,25 @@ fn batchAwaitConcurrent(
             if (timer_failed) return error.ConcurrencyUnavailable;
             if (batch.completed.head != .none) return; // something completed inline
             var waiter: EntryWaiter = .{
-                .sleeper = .init(ev.queue, fiber),
+                .sleeper = undefined,
+                .entry = entry,
             };
+            try waiter.enter(fiber);
+            waiter.sleeper = .init(ev.queue, fiber);
             entry.waiter = &waiter;
-            var when: c.dispatch.time_t = .FOREVER;
             if (timer) |object| {
-                when = ev.timeFromTimeout(timeout);
-                object.set_timer(when, c.dispatch.TIME_FOREVER, ev.leeway);
+                object.set_timer(ev.timeFromTimeout(.{ .deadline = deadline.? }), c.dispatch.TIME_FOREVER, ev.leeway);
                 entry.timer_armed = true;
                 object.as_object().@"resume"();
             }
             ev.yield(.{ .@"resume" = entry.queue.as_object() });
+            try waiter.cancelable.acknowledge(fiber);
             if (batch.completed.head != .none) return;
             if (timeout == .none) unreachable; // only sources wake an untimed wait
             // Woke with nothing completed: either the deadline passed, or a
             // stale fire from an earlier arm of this entry's timer was
             // delivered. Only a real deadline returns.
-            const clock = switch (timeout) {
-                .none => unreachable,
-                .duration => |duration| duration.clock,
-                .deadline => |deadline| deadline.clock,
-            };
-            const now_time = ev.timeFromTimeout(.{
-                .duration = .{ .raw = .fromNanoseconds(0), .clock = clock },
-            });
-            if (@intFromEnum(when) <= @intFromEnum(now_time)) {
+            if (deadline.?.durationFromNow(ev.io()).raw.toNanoseconds() <= 0) {
                 // The operations stay pending on the entry, as on the other
                 // backends: the caller may await again or call `Batch.cancel`.
                 return error.Timeout;
@@ -2379,32 +2454,43 @@ fn batchAwaitConcurrent(
         }
     }
     var waiter: BatchWaiter = .{
-        .sleeper = .init(ev.queue, Thread.current().currentFiber()),
+        .sleeper = undefined,
         .queue = queue,
-    };
-    if (batch.completed.head == .none) switch (timeout) {
-        .none => {},
-        else => {
-            const timer = c.dispatch.source_create(.TIMER, 0, .none, queue) orelse
-                return error.ConcurrencyUnavailable;
-            assert(timer != BatchWaiter.already_signaled);
-            timer.as_object().set_context(&waiter);
-            timer.set_event_handler(&BatchWaiter.signal);
-            timer.set_cancel_handler(&BatchWaiter.@"suspend");
-            timer.set_timer(ev.timeFromTimeout(timeout), c.dispatch.TIME_FOREVER, ev.leeway);
-            timer.as_object().activate();
-            waiter.timer = timer;
+        .timer = switch (timeout) {
+            .none => null,
+            else => c.dispatch.source_create(.TIMER, 0, .none, queue) orelse
+                return error.ConcurrencyUnavailable,
         },
-    } else BatchWaiter.signal(&waiter);
+    };
+    waiter.enter(fiber) catch |err| {
+        if (waiter.timer) |timer| {
+            // No handlers refer to the stack waiter yet. Activate even on
+            // cancellation so an initially inactive source can finalize.
+            timer.cancel();
+            timer.as_object().activate();
+            timer.as_object().release();
+        }
+        return err;
+    };
+    waiter.sleeper = .init(ev.queue, fiber);
+    if (waiter.timer) |timer| {
+        assert(timer != BatchWaiter.already_signaled);
+        timer.as_object().set_context(&waiter);
+        timer.set_event_handler(&BatchWaiter.signal);
+        timer.set_cancel_handler(&BatchWaiter.@"suspend");
+        timer.set_timer(ev.timeFromTimeout(timeout), c.dispatch.TIME_FOREVER, ev.leeway);
+        timer.as_object().activate();
+    }
     queue.as_object().set_context(&waiter);
     ev.yield(.{ .@"resume" = queue.as_object() });
+    batchReleaseIdleQueue(batch);
+    try waiter.cancelable.acknowledge(fiber);
     if (timeout != .none and batch.completed.head == .none) {
         // The timer fired before any operation completed. The operations stay
         // pending on the (now suspended) batch queue, as on the other
         // backends: the caller may await again or call `Batch.cancel`.
         return error.Timeout;
     }
-    batchReleaseIdleQueue(batch);
 }
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
@@ -5774,7 +5860,6 @@ const SleepWaiter = struct {
     fn wake(context: ?*anyopaque) callconv(.c) void {
         const waiter: *SleepWaiter = @ptrCast(@alignCast(context));
         var sleeper = waiter.sleeper;
-        waiter.* = undefined;
         Sleeper.wake(&sleeper);
     }
 };
@@ -5808,19 +5893,15 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
 }
 
 fn timeFromTimeout(ev: *Evented, timeout: Io.Timeout) c.dispatch.time_t {
+    // A deadline in the past is ready now. In particular, passing the
+    // Unix epoch to dispatch_walltime produces FOREVER, not an expiry.
     return timeout: switch (timeout) {
         .none => .FOREVER,
         .duration => |duration| .time(switch (duration.clock) {
             .real => .WALL_NOW,
             else => .NOW,
-        }, std.math.lossyCast(i64, duration.raw.toNanoseconds())),
-        .deadline => |deadline| switch (deadline.clock) {
-            .real => .walltime(&.{
-                .sec = @intCast(@divFloor(deadline.raw.toNanoseconds(), std.time.ns_per_s)),
-                .nsec = @intCast(@mod(deadline.raw.toNanoseconds(), std.time.ns_per_s)),
-            }, 0),
-            else => continue :timeout .{ .duration = deadline.durationFromNow(ev.io()) },
-        },
+        }, std.math.lossyCast(i64, @max(0, duration.raw.toNanoseconds()))),
+        .deadline => |deadline| continue :timeout .{ .duration = deadline.durationFromNow(ev.io()) },
     };
 }
 
@@ -5900,6 +5981,7 @@ fn netAccept(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = options;
     while (true) {
+        try checkCancel(ev);
         var storage: Io.Threaded.PosixAddress = undefined;
         var addr_len: posix.socklen_t = @sizeOf(Io.Threaded.PosixAddress);
         const rc = c.accept(listen_handle, &storage.any, &addr_len);
@@ -5961,14 +6043,13 @@ fn netConnectIp(
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
-    if (options.timeout != .none) return error.OptionUnsupported; // TODO timer race
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = Io.Threaded.posixAddressFamily(address);
     const socket_fd = try openSocket(family, options.mode, options.protocol);
     errdefer closeFd(socket_fd);
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
-    try posixConnect(ev, socket_fd, &storage.any, addr_len);
+    try posixConnect(ev, socket_fd, &storage.any, addr_len, options.timeout);
     try posixGetSockName(socket_fd, &storage.any, &addr_len);
     return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
@@ -6012,7 +6093,7 @@ fn netConnectUnix(
     errdefer closeFd(socket_fd);
     var storage: Io.Threaded.UnixAddress = undefined;
     const addr_len = Io.Threaded.addressUnixToPosix(address, &storage);
-    posixConnect(ev, socket_fd, &storage.any, addr_len) catch |err| switch (err) {
+    posixConnect(ev, socket_fd, &storage.any, addr_len, .none) catch |err| switch (err) {
         error.AddressUnavailable,
         error.ConnectionPending,
         error.ConnectionResetByPeer,
@@ -6169,73 +6250,264 @@ fn netLookupFallible(
     host_name: net.HostName,
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
-) (net.HostName.LookupError || Io.QueueClosedError)!void {
+) DnsSdLookupError!void {
     const ev_io = ev.io();
+    try Io.checkCancel(ev_io);
     const name = host_name.bytes;
     assert(name.len <= net.HostName.max_len);
 
-    // Darwin lacks an asynchronous resolver API, so we are stuck with
-    // getaddrinfo.
+    if (net.IpAddress.parse(name, options.port)) |address| {
+        if (options.family) |family| {
+            if (std.meta.activeTag(address) != family) return error.UnknownHostName;
+        }
+        try resolved.putOne(ev_io, .{ .address = address });
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+            try resolved.putOne(ev_io, .{ .canonical_name = canon });
+        }
+        return;
+    } else |_| {}
+
+    // RFC 6761: localhost and names beneath it always resolve to loopback.
+    const localhost = if (name[name.len - 1] == '.') "localhost." else "localhost";
+    if (std.ascii.endsWithIgnoreCase(name, localhost) and
+        (name.len == localhost.len or name[name.len - localhost.len - 1] == '.'))
+    {
+        if (options.family != .ip4) {
+            try resolved.putOne(ev_io, .{ .address = .{ .ip6 = .loopback(options.port) } });
+        }
+        if (options.family != .ip6) {
+            try resolved.putOne(ev_io, .{ .address = .{ .ip4 = .loopback(options.port) } });
+        }
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, "localhost")) |canon| {
+            try resolved.putOne(ev_io, .{ .canonical_name = canon });
+        }
+        return;
+    }
+
     var name_buffer: [net.HostName.max_len:0]u8 = undefined;
     @memcpy(name_buffer[0..name.len], name);
     name_buffer[name.len] = 0;
     const name_c = name_buffer[0..name.len :0];
-
-    var port_buffer: [8]u8 = undefined;
-    const port_c = std.mem.printSentinel(&port_buffer, "{d}", .{options.port}, 0) catch unreachable;
-
-    const family: i32 = if (options.family) |f| switch (f) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
-    } else posix.AF.UNSPEC;
-
-    const hints: c.addrinfo = .{
-        .flags = .{ .CANONNAME = options.canonical_name_buffer != null, .NUMERICSERV = true },
-        .family = family,
-        .socktype = posix.SOCK.STREAM,
-        .protocol = posix.IPPROTO.TCP,
-        .canonname = null,
-        .addr = null,
-        .addrlen = 0,
-        .next = null,
+    var lookup: DnsSdLookup = .{ .ev = ev, .resolved = resolved, .port = options.port };
+    const result = if (options.family) |family|
+        try netLookupDnsSd(&lookup, name_c, family)
+    else result: {
+        // MoreComing only describes the current callback batch. Separate
+        // requests ensure an early A reply does not hide a later AAAA reply.
+        var ip6_result: DnsSdLookupError!DnsSdResult = undefined;
+        var group: Io.Group = .init;
+        group.async(ev_io, netLookupDnsSdIp6, .{ &lookup, name_c, &ip6_result });
+        defer group.cancel(ev_io);
+        const ip4_result = netLookupDnsSd(&lookup, name_c, .ip4);
+        if (ip4_result) |_| {} else |err| switch (err) {
+            error.Canceled, error.Closed => return err,
+            else => {},
+        }
+        try group.await(ev_io);
+        try Io.checkCancel(ev_io);
+        if (ip6_result) |_| {} else |err| switch (err) {
+            error.Canceled, error.Closed => return err,
+            else => {},
+        }
+        // One family can legitimately have no records while the other does.
+        break :result ip4_result catch try ip6_result;
     };
-    var res: ?*c.addrinfo = null;
-    switch (c.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &res)) {
-        @as(c.EAI, @fromBackingInt(0)) => {},
-        .SYSTEM => switch (c.errno(-1)) {
-            .INTR => return netLookupFallible(ev, host_name, resolved, options),
-            else => |e| return unexpectedErrno(e),
-        },
-        .ADDRFAMILY => return error.AddressFamilyUnsupported,
-        .AGAIN => return error.NameServerFailure,
-        .FAIL => return error.NameServerFailure,
-        .FAMILY => return error.AddressFamilyUnsupported,
-        .MEMORY => return error.SystemResources,
-        .NODATA => return error.UnknownHostName,
-        .NONAME => return error.UnknownHostName,
-        else => return error.Unexpected,
-    }
-    defer if (res) |some| c.freeaddrinfo(some);
-
-    var it = res;
-    var canon_name: ?[*:0]const u8 = null;
-    while (it) |info| : (it = info.next) {
-        const addr = info.addr orelse continue;
-        try resolved.putOne(ev_io, .{
-            .address = Io.Threaded.addressFromPosix(@alignCast(@fieldParentPtr("any", addr))),
-        });
-        if (info.canonname) |n| {
-            if (canon_name == null) {
-                canon_name = n;
-            }
-        }
-    }
-    if (canon_name) |n| {
-        if (Io.Threaded.copyCanon(options.canonical_name_buffer, std.mem.sliceTo(n, 0))) |canon| {
-            try resolved.putOne(ev_io, .{ .canonical_name = canon });
-        }
+    const canonical_name = if (result.canonical_name_len != 0)
+        result.canonical_name[0..result.canonical_name_len]
+    else
+        name;
+    if (Io.Threaded.copyCanon(options.canonical_name_buffer, canonical_name)) |canon| {
+        try resolved.putOne(ev_io, .{ .canonical_name = canon });
     }
 }
+
+const DnsSdLookupError = net.HostName.LookupError || Io.QueueClosedError;
+
+const DnsSdLookup = struct {
+    ev: *Evented,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    port: u16,
+    // HostName.lookup guarantees that a queue with capacity 16 cannot fill.
+    // Reserve one slot for the canonical name across both protocol queries.
+    address_count: std.atomic.Value(u8) = .init(0),
+};
+
+const DnsSdResult = struct {
+    canonical_name: [net.HostName.max_len]u8 = undefined,
+    canonical_name_len: usize = 0,
+};
+
+/// DNSServiceProcessResult invokes callbacks synchronously on the lookup's
+/// fiber. Waiting on the service socket yields the worker and can be canceled.
+fn netLookupDnsSd(
+    lookup: *DnsSdLookup,
+    name_c: [:0]const u8,
+    family: net.IpAddress.Family,
+) DnsSdLookupError!DnsSdResult {
+    try Io.checkCancel(lookup.ev.io());
+    var context: DnsSdContext = .{ .lookup = lookup, .family = family };
+    var sd_ref: DNSServiceRef = undefined;
+    try dnsSdCheckError(DNSServiceGetAddrInfo(
+        &sd_ref,
+        kDNSServiceFlagsTimeout,
+        0,
+        switch (family) {
+            .ip4 => kDNSServiceProtocol_IPv4,
+            .ip6 => kDNSServiceProtocol_IPv6,
+        },
+        name_c.ptr,
+        &dnsSdReply,
+        &context,
+    ));
+    defer DNSServiceRefDeallocate(sd_ref);
+    const fd = DNSServiceRefSockFD(sd_ref);
+    if (fd < 0) return error.Unexpected;
+
+    while (!context.done) {
+        try waitReady(lookup.ev, fd, .READ);
+        const process_error = DNSServiceProcessResult(sd_ref);
+        // Queue backpressure may park and migrate this fiber. Drain replies
+        // after returning from DNS-SD, rather than yielding inside its C
+        // callback with the resolver's internal frames still on the stack.
+        for (context.addresses[0..context.addresses_len]) |address|
+            try lookup.resolved.putOne(lookup.ev.io(), .{ .address = address });
+        context.addresses_len = 0;
+        try dnsSdCheckError(process_error);
+        if (context.err) |err| return err;
+    }
+    if (!context.got_address) return error.UnknownHostName;
+    return context.result;
+}
+
+fn netLookupDnsSdIp6(
+    lookup: *DnsSdLookup,
+    name_c: [:0]const u8,
+    result: *DnsSdLookupError!DnsSdResult,
+) void {
+    result.* = netLookupDnsSd(lookup, name_c, .ip6);
+}
+
+const DnsSdContext = struct {
+    lookup: *DnsSdLookup,
+    family: net.IpAddress.Family,
+    result: DnsSdResult = .{},
+    addresses: [15]net.IpAddress = undefined,
+    addresses_len: usize = 0,
+    err: ?DnsSdLookupError = null,
+    got_address: bool = false,
+    done: bool = false,
+};
+
+fn dnsSdReply(
+    sd_ref: DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    error_code: i32,
+    hostname: ?[*:0]const u8,
+    address: ?*const c.sockaddr,
+    ttl: u32,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    _ = sd_ref;
+    _ = interface_index;
+    _ = ttl;
+    const context: *DnsSdContext = @ptrCast(@alignCast(userdata));
+    if (context.err != null) return;
+    dnsSdCheckError(error_code) catch |err| {
+        // All other callback parameters are undefined on error, including
+        // flags and address. In particular, do not inspect MoreComing here.
+        context.err = err;
+        context.done = true;
+        return;
+    };
+    if (flags & kDNSServiceFlagsMoreComing == 0) context.done = true;
+    if (flags & kDNSServiceFlagsAdd == 0) return;
+    const sockaddr = address orelse return;
+    var storage: Io.Threaded.PosixAddress = undefined;
+    switch (sockaddr.family) {
+        posix.AF.INET => {
+            if (context.family != .ip4) return;
+            const ip4: *const c.sockaddr.in = @ptrCast(@alignCast(sockaddr));
+            storage.in = ip4.*;
+        },
+        posix.AF.INET6 => {
+            if (context.family != .ip6) return;
+            const ip6: *const c.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
+            storage.in6 = ip6.*;
+        },
+        else => return,
+    }
+    var ip = Io.Threaded.addressFromPosix(&storage);
+    ip.setPort(context.lookup.port);
+    context.got_address = true;
+    if (context.result.canonical_name_len == 0) {
+        if (hostname) |h| {
+            const canonical_name = std.mem.sliceTo(h, 0);
+            net.HostName.validate(canonical_name) catch {
+                context.err = error.InvalidDnsCnameRecord;
+                return;
+            };
+            @memcpy(context.result.canonical_name[0..canonical_name.len], canonical_name);
+            context.result.canonical_name_len = canonical_name.len;
+        }
+    }
+    var count = context.lookup.address_count.load(.monotonic);
+    while (count < 15) {
+        count = context.lookup.address_count.cmpxchgWeak(count, count + 1, .monotonic, .monotonic) orelse {
+            context.addresses[context.addresses_len] = ip;
+            context.addresses_len += 1;
+            return;
+        };
+    }
+}
+
+fn dnsSdCheckError(error_code: i32) net.HostName.LookupError!void {
+    return switch (error_code) {
+        kDNSServiceErr_NoError => {},
+        kDNSServiceErr_NoMemory => error.SystemResources,
+        kDNSServiceErr_BadParam, kDNSServiceErr_NoSuchName, kDNSServiceErr_NoSuchRecord => error.UnknownHostName,
+        kDNSServiceErr_ServiceNotRunning, kDNSServiceErr_Timeout => error.NameServerFailure,
+        else => error.Unexpected,
+    };
+}
+
+const DNSServiceRef = *opaque {};
+const DNSServiceGetAddrInfoReply = *const fn (
+    sd_ref: DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    error_code: i32,
+    hostname: ?[*:0]const u8,
+    address: ?*const c.sockaddr,
+    ttl: u32,
+    context: ?*anyopaque,
+) callconv(.c) void;
+
+extern "c" fn DNSServiceGetAddrInfo(
+    sd_ref: *DNSServiceRef,
+    flags: u32,
+    interface_index: u32,
+    protocol: u32,
+    hostname: [*:0]const u8,
+    callback: DNSServiceGetAddrInfoReply,
+    context: ?*anyopaque,
+) i32;
+extern "c" fn DNSServiceRefSockFD(sd_ref: DNSServiceRef) c_int;
+extern "c" fn DNSServiceProcessResult(sd_ref: DNSServiceRef) i32;
+extern "c" fn DNSServiceRefDeallocate(sd_ref: DNSServiceRef) void;
+
+const kDNSServiceFlagsMoreComing: u32 = 0x1;
+const kDNSServiceFlagsAdd: u32 = 0x2;
+const kDNSServiceFlagsTimeout: u32 = 0x10000;
+const kDNSServiceProtocol_IPv4: u32 = 0x01;
+const kDNSServiceProtocol_IPv6: u32 = 0x02;
+const kDNSServiceErr_NoError: i32 = 0;
+const kDNSServiceErr_NoSuchName: i32 = -65538;
+const kDNSServiceErr_NoMemory: i32 = -65539;
+const kDNSServiceErr_BadParam: i32 = -65540;
+const kDNSServiceErr_NoSuchRecord: i32 = -65554;
+const kDNSServiceErr_ServiceNotRunning: i32 = -65563;
+const kDNSServiceErr_Timeout: i32 = -65568;
 
 const OpenSocketError = error{
     AddressFamilyUnsupported,
@@ -6399,14 +6671,16 @@ fn posixConnect(
     socket_fd: c.fd_t,
     addr: *const posix.sockaddr,
     addr_len: posix.socklen_t,
+    timeout: Io.Timeout,
 ) ConnectError!void {
     while (true) {
+        try checkCancel(ev);
         switch (c.errno(c.connect(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
             // The socket is nonblocking; the outcome is determined once the
             // socket becomes writable.
-            .AGAIN, .INPROGRESS => return connectFinish(ev, socket_fd),
+            .AGAIN, .INPROGRESS => return connectFinish(ev, socket_fd, timeout),
             .ADDRNOTAVAIL => return error.AddressUnavailable,
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
             .ALREADY => return error.ConnectionPending,
@@ -6431,6 +6705,7 @@ fn posixConnect(
 }
 
 const ConnectError = error{
+    Canceled,
     AccessDenied,
     AddressFamilyUnsupported,
     AddressUnavailable,
@@ -6445,8 +6720,8 @@ const ConnectError = error{
     Unexpected,
 };
 
-fn connectFinish(ev: *Evented, socket_fd: c.fd_t) ConnectError!void {
-    try waitReady(ev, socket_fd, .WRITE);
+fn connectFinish(ev: *Evented, socket_fd: c.fd_t, timeout: Io.Timeout) ConnectError!void {
+    try waitReadyTimeout(ev, socket_fd, .WRITE, timeout);
     var value: c_int = undefined;
     var len: posix.socklen_t = @sizeOf(c_int);
     switch (c.errno(c.getsockopt(socket_fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len))) {
@@ -6487,36 +6762,129 @@ fn posixGetSockName(socket_fd: c.fd_t, addr: *posix.sockaddr, addr_len: *posix.s
     }
 }
 
-/// Suspends the current fiber until `handle` is ready for reading (`.READ`) or
-/// writing (`.WRITE`), following the same dispatch source lifecycle as
-/// `fileReadStreaming`.
-///
-/// A spurious return is possible; callers must retry the operation and wait
-/// again on `error.WouldBlock`.
+/// A socket wait owns a serial queue so readiness, timeout, and cancellation
+/// choose one outcome. The fiber remains parked until every source's cancel
+/// handler has run; no callback may outlive the stack-allocated waiter.
+const WaitReadyWaiter = struct {
+    sleeper: Sleeper = undefined,
+    cancelable: Cancelable,
+    source: c.dispatch.source_t,
+    timer: ?c.dispatch.source_t,
+    pending_cancels: u8,
+    finishing: bool = false,
+    timed_out: bool = false,
+
+    fn start(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.cancelable.enter(waiter.sleeper.fiber) catch {
+            waiter.finishing = true;
+            waiter.cancelSources();
+        };
+        // Even a source canceled before registration must be activated for
+        // its cancel handler to run and release this waiter's ownership.
+        if (waiter.timer) |timer| timer.as_object().activate();
+        waiter.source.as_object().activate();
+    }
+
+    fn ready(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.finish(false);
+    }
+
+    fn timedOut(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.finish(true);
+    }
+
+    fn finish(waiter: *WaitReadyWaiter, timed_out: bool) void {
+        if (waiter.finishing) return;
+        waiter.finishing = true;
+        // A cancellation request that won the race has a callback queued on
+        // this serial queue. Let that callback cancel the sources and wake.
+        waiter.cancelable.leave(waiter.sleeper.fiber) catch return;
+        waiter.timed_out = timed_out;
+        waiter.cancelSources();
+    }
+
+    fn canceled(context: ?*anyopaque) callconv(.c) void {
+        const cancelable: *Cancelable = @ptrCast(@alignCast(context));
+        const waiter: *WaitReadyWaiter = @fieldParentPtr("cancelable", cancelable);
+        cancelable.requested(waiter.sleeper.fiber);
+        waiter.finishing = true;
+        waiter.cancelSources();
+    }
+
+    fn cancelSources(waiter: *WaitReadyWaiter) void {
+        waiter.source.cancel();
+        if (waiter.timer) |timer| timer.cancel();
+    }
+
+    fn wake(context: ?*anyopaque) callconv(.c) void {
+        const waiter: *WaitReadyWaiter = @ptrCast(@alignCast(context));
+        waiter.pending_cancels -= 1;
+        if (waiter.pending_cancels != 0) return;
+        waiter.source.as_object().release();
+        if (waiter.timer) |timer| timer.as_object().release();
+        var sleeper = waiter.sleeper;
+        Sleeper.wake(&sleeper);
+    }
+};
+
+/// A spurious return is possible; callers must retry the operation.
 fn waitReady(
     ev: *Evented,
     handle: c.fd_t,
     source_type: c.dispatch.source_type_t,
-) error{SystemResources}!void {
+) error{ Canceled, SystemResources }!void {
+    return waitReadyTimeout(ev, handle, source_type, .none) catch |err| switch (err) {
+        error.Timeout => unreachable, // no timer
+        else => |e| e,
+    };
+}
+
+fn waitReadyTimeout(
+    ev: *Evented,
+    handle: c.fd_t,
+    source_type: c.dispatch.source_type_t,
+    timeout: Io.Timeout,
+) error{ Canceled, SystemResources, Timeout }!void {
+    try checkCancel(ev);
+    const queue = c.dispatch.queue_create_with_target(
+        "org.ziglang.std.Io.Dispatch.netWait",
+        .SERIAL(),
+        ev.queue,
+    ) orelse return error.SystemResources;
+    defer queue.as_object().release();
     const source = c.dispatch.source_create(
         source_type,
         @bitCast(@as(isize, handle)),
         .none,
-        ev.queue,
+        queue,
     ) orelse return error.SystemResources;
-    defer source.as_object().release();
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    // The fiber is now running inside this source's event handler. The
-    // source is level-triggered: if the descriptor is still ready when
-    // the handler returns (it usually is for a writable socket, and for
-    // a readable one when the caller drains only part of the queue),
-    // libdispatch re-arms it and would call `Fiber.resume` again after
-    // this fiber has parked somewhere else. Cancel before the deferred
-    // release so no second resume can be delivered.
-    source.cancel();
-    _ = source.get_data();
+    const timer = if (timeout == .none) null else c.dispatch.source_create(.TIMER, 0, .none, queue) orelse {
+        source.cancel();
+        source.as_object().activate();
+        source.as_object().release();
+        return error.SystemResources;
+    };
+    var waiter: WaitReadyWaiter = .{
+        .cancelable = .{ .queue = queue, .cancel = &WaitReadyWaiter.canceled },
+        .source = source,
+        .timer = timer,
+        .pending_cancels = if (timer == null) 1 else 2,
+    };
+    source.as_object().set_context(&waiter);
+    source.set_event_handler(&WaitReadyWaiter.ready);
+    source.set_cancel_handler(&WaitReadyWaiter.wake);
+    if (timer) |object| {
+        object.as_object().set_context(&waiter);
+        object.set_event_handler(&WaitReadyWaiter.timedOut);
+        object.set_cancel_handler(&WaitReadyWaiter.wake);
+        object.set_timer(ev.timeFromTimeout(timeout), c.dispatch.TIME_FOREVER, ev.leeway);
+    }
+    ev.yield(.{ .wait_ready = &waiter });
+    try waiter.cancelable.acknowledge(waiter.sleeper.fiber);
+    if (waiter.timed_out) return error.Timeout;
 }
 
 /// Performs one nonblocking `readv` attempt on a socket.
@@ -6547,7 +6915,8 @@ fn netReadOnce(handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || erro
     }
 }
 
-fn netRead(ev: *Evented, handle: c.fd_t, data: [][]u8) Io.Operation.NetRead.Error!usize {
+fn netRead(ev: *Evented, handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || Io.Cancelable)!usize {
+    try checkCancel(ev);
     while (true) return netReadOnce(handle, data) catch |err| switch (err) {
         error.WouldBlock => {
             try waitReady(ev, handle, .READ);
@@ -6642,7 +7011,8 @@ fn netWrite(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
-) Io.Operation.NetWrite.Error!usize {
+) (Io.Operation.NetWrite.Error || Io.Cancelable)!usize {
+    try checkCancel(ev);
     while (true) return netWriteOnce(handle, header, data, splat) catch |err| switch (err) {
         error.WouldBlock => {
             try waitReady(ev, handle, .WRITE);
@@ -6739,14 +7109,25 @@ fn netSend(
     handle: c.fd_t,
     messages: []net.OutgoingMessage,
     flags: net.SendFlags,
-) struct { ?Io.Operation.NetSend.Error, usize } {
+) Io.Cancelable!struct { ?Io.Operation.NetSend.Error, usize } {
+    try checkCancel(ev);
     const posix_flags = posixSendFlags(flags);
 
     for (messages, 0..) |*message, i| {
         while (true) {
             netSendOne(handle, message, posix_flags) catch |err| switch (err) {
                 error.WouldBlock => {
-                    waitReady(ev, handle, .WRITE) catch |e| return .{ e, i };
+                    waitReady(ev, handle, .WRITE) catch |e| switch (e) {
+                        error.Canceled => if (i == 0) {
+                            return error.Canceled;
+                        } else {
+                            // Report already-sent messages, leaving cancellation
+                            // outstanding for the caller's next operation.
+                            recancel(ev);
+                            return .{ null, i };
+                        },
+                        error.SystemResources => return .{ error.SystemResources, i },
+                    };
                     continue;
                 },
                 else => |e| return .{ e, i },
@@ -6861,13 +7242,17 @@ fn netReceive(
     message_buffer: []net.IncomingMessage,
     data_buffer: []u8,
     flags: net.ReceiveFlags,
-) struct { ?Io.Operation.NetReceive.Error, usize } {
+) Io.Cancelable!struct { ?Io.Operation.NetReceive.Error, usize } {
     assert(message_buffer.len >= 1);
+    try checkCancel(ev);
     while (true) {
         const opt_err, const count = netReceiveNonblocking(handle, message_buffer, data_buffer, flags);
         if (opt_err) |err| switch (err) {
             error.WouldBlock => {
-                waitReady(ev, handle, .READ) catch |e| return .{ e, 0 };
+                waitReady(ev, handle, .READ) catch |e| switch (e) {
+                    error.Canceled => return error.Canceled,
+                    error.SystemResources => return .{ error.SystemResources, 0 },
+                };
                 continue;
             },
             else => |e| return .{ e, count },
@@ -6923,4 +7308,44 @@ fn addBuf(
 
 test {
     _ = Fiber.CancelProtection;
+}
+
+test "Dispatch socket wait timeout and readiness race" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    var ev: Evented = undefined;
+    try ev.init(std.heap.page_allocator, .{ .leeway = .zero });
+    defer ev.deinit();
+    const ev_io = ev.io();
+    const address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = try address.bind(ev_io, .{ .mode = .dgram });
+    defer socket.close(ev_io);
+
+    // An idle local socket tests actual expiry without depending on a
+    // firewall, unreachable host, or TCP retransmission timing.
+    inline for (.{ Io.Clock.awake, Io.Clock.real }) |clock| {
+        try std.testing.expectError(error.Timeout, waitReadyTimeout(&ev, socket.handle, .READ, .{
+            .duration = .{ .raw = .fromMilliseconds(2), .clock = clock },
+        }));
+        try std.testing.expectError(error.Timeout, waitReadyTimeout(&ev, socket.handle, .READ, .{
+            .deadline = .{ .raw = .zero, .clock = clock },
+        }));
+    }
+
+    var server = try address.listen(ev_io, .{});
+    defer server.deinit(ev_io);
+    const client = try server.socket.address.connect(ev_io, .{ .mode = .stream });
+    defer client.close(ev_io);
+    const peer = try server.accept(ev_io);
+    defer peer.close(ev_io);
+    // Both callbacks may already be queued when the serial queue runs.
+    // Either outcome is valid; both source cancel handlers must drain
+    // before another wait reuses the same stack slot.
+    for (0..64) |_| {
+        waitReadyTimeout(&ev, client.socket.handle, .WRITE, .{
+            .duration = .{ .raw = .zero, .clock = .awake },
+        }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+    }
 }
