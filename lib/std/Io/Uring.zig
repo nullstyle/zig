@@ -467,6 +467,10 @@ const CancelRegion = struct {
             status.awaiting,
         )) {
             @branchHint(.unlikely);
+            // Registration installed the new wait source even when a request
+            // was already pending. No operation will be submitted on this
+            // path, so release that source before disabling region cleanup.
+            _ = cancel_region.fiber.cancel_status.changeAwaiting(status.awaiting, .nothing);
             cancel_region.fiber.cancel_protection.acknowledge();
             cancel_region.status = .unrequested;
             return error.Canceled;
@@ -1610,6 +1614,20 @@ const Group = struct {
         cancel_requested: bool,
         awaiter_delayed: bool,
         fibers: Fiber.PackedPtr,
+
+        // A completed group retains resources until its caller releases the
+        // marker after the final member has unlocked the group. The reserved
+        // marker distinguishes that release from a concurrent add-and-finish.
+        const completed: List = .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .all_ones };
+        const releasing: List = .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .all_ones };
+        const empty: List = .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null };
+
+        fn head(list: List) ?*Fiber {
+            return switch (list.fibers) {
+                .null, .all_ones => null,
+                else => list.fibers.unpack(),
+            };
+        }
     };
     fn listPtr(group: Group) *List {
         return @ptrCast(&group.ptr.token);
@@ -1617,7 +1635,7 @@ const Group = struct {
 
     const Mutex = packed struct(u32) {
         locked: bool,
-        contended: bool,
+        cancel_callback_absent: bool,
         shared2: u30,
     };
     fn mutexPtr(group: Group) *Mutex {
@@ -1631,7 +1649,7 @@ const Group = struct {
 
     const Awaiter = packed struct(usize) {
         locked: bool,
-        contended: bool,
+        cancel_callback_absent: bool,
         awaiter: Fiber.PackedPtr,
     };
     fn awaiterPtr(group: Group) *Awaiter {
@@ -1639,51 +1657,63 @@ const Group = struct {
     }
 
     fn lock(group: Group, ev: *Evented) void {
+        _ = ev;
         const mutex = group.mutexPtr();
-        {
+        // These short critical sections also run after a context switch on an
+        // idle context, where managed-fiber futex waits cannot be used.
+        while (true) {
             const old_state = @atomicRmw(
                 Mutex,
                 mutex,
                 .Or,
-                .{ .locked = true, .contended = false, .shared2 = 0 },
+                .{ .locked = true, .cancel_callback_absent = false, .shared2 = 0 },
                 .acquire,
             );
             if (!old_state.locked) {
                 @branchHint(.likely);
                 return;
             }
-            if (old_state.contended) {
-                futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-            }
-        }
-        while (true) {
-            var old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = true, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            old_state.contended = true;
-            futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
+            std.atomic.spinLoopHint();
         }
     }
 
     fn unlock(group: Group, ev: *Evented) void {
+        _ = ev;
         const mutex = group.mutexPtr();
         const old_state = @atomicRmw(
             Mutex,
             mutex,
             .And,
-            .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
+            .{ .locked = false, .cancel_callback_absent = true, .shared2 = std.math.maxInt(u30) },
             .release,
         );
         assert(old_state.locked);
-        if (old_state.contended) futexWake(ev, @ptrCast(mutex), 1);
+    }
+
+    /// Assumes the mutex is held.
+    fn clearAwaiter(group: Group) void {
+        _ = @atomicRmw(Awaiter, group.awaiterPtr(), .And, .{
+            .locked = true,
+            .cancel_callback_absent = false,
+            .awaiter = .null,
+        }, .monotonic);
+    }
+
+    fn complete(group: Group, ev: *Evented) bool {
+        group.lock(ev);
+        const list_ptr = group.listPtr();
+        const list = @atomicLoad(List, list_ptr, .monotonic);
+        if (list.head() != null) {
+            group.unlock(ev);
+            return false;
+        }
+        assert(!list.awaiter_delayed);
+        assert(@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter == .null);
+        @atomicStore(List, list_ptr, List.releasing, .monotonic);
+        group.unlock(ev);
+        // Publishing null is the last access to the group: the caller can now
+        // release its storage. A concurrent add changes the reserved marker.
+        return @cmpxchgStrong(List, list_ptr, List.releasing, List.empty, .acq_rel, .acquire) == null;
     }
 
     fn addFiber(group: Group, ev: *Evented, fiber: *Fiber) void {
@@ -1691,13 +1721,20 @@ const Group = struct {
         defer group.unlock(ev);
         const list_ptr = group.listPtr();
         const list = @atomicLoad(List, list_ptr, .monotonic);
-        if (list.cancel_requested) fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
-        const old_head = list.fibers.unpack();
+        const old_head = list.head();
+        if (old_head != null and list.cancel_requested)
+            fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
+        if (old_head == null and list.awaiter_delayed) {
+            // A new member arrived before a racing cancellation consumed the
+            // delayed waiter. Restore the registration for its next completion.
+            const awaiter = @atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack().?;
+            _ = awaiter.cancel_status.changeAwaiting(.nothing, .group);
+        }
         if (old_head) |head| head.link.group.prev = fiber;
         fiber.link.group.next = old_head;
         @atomicStore(List, list_ptr, .{
-            .cancel_requested = list.cancel_requested,
-            .awaiter_delayed = list.awaiter_delayed,
+            .cancel_requested = old_head != null and list.cancel_requested,
+            .awaiter_delayed = false,
             .fibers = .pack(fiber),
         }, .monotonic);
     }
@@ -1717,12 +1754,17 @@ const Group = struct {
                 .fibers = .pack(new_head),
             }, .monotonic);
         } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-            if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
-                @atomicStore(List, list_ptr, .{
-                    .cancel_requested = false,
-                    .awaiter_delayed = false,
-                    .fibers = .null,
-                }, .release);
+            const cancel_callback_absent = @atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).cancel_callback_absent;
+            const cancellation_raced = if (cancel_callback_absent) blk: {
+                const awaiting = @atomicLoad(Fiber.CancelStatus, &awaiter.cancel_status, .monotonic).awaiting;
+                if (awaiting == .group) {
+                    _ = awaiter.cancel_status.changeAwaiting(.group, .nothing);
+                } else assert(awaiting == .nothing);
+                break :blk false;
+            } else awaiter.cancel_status.changeAwaiting(.group, .nothing);
+            if (!cancellation_raced or list.cancel_requested) {
+                group.clearAwaiter();
+                @atomicStore(List, list_ptr, List.completed, .monotonic);
                 assert(awaiter.status.awaiting_group.ptr == group.ptr);
                 awaiter.status = .{ .queue_next = null };
                 return awaiter;
@@ -1731,21 +1773,17 @@ const Group = struct {
             @atomicStore(List, list_ptr, .{
                 .cancel_requested = false,
                 .awaiter_delayed = true,
-                .fibers = .null,
+                .fibers = .all_ones,
             }, .monotonic);
-        } else @atomicStore(List, list_ptr, .{
-            .cancel_requested = false,
-            .awaiter_delayed = false,
-            .fibers = .null,
-        }, .release);
+        } else @atomicStore(List, list_ptr, List.completed, .monotonic);
         return null;
     }
 
     fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
         group.lock(ev);
         defer group.unlock(ev);
-        if (@atomicLoad(List, group.listPtr(), .monotonic).fibers.unpack()) |_| {
-            if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
+        if (@atomicLoad(List, group.listPtr(), .monotonic).head()) |_| {
+            if (group.registerAwaiter(awaiter, awaiter.cancel_protection.check() == .unblocked)) {
                 // The awaiter already had an unacknowledged cancelation request before
                 // attempting to await a group, so propagate the cancelation to the group.
                 assert(!group.cancelLocked(ev, null));
@@ -1764,44 +1802,55 @@ const Group = struct {
     /// Assumes the mutex is held.
     fn cancelLocked(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
         const list_ptr = group.listPtr();
-        const list = @atomicRmw(
-            List,
-            list_ptr,
-            .Add,
-            .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
-            .monotonic,
-        );
-        assert(!list.cancel_requested);
-        if (list.fibers.unpack()) |head| {
-            var maybe_fiber: ?*Fiber = head;
-            while (maybe_fiber) |fiber| {
-                fiber.requestCancel(ev);
-                maybe_fiber = fiber.link.group.next;
+        const list = @atomicLoad(List, list_ptr, .monotonic);
+        if (list.head()) |head| {
+            @atomicStore(List, list_ptr, .{
+                .cancel_requested = true,
+                .awaiter_delayed = list.awaiter_delayed,
+                .fibers = list.fibers,
+            }, .monotonic);
+            if (!list.cancel_requested) {
+                var maybe_fiber: ?*Fiber = head;
+                while (maybe_fiber) |fiber| {
+                    fiber.requestCancel(ev);
+                    maybe_fiber = fiber.link.group.next;
+                }
             }
-            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
+            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter, false);
             return false;
         }
-        @atomicStore(
-            List,
-            list_ptr,
-            .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
-            .release,
-        );
+        if (list.awaiter_delayed) group.clearAwaiter();
+        @atomicStore(List, list_ptr, List.completed, .monotonic);
         return if (maybe_awaiter) |_| true else list.awaiter_delayed;
     }
 
     /// Assumes the mutex is held.
-    fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
+    fn registerAwaiter(group: Group, awaiter: *Fiber, cancelable: bool) bool {
         assert(awaiter.status.queue_next == null);
         awaiter.status = .{ .awaiting_group = group };
         assert(@atomicRmw(
             Awaiter,
             group.awaiterPtr(),
             .Add,
-            .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
+            .{ .locked = false, .cancel_callback_absent = false, .awaiter = .pack(awaiter) },
             .monotonic,
         ).awaiter == .null);
-        return awaiter.cancel_status.changeAwaiting(.nothing, .group);
+        const requested = if (cancelable)
+            awaiter.cancel_status.changeAwaiting(.nothing, .group)
+        else blk: {
+            assert(@atomicLoad(Fiber.CancelStatus, &awaiter.cancel_status, .monotonic).awaiting == .nothing);
+            break :blk false;
+        };
+        if (!cancelable or requested) {
+            // An uncancelable waiter has no group callback. A request that
+            // preceded registration likewise owns no group handoff.
+            _ = @atomicRmw(Awaiter, group.awaiterPtr(), .Or, .{
+                .locked = false,
+                .cancel_callback_absent = true,
+                .awaiter = .null,
+            }, .monotonic);
+        }
+        return requested;
     }
 
     const AsyncClosure = struct {
@@ -1947,13 +1996,22 @@ fn groupAwait(
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
-    ev.yield(null, .{ .group_await = .{ .ptr = type_erased } });
+    const group: Group = .{ .ptr = type_erased };
+    while (true) {
+        ev.yield(null, .{ .group_await = group });
+        if (group.complete(ev)) break;
+    }
+    try checkCancel(ev);
 }
 
 fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
-    ev.yield(null, .{ .group_cancel = .{ .ptr = type_erased } });
+    const group: Group = .{ .ptr = type_erased };
+    while (true) {
+        ev.yield(null, .{ .group_cancel = group });
+        if (group.complete(ev)) break;
+    }
 }
 
 fn recancel(userdata: ?*anyopaque) void {
@@ -5137,6 +5195,13 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .resv = 0,
     };
     ev.yield(null, .nothing);
+    if (cancel_region.errno() == .CANCELED) {
+        // Protected waits never register a cancelable ring source. A canceled
+        // timer therefore belongs to this region's cancellation request.
+        assert(cancel_region.status.requested);
+        cancel_region.fiber.cancel_protection.acknowledge();
+        return error.Canceled;
+    }
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
     // getting here, which would have reported 0, making this a legal
