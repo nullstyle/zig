@@ -292,6 +292,44 @@ pub const IpAddress = union(enum) {
         /// When not enabled any attempt to send datagrams to a broadcast address
         /// will fail with `error.AccessDenied`
         allow_broadcast: bool = false,
+        /// Sets SO_REUSEPORT before binding, so that several sockets may be
+        /// bound to the same address and port at the same time (for example
+        /// one socket per worker, all serving one UDP port). Each socket that
+        /// joins the group sets this option, the first one included; a plain
+        /// bind to a port held by such a group still fails with
+        /// `error.AddressInUse`.
+        ///
+        /// Multicast and broadcast datagrams reach every socket in the group.
+        /// What happens to unicast datagrams is platform behavior: Linux
+        /// balances them across the sockets by a hash of the 4-tuple (a
+        /// socket joining or leaving re-maps flows) and only lets sockets
+        /// owned by the same user id share the port; the owner is the uid
+        /// the socket was created under (what `fstat` reports), not the
+        /// caller's uid at bind time, so a socket created before dropping
+        /// privileges cannot be joined by one created afterwards. BSD and
+        /// macOS do not balance: one socket of the group receives every
+        /// unicast datagram (the newest when bound to a specific address,
+        /// the oldest when bound to the wildcard address). Only SO_REUSEPORT
+        /// is set: SO_REUSEADDR on a datagram socket would let a process
+        /// under any user id bind the same port on Linux and, as the newest
+        /// socket, receive all of its unicast traffic.
+        ///
+        /// Windows and systems without SO_REUSEPORT return
+        /// `error.OptionUnsupported`.
+        reuse_port: bool = false,
+        /// Allows several sockets to bind the same address and port, with
+        /// unicast flows distributed among them by the kernel. This implies
+        /// port reuse; `reuse_port` need not also be set. Every socket joining
+        /// the group must request load balancing before binding.
+        ///
+        /// Uses SO_REUSEPORT on Linux and SO_REUSEPORT_LB on FreeBSD. Other
+        /// systems return `error.OptionUnsupported`. Distribution is based
+        /// on flow addresses and ports. With unchanged group membership,
+        /// one flow stays on one socket; this does not promise equal traffic
+        /// or round-robin delivery.
+        /// The same-user restriction described by `reuse_port` still applies
+        /// on Linux. Plain `reuse_port` keeps its existing platform behavior.
+        reuse_port_load_balance: bool = false,
         mode: Socket.Mode,
         protocol: ?Protocol = null,
     };
