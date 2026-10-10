@@ -879,6 +879,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     };
     const main_thread = &ev.threads.allocated[0];
     Thread.self = main_thread;
+    errdefer Thread.self = null;
     main_thread.* = .{
         .required_align = {},
         .thread = undefined,
@@ -920,12 +921,41 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 pub fn deinit(ev: *Evented) void {
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     assert(Thread.current().currentFiber() == main_fiber);
+    // A wake or handoff may move the main fiber to a worker. Return it to
+    // the original OS thread before joining workers or releasing idle
+    // stacks; otherwise teardown can join itself or race the original
+    // thread's idle loop. The completion handoff happens only after park.
+    if (Thread.current() != &ev.threads.allocated[0])
+        ev.yield(null, .return_main);
+    const current_thread: *Thread = .current();
+    assert(current_thread == &ev.threads.allocated[0]);
     const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
     for (ev.threads.allocated[0..active_threads]) |*thread| {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
     }
-    ev.yield(null, .exit);
+    // Submit exit events from the running main fiber, then join every
+    // worker before touching scheduler state. Do not park on the main idle
+    // stack during cleanup: this fiber owns the remainder of teardown.
+    for (ev.threads.allocated[1..active_threads]) |*thread| {
+        current_thread.enqueue().* = .{
+            .opcode = .MSG_RING,
+            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+            .ioprio = 0,
+            .fd = thread.io_uring.fd,
+            .off = @backingInt(Completion.Userdata.exit),
+            .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @backingInt(Completion.Userdata.cleanup),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+    current_thread.submit();
     ev.null_fd.close();
     ev.random_fd.close();
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(ev.threads.allocated.ptr));
@@ -939,6 +969,7 @@ pub fn deinit(ev: *Evented) void {
     assert(active_threads == ev.threads.active); // spawned threads while there was no pending async?
     ev.threaded.deinit();
     ev.backing_allocator.free(allocated_ptr[0..idle_stack_end_offset]);
+    Thread.self = null;
     ev.* = undefined;
 }
 
@@ -1081,14 +1112,18 @@ fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) bool {
         return false;
     }
     // nobody wanted it, so just queue it on ourselves
-    while (true) ready_queue.tail.status.queue_next = @cmpxchgWeak(
+    while (@cmpxchgWeak(
         ?*Fiber,
         &thread.ready_queue,
         ready_queue.tail.status.queue_next,
         ready_queue.head,
         .acq_rel,
         .acquire,
-    ) orelse break;
+    )) |old_head| {
+        // The owner briefly locks its queue with this sentinel. Never
+        // make it a next pointer or replace the queue while it is locked.
+        if (old_head != Fiber.finished) ready_queue.tail.status.queue_next = old_head;
+    }
     return false;
 }
 
@@ -1099,6 +1134,11 @@ fn threadEntry(ev: *Evented, index: u32) void {
         .SUCCESS => ev.idle(thread),
         else => |err| @panic(@tagName(err)),
     }
+    // A scheduler may still have loaded this Thread before its exit CQE.
+    // Keep the struct and ring alive until the main fiber joins us, but
+    // permanently retire the queue so new work cannot be pushed here.
+    if (@cmpxchgStrong(?*Fiber, &thread.ready_queue, null, Fiber.finished, .release, .monotonic)) |stray|
+        assert(stray == Fiber.finished); // pending async
 }
 
 const Completion = struct {
@@ -1112,6 +1152,7 @@ const Completion = struct {
         close,
         cleanup,
         exit,
+        return_main,
         /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
         /// If bits 0 and 1 are 0, a `*Fiber`.
         _,
@@ -1156,8 +1197,7 @@ fn mainIdle(
     const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
     message.handle(ev);
     ev.idle(&ev.threads.allocated[0]);
-    ev.yield(@ptrCast(&ev.main_fiber_buffer), .nothing);
-    unreachable; // switched to dead fiber
+    unreachable; // teardown keeps the main fiber on this OS thread
 }
 
 fn idle(ev: *Evented, thread: *Thread) void {
@@ -1201,6 +1241,11 @@ fn idle(ev: *Evented, thread: *Thread) void {
                 .exit => {
                     assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
                     return;
+                },
+                .return_main => {
+                    assert(thread == &ev.threads.allocated[0]);
+                    assert(maybe_ready_fiber == null and maybe_ready_queue == null);
+                    maybe_ready_fiber = @ptrCast(&ev.main_fiber_buffer);
                 },
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                     0b00 => {
@@ -1282,8 +1327,10 @@ const SwitchMessage = struct {
         group_await: Group,
         group_cancel: Group,
         batch_await: *Io.Batch,
+        finished: *Fiber,
+        group_finished: struct { fiber: *Fiber, group: Group },
         destroy,
-        exit,
+        return_main,
     };
 
     fn handle(message: *const SwitchMessage, ev: *Evented) void {
@@ -1332,19 +1379,32 @@ const SwitchMessage = struct {
                     _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
                 }
             },
+            .finished => |fiber| {
+                // An awaiter may immediately recycle this stack on another
+                // CPU. Publish completion only after it has stopped running.
+                if (@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel)) |awaiter|
+                    _ = ev.schedule(thread, .{ .head = awaiter, .tail = awaiter });
+            },
+            .group_finished => |finished| {
+                // Removing the last member lets an awaiter tear down both
+                // the group and backend. The member must already be parked.
+                const awaiter = finished.group.removeFiber(ev, finished.fiber);
+                finished.fiber.destroy();
+                if (awaiter) |fiber| _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+            },
             .destroy => {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 fiber.destroy();
             },
-            .exit => for (
-                ev.threads.allocated[0..@atomicLoad(u32, &ev.threads.active, .acquire)],
-            ) |*each_thread| {
+            .return_main => {
+                // The main fiber is now parked. Deliver it as a ring-local
+                // completion rather than a stealable scheduler queue entry.
                 thread.enqueue().* = .{
                     .opcode = .MSG_RING,
                     .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
                     .ioprio = 0,
-                    .fd = each_thread.io_uring.fd,
-                    .off = @backingInt(Completion.Userdata.exit),
+                    .fd = ev.threads.allocated[0].io_uring.fd,
+                    .off = @backingInt(Completion.Userdata.return_main),
                     .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
                     .len = 0,
                     .rw_flags = 0,
@@ -1355,6 +1415,7 @@ const SwitchMessage = struct {
                     .addr3 = 0,
                     .resv = 0,
                 };
+                thread.submit();
             },
         }
     }
@@ -1428,7 +1489,7 @@ const AsyncClosure = struct {
         const fiber = closure.fiber;
         message.handle(ev);
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        ev.yield(@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel), .nothing);
+        ev.yield(null, .{ .finished = fiber });
         unreachable; // switched to dead fiber
     }
 };
@@ -1795,7 +1856,7 @@ const Group = struct {
             message.handle(ev);
             assert(fiber.status.queue_next == null);
             closure.start(closure.contextPointer());
-            ev.yield(closure.group.removeFiber(ev, fiber), .destroy);
+            ev.yield(null, .{ .group_finished = .{ .fiber = fiber, .group = closure.group } });
             unreachable; // switched to dead fiber
         }
     };
