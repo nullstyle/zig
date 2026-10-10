@@ -516,7 +516,9 @@ pub const Operation = union(enum) {
             tag: Tag,
             userdata: Userdata align(@max(@alignOf(usize), 4)),
 
-            pub const Userdata = [7]usize;
+            // The 0.17 network operations also retain ancillary-control slices.
+            // Nine words retain the complete network operation without narrowing slices.
+            pub const Userdata = [9]usize;
         };
 
         pub const Completion = struct {
@@ -563,9 +565,11 @@ pub fn operateTimeout(io: Io, operation: Operation, timeout: Timeout) OperateTim
     if (timeout == .none) return io.vtable.operate(io.userdata, operation);
     var storage: [1]Operation.Storage = undefined;
     var batch: Batch = .init(&storage);
+    // Retries must share the original deadline, including relative timeouts.
+    const deadline: Timeout = .{ .deadline = timeout.toTimestamp(io).? };
     while (true) {
         batch.addAt(0, operation);
-        batch.awaitConcurrent(io, timeout) catch |err| {
+        batch.awaitConcurrent(io, deadline) catch |err| {
             // `storage` is about to go out of scope; the implementation may
             // still hold references to it for the pending operation (a
             // readiness source pointing at the storage, for instance), so

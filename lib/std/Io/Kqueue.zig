@@ -1,3 +1,9 @@
+//! Experimental evented I/O backend. Each participating OS thread supports
+//! one active backend context and must execute a managed fiber or be registered
+//! with that backend. Calls from foreign threads and nested backend instances
+//! are unsupported. Finish or cancel socket operations before closing their
+//! sockets through the same Io instance.
+
 const Kqueue = @This();
 const builtin = @import("builtin");
 
@@ -51,7 +57,7 @@ const NativeMutex = struct {
     state: Io.Mutex = .init,
 
     fn lock(m: *NativeMutex) void {
-        Io.Threaded.mutexLock(&m.state);
+        Io.Threaded.mutexLockUncancelable(&m.state);
     }
 
     fn unlock(m: *NativeMutex) void {
@@ -902,12 +908,12 @@ pub fn io(k: *Kqueue) Io {
             .processSetCurrentDir = comptime threadedAdapter("processSetCurrentDir"),
             .processSetCurrentPath = comptime threadedAdapter("processSetCurrentPath"),
             .processReplace = comptime threadedAdapter("processReplace"),
-            .processReplacePath = processReplacePath,
             .processSpawn = comptime threadedAdapter("processSpawn"),
-            .processSpawnPath = processSpawnPath,
             .childWait = comptime threadedAdapter("childWait"),
             .childKill = comptime threadedAdapter("childKill"),
             .progressParentFile = comptime threadedAdapter("progressParentFile"),
+            .inheritParentDir = comptime threadedAdapter("inheritParentDir"),
+            .inheritParentFile = comptime threadedAdapter("inheritParentFile"),
             .now = now,
             .clockResolution = comptime threadedAdapter("clockResolution"),
             .sleep = sleep,
@@ -1092,7 +1098,17 @@ fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.
     k.futex_waiters.append(&fiber.futex_node);
     k.futex_mutex.unlock();
     if (deadline) |when|
-        batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(when.durationFromNow(k.io()).raw.toNanoseconds()), false);
+        batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(when.durationFromNow(k.io()).raw.toNanoseconds()), false) catch {
+            k.futex_mutex.lock();
+            if (fiber.futex_ptr != null) {
+                k.futex_waiters.remove(&fiber.futex_node);
+                fiber.futex_ptr = null;
+            }
+            k.futex_mutex.unlock();
+            const fallback = k.threaded.io();
+            try fallback.vtable.futexWait(fallback.userdata, ptr, expected, .{ .deadline = when });
+            return k.checkCancel();
+        };
     k.yield(null, .{ .register_batch_waiter = &fiber.batch_waiter.parked });
     k.futex_mutex.lock();
     if (fiber.futex_ptr != null) {
@@ -1100,7 +1116,7 @@ fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.
         fiber.futex_ptr = null;
     }
     k.futex_mutex.unlock();
-    if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true);
+    if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true) catch @panic("failed to disarm Kqueue timer");
     try k.checkCancel();
 }
 
@@ -1321,52 +1337,6 @@ fn errorSetHasCanceled(comptime Errors: type) bool {
     return false;
 }
 
-fn processSpawnPath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: std.process.SpawnOptions,
-) std.process.SpawnError!std.process.Child {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    try k.checkCancel();
-    var arena_allocator = std.heap.ArenaAllocator.init(k.gpa);
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-    const argv = try arena.alloc([]const u8, options.argv.len);
-    argv[0] = try argv0Path(arena, options.argv[0]);
-    @memcpy(argv[1..], options.argv[1..]);
-    var path_options = options;
-    path_options.argv = argv;
-    path_options.cwd = .{ .dir = dir };
-    const fallback = k.threaded.io();
-    return fallback.vtable.processSpawn(fallback.userdata, path_options);
-}
-
-fn processReplacePath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: std.process.ReplaceOptions,
-) std.process.ReplaceError {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    try k.checkCancel();
-    var arena_allocator = std.heap.ArenaAllocator.init(k.gpa);
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-    const argv = try arena.alloc([]const u8, options.argv.len);
-    argv[0] = try argv0Path(arena, options.argv[0]);
-    @memcpy(argv[1..], options.argv[1..]);
-    var path_options = options;
-    path_options.argv = argv;
-    path_options.expand_arg0 = .no_expand;
-    try Io.Threaded.fchdir(dir.handle);
-    const fallback = k.threaded.io();
-    return fallback.vtable.processReplace(fallback.userdata, path_options);
-}
-
-fn argv0Path(gpa: Allocator, arg0: []const u8) Allocator.Error![]const u8 {
-    if (std.mem.findScalar(u8, arg0, '/') != null) return arg0;
-    return std.fmt.allocPrint(gpa, "./{s}", .{arg0});
-}
-
 fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
     _ = k;
@@ -1385,10 +1355,14 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         if (deadline) |when| {
             const remaining = when.durationFromNow(k.io()).raw.toNanoseconds();
             if (remaining <= 0) return;
-            batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(remaining), false);
+            batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(remaining), false) catch {
+                const fallback = k.threaded.io();
+                try fallback.sleep(when.durationFromNow(k.io()).raw, when.clock);
+                return k.checkCancel();
+            };
         }
         k.yield(null, .{ .register_batch_waiter = &fiber.batch_waiter.parked });
-        if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true);
+        if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true) catch @panic("failed to disarm Kqueue timer");
         // Recheck the actual deadline after a stale or protected wake.
     }
 }
@@ -1895,17 +1869,20 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             while (msg_i < o.message_buffer.len) {
                 const message = &o.message_buffer[msg_i];
                 const remaining = o.data_buffer[data_i..];
+                // Permit an empty buffer for the first datagram, but do not
+                // consume another one after the caller's data space is full.
+                if (remaining.len == 0 and msg_i != 0) break;
                 Io.Threaded.netReceivePosix(o.socket_handle, message, remaining, o.flags, true) catch |err| switch (err) {
                     error.Canceled => |e| return e,
                     error.WouldBlock => {
                         if (msg_i != 0) return .{ .net_receive = .{ null, msg_i } };
                         waitReady(k, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.READ) catch |e| switch (e) {
                             error.Canceled => return error.Canceled,
-                            else => return .{ .net_receive = .{ e, 0 } },
+                            else => return .{ .net_receive = .{ e, msg_i } },
                         };
                         continue;
                     },
-                    else => |e| return .{ .net_receive = .{ e, 0 } },
+                    else => |e| return .{ .net_receive = .{ e, msg_i } },
                 };
                 data_i += message.data.len;
                 msg_i += 1;
@@ -1931,13 +1908,13 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             break :r .{ null, o.messages.len };
         } },
         .net_read => |o| return .{
-            .net_read = netRead(k, o.socket_handle, o.data) catch |err| switch (err) {
+            .net_read = netRead(k, o.socket_handle, o.data, o.control) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => |e| e,
             },
         },
         .net_write => |o| return .{
-            .net_write = netWrite(k, o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
+            .net_write = netWrite(k, o.socket_handle, o.header, o.data, o.splat, o.control) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => |e| e,
             },
@@ -2025,17 +2002,31 @@ const iovec_const = posix.iovec_const;
 const iovlen_t = @FieldType(posix.msghdr_const, "iovlen");
 const splat_buffer_size = Io.Threaded.splat_buffer_size;
 
-/// Performs one nonblocking `readv` attempt on a socket.
-fn netReadOnce(handle: posix.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || error{WouldBlock})!usize {
+/// Performs one nonblocking `recvmsg` attempt, preserving ancillary metadata.
+fn netReadOnce(handle: posix.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || error{WouldBlock})!net.Stream.ReadResult {
     var iovecs: [max_iovecs_len]iovec = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
     for (data) |buf| addBuf(false, &iovecs, &iovlen, &remaining, buf);
-    if (iovlen == 0) return 0;
+    if (iovlen == 0) return .{ .data_len = 0 };
     while (true) {
-        const rc = posix.system.readv(handle, &iovecs, iovlen);
+        var msg: posix.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iovecs,
+            .iovlen = @intCast(iovlen),
+            .control = if (control.len == 0) null else control.ptr,
+            .controllen = @intCast(control.len),
+            .flags = 0,
+        };
+        const flags = if (@hasDecl(posix.MSG, "CMSG_CLOEXEC")) posix.MSG.CMSG_CLOEXEC else 0;
+        const rc = posix.system.recvmsg(handle, &msg, flags);
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => return .{
+                .data_len = @intCast(rc),
+                .control_len = @intCast(msg.controllen),
+                .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+            },
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .INVAL => |err| return errnoBug(err),
@@ -2053,10 +2044,10 @@ fn netReadOnce(handle: posix.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || 
     }
 }
 
-fn netRead(k: *Kqueue, handle: posix.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || Io.Cancelable)!usize {
+fn netRead(k: *Kqueue, handle: posix.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || Io.Cancelable)!net.Stream.ReadResult {
     while (true) {
         try k.checkCancel();
-        return netReadOnce(handle, data) catch |err| switch (err) {
+        return netReadOnce(handle, data, control) catch |err| switch (err) {
             error.WouldBlock => {
                 try waitReady(k, @bitCast(@as(isize, handle)), std.c.EVFILT.READ);
                 continue;
@@ -2073,6 +2064,7 @@ fn netWriteOnce(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
+    control: []const u8,
 ) (Io.Operation.NetWrite.Error || error{WouldBlock})!usize {
     var iovecs: [max_iovecs_len]iovec_const = undefined;
     var iovlen: iovlen_t = 0;
@@ -2112,8 +2104,8 @@ fn netWriteOnce(
         .namelen = 0,
         .iov = &iovecs,
         .iovlen = @intCast(iovlen),
-        .control = null,
-        .controllen = 0,
+        .control = if (control.len == 0) null else control.ptr,
+        .controllen = @intCast(control.len),
         .flags = 0,
     };
     while (true) {
@@ -2151,10 +2143,11 @@ fn netWrite(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
+    control: []const u8,
 ) (Io.Operation.NetWrite.Error || Io.Cancelable)!usize {
     while (true) {
         try k.checkCancel();
-        return netWriteOnce(handle, header, data, splat) catch |err| switch (err) {
+        return netWriteOnce(handle, header, data, splat, control) catch |err| switch (err) {
             error.WouldBlock => {
                 try waitReady(k, @bitCast(@as(isize, handle)), std.c.EVFILT.WRITE);
                 continue;
@@ -2454,10 +2447,10 @@ fn waitReadyTimeout(k: *Kqueue, ident: usize, filter: i16, timeout: Io.Timeout) 
     try socketWaitArm(k, &registration, owner, fiber, ident, filter);
     defer socketWaitDisarm(&registration);
     if (deadline) |when|
-        batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(when.durationFromNow(k.io()).raw.toNanoseconds()), false);
+        try batchTimerChange(owner.kq_fd, fiber, timerMilliseconds(when.durationFromNow(k.io()).raw.toNanoseconds()), false);
     k.yield(null, .{ .register_batch_waiter = &waiter.parked });
     socketWaitDisarm(&registration);
-    if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true);
+    if (deadline != null) batchTimerChange(owner.kq_fd, fiber, 0, true) catch @panic("failed to disarm Kqueue timer");
     try k.checkCancel();
     if (deadline) |when| {
         if (when.durationFromNow(k.io()).raw.toNanoseconds() <= 0) return error.Timeout;
@@ -2525,8 +2518,8 @@ fn socketWaitDisarm(wait: *SocketWait) void {
 /// Adds or deletes the calling fiber's batch timer. The timer's ident is
 /// the fiber pointer (unique per waiting fiber; fd idents are small), its
 /// udata the tagged batch waiter.
-fn batchTimerChange(kq_fd: posix.fd_t, fiber: *Fiber, ms: i64, delete: bool) void {
-    if (kq_fd < 0) return;
+fn batchTimerChange(kq_fd: posix.fd_t, fiber: *Fiber, ms: i64, delete: bool) error{ SystemResources, Unexpected }!void {
+    if (kq_fd < 0) return error.Unexpected;
     const changes = [_]posix.Kevent{
         .{
             .ident = @intFromPtr(fiber),
@@ -2537,9 +2530,13 @@ fn batchTimerChange(kq_fd: posix.fd_t, fiber: *Fiber, ms: i64, delete: bool) voi
             .udata = @intFromPtr(&fiber.batch_waiter) | batch_userdata_tag,
         },
     };
-    // A delete of an already-consumed timer is fine (ENOENT); any other
-    // failure only pessimises scheduling.
-    _ = kevent(kq_fd, &changes, &.{}, null) catch {};
+    // Only an already-consumed timer is harmless. Failure to add a timer
+    // must be observed before parking, or a finite wait could hang forever.
+    _ = kevent(kq_fd, &changes, &.{}, null) catch |err| switch (err) {
+        error.EventNotFound => if (!delete) return error.Unexpected,
+        error.SystemResources => return error.SystemResources,
+        else => return error.Unexpected,
+    };
 }
 
 /// Tries every submitted operation without blocking. Operations that
@@ -2561,16 +2558,18 @@ fn batchDrainSubmitted(k: *Kqueue, b: *Io.Batch, registrations: []SocketWait) Io
                 var msg_i: usize = 0;
                 break :r drain: for (o.message_buffer) |*message| {
                     const remaining = o.data_buffer[data_i..];
+                    if (remaining.len == 0 and msg_i != 0)
+                        break :drain .{ .net_receive = .{ null, msg_i } };
                     Io.Threaded.netReceivePosix(o.socket_handle, message, remaining, o.flags, true) catch |err| switch (err) {
                         error.Canceled => |e| return e,
                         error.WouldBlock => {
                             if (msg_i != 0) break :drain .{ .net_receive = .{ null, msg_i } };
                             socketWaitArm(k, &registrations[index.toIndex()], thread, fiber, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.READ) catch |e|
-                                break :r .{ .net_receive = .{ e, 0 } };
+                                break :r .{ .net_receive = .{ e, msg_i } };
                             completed_inline = false;
                             break :r .{ .net_receive = .{ null, 0 } };
                         },
-                        else => |e| break :drain .{ .net_receive = .{ e, 0 } },
+                        else => |e| break :drain .{ .net_receive = .{ e, msg_i } },
                     };
                     data_i += message.data.len;
                     msg_i += 1;
@@ -2591,19 +2590,19 @@ fn batchDrainSubmitted(k: *Kqueue, b: *Io.Batch, registrations: []SocketWait) Io
                 }
             },
             .net_read => |o| r: {
-                const n = netReadOnce(o.socket_handle, o.data) catch |err| switch (err) {
+                const n = netReadOnce(o.socket_handle, o.data, o.control) catch |err| switch (err) {
                     error.WouldBlock => {
                         socketWaitArm(k, &registrations[index.toIndex()], thread, fiber, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.READ) catch |e|
                             break :r .{ .net_read = e };
                         completed_inline = false;
-                        break :r .{ .net_read = 0 };
+                        break :r .{ .net_read = .{ .data_len = 0 } };
                     },
                     else => |e| break :r .{ .net_read = e },
                 };
                 break :r .{ .net_read = n };
             },
             .net_write => |o| r: {
-                const n = netWriteOnce(o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
+                const n = netWriteOnce(o.socket_handle, o.header, o.data, o.splat, o.control) catch |err| switch (err) {
                     error.WouldBlock => {
                         socketWaitArm(k, &registrations[index.toIndex()], thread, fiber, @bitCast(@as(isize, o.socket_handle)), std.c.EVFILT.WRITE) catch |e|
                             break :r .{ .net_write = e };
@@ -2682,7 +2681,7 @@ fn batchAwaitConcurrent(
         if (deadline) |when| {
             const remaining = when.durationFromNow(k.io()).raw.toNanoseconds();
             if (remaining <= 0) return error.Timeout;
-            batchTimerChange(waiter.kq_fd, fiber, timerMilliseconds(remaining), false);
+            batchTimerChange(waiter.kq_fd, fiber, timerMilliseconds(remaining), false) catch return error.ConcurrencyUnavailable;
         }
         k.yield(null, .{ .register_batch_waiter = &waiter.parked });
         batchDisarm(fiber, registrations);
@@ -2697,7 +2696,7 @@ fn batchDisarm(fiber: *Fiber, registrations: []SocketWait) void {
     const fd = fiber.batch_waiter.kq_fd;
     if (fd < 0) return;
     _ = @atomicRmw(?*Fiber, &fiber.batch_waiter.parked, .Xchg, Fiber.finished, .acq_rel);
-    batchTimerChange(fd, fiber, 0, true);
+    batchTimerChange(fd, fiber, 0, true) catch @panic("failed to disarm Kqueue timer");
     for (registrations) |*registration| socketWaitDisarm(registration);
     fiber.batch_waiter.kq_fd = -1;
 }

@@ -1,14 +1,17 @@
+//! Experimental backend for participating managed fibers and threads. Keep one
+//! active backend context per OS thread; foreign-thread calls and nested active
+//! instances are unsupported. Finish or cancel socket operations before closing
+//! the socket through the same owning Io.
+
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
 const Argv0 = Io.Threaded.Argv0;
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 const c = std.c;
-const ChdirError = Io.Threaded.ChdirError;
 const clockToPosix = Io.Threaded.clockToPosix;
 const closeFd = Io.Threaded.closeFd;
 const Csprng = Io.Threaded.Csprng;
-const default_PATH = Io.Threaded.default_PATH;
 const Dir = Io.Dir;
 const Environ = Io.Threaded.Environ;
 const errnoBug = Io.Threaded.errnoBug;
@@ -48,9 +51,13 @@ backing_allocator: Allocator,
 /// before its own stack is freed on a worker's main context, so `deinit`
 /// waits for this to reach zero before tearing down shared state.
 live_fibers: std.atomic.Value(usize),
+/// Includes entries whose dispatch source cancellation handlers are draining.
+live_net_entries: std.atomic.Value(usize) = .init(0),
 main_fiber: Fiber,
 main_loop_stack: [*]align(builtin.target.stackAlignment()) u8,
 exit_semaphore: c.dispatch.semaphore_t,
+/// Owns synchronous process/parent-handle adapters; socket waits stay evented.
+threaded: Io.Threaded,
 
 use_sendfile: UseSendfile,
 use_fcopyfile: UseFcopyfile,
@@ -59,9 +66,11 @@ leeway: u64,
 /// Cached per-socket libdispatch objects for the batched network operations,
 /// keyed by socket handle. Entries are created on the first batched network
 /// operation on a socket and destroyed when the socket closes, so a timed
-/// receive or send costs no queue, source or timer registration. Only fibers
-/// touch the map (submission, close), under the backing allocator's lock.
+/// receive or send costs no queue, source or timer registration. Fibers can
+/// run on different workers, so both the map and entry ownership need their
+/// own lock. Allocating while holding the allocator lock would deadlock.
 net_entries: std.AutoHashMapUnmanaged(net.Socket.Handle, *NetEntry) = .empty,
+net_entries_lock: SpinLock = .{},
 
 futexes: [1 << 8]Futex,
 
@@ -72,9 +81,6 @@ stderr_mode: Io.Terminal.Mode,
 
 scan_environ: c.dispatch.once_t,
 environ: Environ,
-
-open_dev_null: c.dispatch.once_t,
-dev_null_file: File.OpenError!File,
 
 csprng_mutex: Mutex,
 csprng: Csprng,
@@ -476,13 +482,13 @@ pub fn io(ev: *Evented) Io {
             .processSetCurrentDir = processSetCurrentDir,
             .processSetCurrentPath = processSetCurrentPath,
             .processReplace = processReplace,
-            .processReplacePath = processReplacePath,
             .processSpawn = processSpawn,
-            .processSpawnPath = processSpawnPath,
             .childWait = childWait,
             .childKill = childKill,
 
             .progressParentFile = progressParentFile,
+            .inheritParentDir = inheritParentDir,
+            .inheritParentFile = inheritParentFile,
 
             .now = now,
             .clockResolution = clockResolution,
@@ -556,6 +562,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .main_loop_stack = main_loop_stack.ptr,
         .live_fibers = .init(0),
         .exit_semaphore = exit_semaphore,
+        .threaded = undefined,
 
         .use_fcopyfile = .default,
         .use_sendfile = .default,
@@ -576,12 +583,17 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .scan_environ = if (options.environ.block.isEmpty()) .done else .init,
         .environ = .{ .process_environ = options.environ },
 
-        .open_dev_null = .init,
-        .dev_null_file = error.FileNotFound,
-
         .csprng_mutex = undefined,
         .csprng = .uninitialized,
     };
+    // Synchronous adapters must not replace process-global signal handlers
+    // when independent evented instances are created and destroyed.
+    ev.threaded = .init_single_threaded;
+    ev.threaded.allocator = ev.allocator();
+    ev.threaded.argv0 = options.argv0;
+    ev.threaded.environ = .{ .process_environ = options.environ };
+    ev.threaded.environ_initialized = options.environ.block.isEmpty();
+    errdefer ev.threaded.deinit();
     var initialized_futexes: usize = 0;
     errdefer for (ev.futexes[0..initialized_futexes]) |*futex| futex.deinit();
     for (&ev.futexes) |*futex| {
@@ -619,17 +631,26 @@ pub fn deinit(ev: *Evented) void {
             .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
         }) });
     }
-    ev.yield(.exit);
     var net_entry_iterator = ev.net_entries.iterator();
     while (net_entry_iterator.next()) |net_entry| {
+        assert(net_entry.value_ptr.*.owner == null);
         netEntryTeardown(net_entry.value_ptr.*);
     }
     ev.net_entries.deinit(ev.allocator());
+    // A source's cancel handler is the lifetime barrier for its queued
+    // events. Keep both the dispatcher and allocator alive until the final
+    // handler has freed its entry, including sockets closed before deinit.
+    while (ev.live_net_entries.load(.acquire) != 0) {
+        ev.yield(.{ .after = ev.timeFromTimeout(.{
+            .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+        }) });
+    }
+    ev.yield(.exit);
     ev.csprng_mutex.deinit();
-    if (ev.dev_null_file) |file| fileClose(ev, &.{file}) else |_| {}
     ev.stderr_mutex.deinit();
     for (&ev.futexes) |*futex| futex.deinit();
     ev.exit_semaphore.as_object().release();
+    ev.threaded.deinit();
     ev.backing_allocator.free(ev.main_loop_stack[0..main_loop_stack_size]);
     ev.queue.as_object().release();
 }
@@ -1796,13 +1817,13 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             .net_send = try ev.netSend(o.socket_handle, o.messages, o.flags),
         },
         .net_read => |o| return .{
-            .net_read = ev.netRead(o.socket_handle, o.data) catch |err| switch (err) {
+            .net_read = ev.netRead(o.socket_handle, o.data, o.control) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => |e| e,
             },
         },
         .net_write => |o| return .{
-            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
+            .net_write = ev.netWrite(o.socket_handle, o.header, o.data, o.splat, o.control) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => |e| e,
             },
@@ -2071,6 +2092,9 @@ const NetEntry = struct {
     evented: *Evented,
     queue: c.dispatch.queue_t,
     handle: net.Socket.Handle,
+    /// A single batch owns the suspended queue and its waiter. Protected by
+    /// `net_entries_lock`; other batches use their own legacy batch queue.
+    owner: ?*Io.Batch = null,
     read: ?c.dispatch.source_t = null,
     write: ?c.dispatch.source_t = null,
     timer: ?c.dispatch.source_t = null,
@@ -2084,6 +2108,7 @@ const NetEntry = struct {
     timer_armed: bool = false,
     /// Set while teardown is in flight; handlers must not suspend sources.
     closed: bool = false,
+    retiring_sources: usize = 0,
     read_target: ?*Io.Operation.Storage = null,
     write_target: ?*Io.Operation.Storage = null,
     waiter: ?*EntryWaiter = null,
@@ -2169,8 +2194,14 @@ fn batchUserdataEntry(batch: *Io.Batch) ?*NetEntry {
     return @ptrFromInt(address & ~batch_userdata_entry_bit);
 }
 
-fn netEntryGet(ev: *Evented, handle: net.Socket.Handle) ?*NetEntry {
-    if (ev.net_entries.get(handle)) |entry| return entry;
+fn netEntryGet(ev: *Evented, handle: net.Socket.Handle, batch: *Io.Batch) ?*NetEntry {
+    ev.net_entries_lock.lock();
+    defer ev.net_entries_lock.unlock();
+    if (ev.net_entries.get(handle)) |entry| {
+        if (entry.owner != null) return null;
+        entry.owner = batch;
+        return entry;
+    }
     const queue = c.dispatch.queue_create_with_target(
         "org.ziglang.std.Io.Dispatch.NetEntry",
         .SERIAL(),
@@ -2185,23 +2216,49 @@ fn netEntryGet(ev: *Evented, handle: net.Socket.Handle) ?*NetEntry {
         queue.as_object().release();
         return null;
     };
-    entry.* = .{ .evented = ev, .queue = queue, .handle = handle };
+    entry.* = .{ .evented = ev, .queue = queue, .handle = handle, .owner = batch };
     ev.net_entries.put(backing, handle, entry) catch {
         backing.destroy(entry);
         queue.as_object().@"resume"();
         queue.as_object().release();
         return null;
     };
+    _ = ev.live_net_entries.fetchAdd(1, .monotonic);
     return entry;
+}
+
+/// The owner still holds the queue suspended. Publish it as available only
+/// after the old batch has dropped every reference to the entry.
+fn netEntryRelease(entry: *NetEntry, batch: *Io.Batch) void {
+    const ev = entry.evented;
+    ev.net_entries_lock.lock();
+    defer ev.net_entries_lock.unlock();
+    assert(entry.owner == batch);
+    assert(entry.read_target == null and entry.write_target == null);
+    assert(entry.waiter == null and !entry.timer_armed);
+    entry.owner = null;
 }
 
 /// Frees the entry once its queue has drained already-queued events, so no
 /// handler can touch freed memory. Runs as the last item on the entry queue.
 fn netEntryFree(context: ?*anyopaque) callconv(.c) void {
     const entry: *NetEntry = @ptrCast(@alignCast(context));
+    const ev = entry.evented;
     const queue = entry.queue;
-    entry.evented.allocator().destroy(entry);
+    ev.allocator().destroy(entry);
     queue.as_object().release();
+    // Last access to ev: deinit may return once it observes zero.
+    _ = ev.live_net_entries.fetchSub(1, .release);
+}
+
+/// Dispatch invokes this only after the source has stopped delivering its
+/// event handler. The serial entry queue makes the final count a barrier
+/// for every source that could still carry the entry as its context.
+fn netEntrySourceCanceled(context: ?*anyopaque) callconv(.c) void {
+    const entry: *NetEntry = @ptrCast(@alignCast(context));
+    assert(entry.closed and entry.retiring_sources != 0);
+    entry.retiring_sources -= 1;
+    if (entry.retiring_sources == 0) netEntryFree(context);
 }
 
 /// Tears an entry down when its socket closes. The sources are canceled (no
@@ -2215,6 +2272,8 @@ fn netEntryTeardown(entry: *NetEntry) void {
     entry.waiter = null;
     inline for (.{ "read", "write", "timer" }) |field| {
         if (@field(entry, field)) |object| {
+            entry.retiring_sources += 1;
+            object.set_cancel_handler(&netEntrySourceCanceled);
             object.cancel();
             // Balance the base suspension, but only when it is actually
             // held: a source that completed an operation stays resumed and
@@ -2227,8 +2286,12 @@ fn netEntryTeardown(entry: *NetEntry) void {
     }
     // Drop the one suspension a fiber always leaves held, let the queue
     // drain, then free.
-    entry.queue.as_object().@"resume"();
-    entry.queue.async(entry, &netEntryFree);
+    const has_sources = entry.retiring_sources != 0;
+    const queue = entry.queue;
+    if (!has_sources) queue.async(entry, &netEntryFree);
+    // No entry access after resuming: the last cancel handler can free it
+    // immediately on another worker.
+    queue.as_object().@"resume"();
 }
 
 /// Disarms the timer if the current wait armed it, re-suspends the entry
@@ -2304,6 +2367,7 @@ fn netEntryEvent(context: ?*anyopaque, direction: NetEntry.Direction) void {
             break :result .{ .net_read = netReadOnce(
                 entry.handle,
                 operation.data_ptr[0..operation.data_len],
+                operation.control_ptr[0..operation.control_len],
             ) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => |e| e,
@@ -2316,6 +2380,7 @@ fn netEntryEvent(context: ?*anyopaque, direction: NetEntry.Direction) void {
                 operation.header_ptr[0..operation.header_len],
                 operation.data_ptr[0..operation.data_len],
                 operation.splat,
+                operation.control_ptr[0..operation.control_len],
             ) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => |e| e,
@@ -2363,6 +2428,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     if (batch.completed.head != .none) return;
     const fiber = Thread.current().currentFiber();
     if (batchUserdataEntry(batch)) |entry| {
+        defer batchReleaseIdleQueue(batch);
         var waiter: EntryWaiter = .{
             .sleeper = undefined,
             .entry = entry,
@@ -2397,6 +2463,7 @@ fn batchAwaitConcurrent(
     if (batch.completed.head != .none) return;
     const fiber = Thread.current().currentFiber();
     if (batchUserdataEntry(batch)) |entry| {
+        defer batchReleaseIdleQueue(batch);
         // Preserve one deadline across stale timer wakes. Dispatch time_t
         // values are opaque encodings, and wall times sort backwards.
         const deadline = timeout.toTimestamp(ev.io());
@@ -2510,8 +2577,8 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
 fn batchReleaseIdleQueue(batch: *Io.Batch) void {
     if (batch.pending.head != .none) return;
     if (batchUserdataEntry(batch)) |entry| {
-        _ = entry;
         batch.userdata = null;
+        netEntryRelease(entry, batch);
         return;
     }
     const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
@@ -2589,6 +2656,7 @@ fn batchCancelPending(ev: *Evented, batch: *Io.Batch) void {
         }
         entry.waiter = null;
         batch.userdata = null;
+        netEntryRelease(entry, batch);
         return;
     }
     const queue: c.dispatch.queue_t = @ptrCast(batch.userdata orelse return);
@@ -2645,13 +2713,17 @@ const BatchOperationUserdata = extern struct {
         net_read: extern struct {
             data_ptr: [*][]u8,
             data_len: usize,
+            control_ptr: [*]u8,
+            control_len: usize,
         },
         net_write: extern struct {
             header_ptr: [*]const u8,
-            header_len: usize,
             data_ptr: [*]const []const u8,
-            data_len: usize,
+            control_ptr: [*]const u8,
             splat: usize,
+            data_len: usize,
+            header_len: usize,
+            control_len: usize,
 
             fn header(operation: *const @This()) []const u8 {
                 return operation.header_ptr[0..operation.header_len];
@@ -2733,8 +2805,8 @@ fn entryNetSource(entry: *NetEntry, direction: NetEntry.Direction) ?c.dispatch.s
 }
 
 /// Fast path of `batchDrainSubmitted` for the common shape: every submitted
-/// operation is a network operation on one socket, at most one per
-/// direction. The operations run on the socket's cached entry, so a wait
+/// operation is a network operation in a single-slot batch. The operation
+/// runs on the socket's cached entry, so a wait
 /// creates no queue, no source and no timer. Returns null when the batch
 /// does not fit the shape, the entry's slots are taken by another batch, or
 /// allocation failed; the caller falls back to the legacy path.
@@ -2742,6 +2814,10 @@ fn batchDrainNetEntry(
     ev: *Evented,
     batch: *Io.Batch,
 ) Io.Cancelable!?c.dispatch.queue_t {
+    // A pending multi-slot batch may later add a file operation or another
+    // socket. Keep it on one general queue for its whole pending lifetime;
+    // tagged entry userdata must never be interpreted as a queue pointer.
+    if (batch.storage.len != 1 or batch.userdata != null) return null;
     var socket_handle: ?net.Socket.Handle = null;
     var needs_read = false;
     var needs_write = false;
@@ -2768,9 +2844,7 @@ fn batchDrainNetEntry(
         index = storage.submission.node.next;
     }
     const handle = socket_handle orelse return null;
-    const entry = netEntryGet(ev, handle) orelse return null;
-    if ((needs_read and entry.read_target != null) or
-        (needs_write and entry.write_target != null)) return null;
+    const entry = netEntryGet(ev, handle, batch) orelse return null;
     index = batch.submitted.head;
     while (index != .none) {
         const storage = &batch.storage[index.toIndex()];
@@ -2856,7 +2930,7 @@ fn batchDrainNetEntry(
                 .net_read => |operation| {
                     const data = for (operation.data, 0..) |buffer, data_index| {
                         if (buffer.len > 0) break operation.data[data_index..];
-                    } else break :result .{ .net_read = 0 };
+                    } else break :result .{ .net_read = .{ .data_len = 0 } };
                     const object = entryNetSource(entry, .read) orelse
                         break :result .{ .net_read = error.SystemResources };
                     storage.* = .{ .pending = .{
@@ -2872,6 +2946,8 @@ fn batchDrainNetEntry(
                         .operation = .{ .net_read = .{
                             .data_ptr = data.ptr,
                             .data_len = data.len,
+                            .control_ptr = operation.control.ptr,
+                            .control_len = operation.control.len,
                         } },
                     };
                     entry.read_target = storage;
@@ -2901,6 +2977,8 @@ fn batchDrainNetEntry(
                         .batch = batch,
                         .completion = .{ .entry = entry },
                         .operation = .{ .net_write = .{
+                            .control_ptr = operation.control.ptr,
+                            .control_len = operation.control.len,
                             .header_ptr = operation.header.ptr,
                             .header_len = operation.header.len,
                             .data_ptr = data.ptr,
@@ -2949,6 +3027,13 @@ fn batchDrainSubmitted(
         entry.queue
     else
         @ptrCast(batch.userdata);
+    // A completed single-slot batch can be reused for a different kind of
+    // operation or socket. Relinquish its old cache entry before choosing
+    // the representation for this new submission.
+    if (batchUserdataEntry(batch) != null) {
+        assert(batch.pending.head == .none); // occupied slots cannot be added
+        batchReleaseIdleQueue(batch);
+    }
     if (try batchDrainNetEntry(ev, batch)) |queue| return queue;
     errdefer batch.submitted.head = index;
     const maybe_queue: ?c.dispatch.queue_t = if (batch.userdata) |batch_userdata|
@@ -3130,7 +3215,7 @@ fn batchDrainSubmitted(
                 .net_read => |operation| {
                     const data = for (operation.data, 0..) |buffer, data_index| {
                         if (buffer.len > 0) break operation.data[data_index..];
-                    } else break :result .{ .net_read = 0 };
+                    } else break :result .{ .net_read = .{ .data_len = 0 } };
                     const source = c.dispatch.source_create(
                         .READ,
                         @bitCast(@as(isize, operation.socket_handle)),
@@ -3150,6 +3235,8 @@ fn batchDrainSubmitted(
                         .operation = .{ .net_read = .{
                             .data_ptr = data.ptr,
                             .data_len = data.len,
+                            .control_ptr = operation.control.ptr,
+                            .control_len = operation.control.len,
                         } },
                     };
                     source.as_object().set_context(storage);
@@ -3182,6 +3269,8 @@ fn batchDrainSubmitted(
                         .batch = batch,
                         .completion = .{ .source = source },
                         .operation = .{ .net_write = .{
+                            .control_ptr = operation.control.ptr,
+                            .control_len = operation.control.len,
                             .header_ptr = operation.header.ptr,
                             .header_len = operation.header.len,
                             .data_ptr = data.ptr,
@@ -3285,6 +3374,7 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
             break :result .{ .net_read = netReadOnce(
                 @intCast(source.get_handle()),
                 operation.data_ptr[0..operation.data_len],
+                operation.control_ptr[0..operation.control_len],
             ) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => |e| e,
@@ -3297,6 +3387,7 @@ fn batchSourceEvent(context: ?*anyopaque) callconv(.c) void {
                 operation.header_ptr[0..operation.header_len],
                 operation.data_ptr[0..operation.data_len],
                 operation.splat,
+                operation.control_ptr[0..operation.control_len],
             ) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => |e| e,
@@ -5182,567 +5273,40 @@ fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.Se
 
 fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    if (!process.can_replace) return error.OperationUnsupported;
-
-    ev.scan_environ.once(ev, &scanEnviron); // for PATH
-    const PATH = ev.environ.string.PATH orelse default_PATH;
-
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
-    for (options.argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
-
-    const env_block = env_block: {
-        const prog_fd: i32 = -1;
-        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-    };
-
-    return ev.execv(options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
-}
-
-fn processReplacePath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.ReplaceOptions,
-) process.ReplaceError {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    if (!process.can_replace) return error.OperationUnsupported;
-
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
-    argv_buf[0] = (try arena.dupeSentinel(u8, try argv0Path(arena, options.argv[0]), 0)).ptr;
-    for (options.argv[1..], 1..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
-
-    const env_block = env_block: {
-        const prog_fd: i32 = -1;
-        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-    };
-
-    // `argv[0]` is relative to `dir`; change into it so that the path
-    // resolves against `dir`.
-    processSetCurrentDir(userdata, dir) catch |err| switch (err) {
-        error.AccessDenied,
-        error.Canceled,
-        error.FileNotFound,
-        error.FileSystem,
-        error.NotDir,
-        error.Unexpected,
-        => |e| return e,
-        // Not produced by `fchdir` on POSIX.
-        error.BadPathName,
-        error.NameTooLong,
-        error.NoDevice,
-        error.OperationUnsupported,
-        error.UnrecognizedVolume,
-        => return error.Unexpected,
-    };
-
-    // The "./" prefix (added by `argv0Path`) ensures `execv` does not search
-    // PATH; `PATH` is unused but must still be non-null.
-    return ev.execv(.no_expand, argv_buf.ptr[0].?, argv_buf.ptr, env_block, ".");
+    try checkCancel(ev);
+    const fallback = ev.threaded.io();
+    return fallback.vtable.processReplace(fallback.userdata, options);
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const spawned = try ev.spawn(options);
-    defer fileClose(ev, &.{spawned.err_pipe});
-
-    // Wait for the child to report any errors in or before `execvpe`.
-    var child_err: ForkBailError = undefined;
-    ev.readAll(spawned.err_pipe, @ptrCast(&child_err)) catch |read_err| {
-        switch (read_err) {
-            error.Canceled => unreachable, // blocked
-            error.EndOfStream => {
-                // Write end closed by CLOEXEC at the time of the `execvpe` call,
-                // indicating success.
-            },
-            else => {
-                // Problem reading the error from the error reporting pipe. We
-                // don't know if the child is alive or dead. Better to assume it is
-                // alive so the resource does not risk being leaked.
-            },
-        }
-        return .{
-            .id = spawned.pid,
-            .thread_handle = {},
-            .stdin = spawned.stdin,
-            .stdout = spawned.stdout,
-            .stderr = spawned.stderr,
-            .request_resource_usage_statistics = options.request_resource_usage_statistics,
-        };
-    };
-    return child_err;
+    try checkCancel(ev);
+    const fallback = ev.threaded.io();
+    return fallback.vtable.processSpawn(fallback.userdata, options);
 }
 
-fn processSpawnPath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.SpawnOptions,
-) process.SpawnError!process.Child {
+fn inheritParentDir(userdata: ?*anyopaque, handle: Dir.Handle) Io.InheritParentHandleError!Dir {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    const argv = try arena.alloc([]const u8, options.argv.len);
-    argv[0] = try argv0Path(arena, options.argv[0]);
-    @memcpy(argv[1..], options.argv[1..]);
-
-    var path_options = options;
-    path_options.argv = argv;
-    path_options.cwd = .{ .dir = dir };
-    return processSpawn(userdata, path_options);
+    const fallback = ev.threaded.io();
+    return fallback.vtable.inheritParentDir(fallback.userdata, handle);
 }
 
-/// Returns `arg0` guaranteed to be treated as a path relative to the current
-/// working directory rather than searched for in `PATH`, by prefixing "./"
-/// when it contains no '/'.
-fn argv0Path(arena: std.mem.Allocator, arg0: []const u8) error{OutOfMemory}![]const u8 {
-    if (std.mem.findScalar(u8, arg0, '/') != null) return arg0;
-    const result = try arena.alloc(u8, arg0.len + 2);
-    result[0] = '.';
-    result[1] = '/';
-    @memcpy(result[2..], arg0);
-    return result;
-}
-
-const prog_fileno = @max(c.STDIN_FILENO, c.STDOUT_FILENO, c.STDERR_FILENO) + 1;
-
-const Spawned = struct {
-    pid: c.pid_t,
-    err_pipe: File,
-    stdin: ?File,
-    stdout: ?File,
-    stderr: ?File,
-};
-fn spawn(ev: *Evented, options: process.SpawnOptions) process.SpawnError!Spawned {
-    // The child process does need to access (one end of) these pipes. However,
-    // we must initially set CLOEXEC to avoid a race condition. If another thread
-    // is racing to spawn a different child process, we don't want it to inherit
-    // these FDs in any scenario; that would mean that, for instance, calls to
-    // `poll` from the parent would not report the child's stdout as closing when
-    // expected, since the other child may retain a reference to the write end of
-    // the pipe. So, we create the pipes with CLOEXEC initially. After fork, we
-    // need to do something in the new child to make sure we preserve the reference
-    // we want. We could use `fcntl` to remove CLOEXEC from the FD, but as it
-    // turns out, we `dup2` everything anyway, so there's no need!
-    const pipe_flags: c.O = .{ .CLOEXEC = true };
-
-    const stdin_pipe = if (options.stdin == .pipe) try pipe2(pipe_flags) else undefined;
-    errdefer if (options.stdin == .pipe) {
-        destroyPipe(stdin_pipe);
-    };
-
-    const stdout_pipe = if (options.stdout == .pipe) try pipe2(pipe_flags) else undefined;
-    errdefer if (options.stdout == .pipe) {
-        destroyPipe(stdout_pipe);
-    };
-
-    const stderr_pipe = if (options.stderr == .pipe) try pipe2(pipe_flags) else undefined;
-    errdefer if (options.stderr == .pipe) {
-        destroyPipe(stderr_pipe);
-    };
-
-    const any_ignore =
-        options.stdin == .ignore or options.stdout == .ignore or options.stderr == .ignore;
-    const dev_null_file = if (any_ignore) dev_null_file: {
-        ev.open_dev_null.once(ev, &openDevNullFile);
-        break :dev_null_file try ev.dev_null_file;
-    } else undefined;
-
-    const prog_pipe: [2]c.fd_t = if (options.progress_node.index != .none)
-        // We use CLOEXEC for the same reason as in `pipe_flags`.
-        try pipe2(.{ .NONBLOCK = true, .CLOEXEC = true })
-    else
-        .{ -1, -1 };
-    errdefer destroyPipe(prog_pipe);
-
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    // The POSIX standard does not allow malloc() between fork() and execve(),
-    // and this allocator may be a libc allocator.
-    // I have personally observed the child process deadlocking when it tries
-    // to call malloc() due to a heap allocation between fork() and execve(),
-    // in musl v1.1.24.
-    // Additionally, we want to reduce the number of possible ways things
-    // can fail between fork() and execve().
-    // Therefore, we do all the allocation for the execve() before the fork().
-    // This means we must do the null-termination of argv and env vars here.
-    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
-    for (options.argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
-
-    const env_block = env_block: {
-        const prog_fd: i32 = if (prog_pipe[1] == -1) -1 else prog_fileno;
-        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-    };
-
-    // This pipe communicates to the parent errors in the child between `fork` and `execvpe`.
-    // It is closed by the child (via CLOEXEC) without writing if `execvpe` succeeds.
-    const err_pipe: [2]File = err_pipe: {
-        const err_pipe = try pipe2(.{ .CLOEXEC = true });
-        break :err_pipe .{
-            .{ .handle = err_pipe[0], .flags = .{ .nonblocking = false } },
-            .{ .handle = err_pipe[1], .flags = .{ .nonblocking = false } },
-        };
-    };
-    errdefer fileClose(ev, &err_pipe);
-
-    ev.scan_environ.once(ev, &scanEnviron); // for PATH
-    const PATH = ev.environ.string.PATH orelse default_PATH;
-
-    const pid_result: c.pid_t = fork: {
-        const rc = c.fork();
-        switch (c.errno(rc)) {
-            .SUCCESS => break :fork @intCast(rc),
-            .AGAIN => return error.SystemResources,
-            .NOMEM => return error.SystemResources,
-            .NOSYS => return error.OperationUnsupported,
-            else => |err| return unexpectedErrno(err),
-        }
-    };
-
-    if (pid_result == 0) {
-        defer comptime unreachable; // We are the child.
-        const err = ev.setUpChild(.{
-            .stdin_pipe = stdin_pipe[0],
-            .stdout_pipe = stdout_pipe[1],
-            .stderr_pipe = stderr_pipe[1],
-            .dev_null_fd = dev_null_file.handle,
-            .prog_pipe = prog_pipe[1],
-            .argv_buf = argv_buf,
-            .env_block = env_block,
-            .PATH = PATH,
-            .spawn = options,
-        });
-        ev.writeAll(err_pipe[1], @ptrCast(&err)) catch {};
-        c.exit(1);
-    }
-
-    const pid: c.pid_t = @intCast(pid_result); // We are the parent.
-    errdefer comptime unreachable; // The child is forked; we must not error from now on
-
-    fileClose(ev, err_pipe[1..2]); // make sure only the child holds the write end open
-
-    if (options.stdin == .pipe) closeFd(stdin_pipe[0]);
-    if (options.stdout == .pipe) closeFd(stdout_pipe[1]);
-    if (options.stderr == .pipe) closeFd(stderr_pipe[1]);
-
-    if (prog_pipe[1] != -1) closeFd(prog_pipe[1]);
-
-    options.progress_node.setIpcFile(ev, .{ .handle = prog_pipe[0], .flags = .{ .nonblocking = true } });
-
-    return .{
-        .pid = pid,
-        .err_pipe = err_pipe[0],
-        .stdin = switch (options.stdin) {
-            .pipe => .{ .handle = stdin_pipe[1], .flags = .{ .nonblocking = false } },
-            else => null,
-        },
-        .stdout = switch (options.stdout) {
-            .pipe => .{ .handle = stdout_pipe[0], .flags = .{ .nonblocking = false } },
-            else => null,
-        },
-        .stderr = switch (options.stderr) {
-            .pipe => .{ .handle = stderr_pipe[0], .flags = .{ .nonblocking = false } },
-            else => null,
-        },
-    };
-}
-
-fn openDevNullFile(context: ?*anyopaque) callconv(.c) void {
-    const ev: *Evented = @ptrCast(@alignCast(context));
-    ev.dev_null_file = dirOpenFile(ev, .cwd(), "/dev/null", .{ .mode = .read_write });
-}
-
-/// Errors that can occur between fork() and execv()
-const ForkBailError = process.SetCurrentDirError || ChdirError ||
-    process.SpawnError || process.ReplaceError;
-fn setUpChild(ev: *Evented, options: struct {
-    stdin_pipe: c.fd_t,
-    stdout_pipe: c.fd_t,
-    stderr_pipe: c.fd_t,
-    dev_null_fd: c.fd_t,
-    prog_pipe: c.fd_t,
-    argv_buf: [:null]?[*:0]const u8,
-    env_block: process.Environ.Block,
-    PATH: []const u8,
-    spawn: process.SpawnOptions,
-}) ForkBailError {
-    try ev.setUpChildIo(
-        options.spawn.stdin,
-        options.stdin_pipe,
-        c.STDIN_FILENO,
-        options.dev_null_fd,
-    );
-    try ev.setUpChildIo(
-        options.spawn.stdout,
-        options.stdout_pipe,
-        c.STDOUT_FILENO,
-        options.dev_null_fd,
-    );
-    try ev.setUpChildIo(
-        options.spawn.stderr,
-        options.stderr_pipe,
-        c.STDERR_FILENO,
-        options.dev_null_fd,
-    );
-
-    switch (options.spawn.cwd) {
-        .inherit => {},
-        .dir => |cwd_dir| try processSetCurrentDir(ev, cwd_dir),
-        .path => |cwd_path| try processSetCurrentPath(ev, cwd_path),
-    }
-
-    // Must happen after fchdir above, the cwd file descriptor might be
-    // equal to prog_fileno and be clobbered by this dup2 call.
-    if (options.prog_pipe != -1) try ev.dup2(options.prog_pipe, prog_fileno);
-
-    if (options.spawn.gid) |gid| while (true) switch (c.errno(c.setregid(gid, gid))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .AGAIN => return error.ResourceLimitReached,
-        .INVAL => return error.InvalidUserId,
-        .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    };
-
-    if (options.spawn.uid) |uid| while (true) switch (c.errno(c.setreuid(uid, uid))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .AGAIN => return error.ResourceLimitReached,
-        .INVAL => return error.InvalidUserId,
-        .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    };
-
-    if (options.spawn.pgid) |pid| while (true) switch (c.errno(c.setpgid(0, pid))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .ACCES => return error.ProcessAlreadyExec,
-        .INVAL => return error.InvalidProcessGroupId,
-        .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    };
-
-    if (options.spawn.start_suspended) while (true) switch (c.errno(c.kill(0, .STOP))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    };
-
-    return ev.execv(
-        options.spawn.expand_arg0,
-        options.argv_buf.ptr[0].?,
-        options.argv_buf.ptr,
-        options.env_block,
-        options.PATH,
-    );
-}
-
-fn setUpChildIo(
-    ev: *Evented,
-    stdio: process.SpawnOptions.StdIo,
-    pipe_fd: c.fd_t,
-    std_fileno: i32,
-    dev_null_fd: c.fd_t,
-) !void {
-    switch (stdio) {
-        .pipe => try ev.dup2(pipe_fd, std_fileno),
-        .close => closeFd(std_fileno),
-        .inherit => {},
-        .ignore => try ev.dup2(dev_null_fd, std_fileno),
-        .file => |file| try ev.dup2(file.handle, std_fileno),
-    }
-}
-
-const PipeError = error{
-    SystemFdQuotaExceeded,
-    ProcessFdQuotaExceeded,
-} || Io.UnexpectedError;
-
-fn pipe2(flags: c.O) PipeError![2]c.fd_t {
-    var fds: [2]c.fd_t = undefined;
-
-    while (true) switch (c.errno(c.pipe(&fds))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        else => |err| return unexpectedErrno(err),
-    };
-    errdefer {
-        closeFd(fds[0]);
-        closeFd(fds[1]);
-    }
-
-    // https://github.com/ziglang/zig/issues/18882
-    if (@as(u32, @bitCast(flags)) == 0) return fds;
-
-    // CLOEXEC is special, it's a file descriptor flag and must be set using
-    // F.SETFD.
-    if (flags.CLOEXEC) for (fds) |fd| while (true) switch (c.errno(c.fcntl(fd, c.F.SETFD, @as(u32, c.FD_CLOEXEC)))) {
-        .SUCCESS => break,
-        .INTR => {},
-        else => |err| return unexpectedErrno(err),
-    };
-
-    const new_flags: u32 = f: {
-        var new_flags = flags;
-        new_flags.CLOEXEC = false;
-        break :f @bitCast(new_flags);
-    };
-
-    // Set every other flag affecting the file status using F.SETFL.
-    if (new_flags != 0) for (fds) |fd| while (true) switch (c.errno(c.fcntl(fd, c.F.SETFL, new_flags))) {
-        .SUCCESS => break,
-        .INTR => {},
-        .INVAL => |err| return errnoBug(err),
-        else => |err| return unexpectedErrno(err),
-    };
-
-    return fds;
-}
-
-fn destroyPipe(pipe: [2]c.fd_t) void {
-    if (pipe[0] != -1) closeFd(pipe[0]);
-    if (pipe[0] != pipe[1]) closeFd(pipe[1]);
-}
-
-const DupError = error{
-    ProcessFdQuotaExceeded,
-    SystemResources,
-} || Io.UnexpectedError || Io.Cancelable;
-fn dup2(ev: *Evented, old_fd: c.fd_t, new_fd: c.fd_t) DupError!void {
-    _ = ev;
-    while (true) switch (c.errno(c.dup2(old_fd, new_fd))) {
-        .SUCCESS => return,
-        .BUSY, .INTR => {},
-        .INVAL => |err| return errnoBug(err), // invalid parameters
-        .BADF => |err| return errnoBug(err), // use after free
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NOMEM => return error.SystemResources,
-        else => |err| return unexpectedErrno(err),
-    };
-}
-
-fn execv(
-    ev: *Evented,
-    arg0_expand: process.ArgExpansion,
-    file: [*:0]const u8,
-    child_argv: [*:null]?[*:0]const u8,
-    env_block: process.Environ.PosixBlock,
-    PATH: []const u8,
-) process.ReplaceError {
-    const file_slice = std.mem.sliceTo(file, 0);
-    if (std.mem.findScalar(u8, file_slice, '/') != null) return ev.execvPath(file, child_argv, env_block);
-
-    // Use of PATH_MAX here is valid as the path_buf will be passed
-    // directly to the operating system in posixExecvPath.
-    var path_buf: [c.PATH_MAX]u8 = undefined;
-    var it = std.mem.tokenizeScalar(u8, PATH, ':');
-    var seen_eacces = false;
-    var err: process.ReplaceError = error.FileNotFound;
-
-    // In case of expanding arg0 we must put it back if we return with an error.
-    const prev_arg0 = child_argv[0];
-    defer switch (arg0_expand) {
-        .expand => child_argv[0] = prev_arg0,
-        .no_expand => {},
-    };
-
-    while (it.next()) |search_path| {
-        const path_len = search_path.len + file_slice.len + 1;
-        if (path_buf.len < path_len + 1) return error.NameTooLong;
-        @memcpy(path_buf[0..search_path.len], search_path);
-        path_buf[search_path.len] = '/';
-        @memcpy(path_buf[search_path.len + 1 ..][0..file_slice.len], file_slice);
-        path_buf[path_len] = 0;
-        const full_path = path_buf[0..path_len :0].ptr;
-        switch (arg0_expand) {
-            .expand => child_argv[0] = full_path,
-            .no_expand => {},
-        }
-        err = ev.execvPath(full_path, child_argv, env_block);
-        switch (err) {
-            error.AccessDenied => seen_eacces = true,
-            error.FileNotFound, error.NotDir => {},
-            else => |e| return e,
-        }
-    }
-    if (seen_eacces) return error.AccessDenied;
-    return err;
-}
-/// This function ignores PATH environment variable.
-fn execvPath(
-    ev: *Evented,
-    path: [*:0]const u8,
-    child_argv: [*:null]const ?[*:0]const u8,
-    env_block: process.Environ.PosixBlock,
-) process.ReplaceError {
-    _ = ev;
-    switch (c.errno(c.execve(path, child_argv, env_block.slice.ptr))) {
-        .FAULT => |err| return errnoBug(err), // Bad pointer parameter.
-        .@"2BIG" => return error.SystemResources,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NAMETOOLONG => return error.NameTooLong,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOMEM => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
-        .INVAL => return error.InvalidExe,
-        .NOEXEC => return error.InvalidExe,
-        .IO => return error.FileSystem,
-        .LOOP => return error.FileSystem,
-        .ISDIR => return error.IsDir,
-        .NOENT => return error.FileNotFound,
-        .NOTDIR => return error.NotDir,
-        .TXTBSY => return error.FileBusy,
-        .BADEXEC => return error.InvalidExe,
-        .BADARCH => return error.InvalidExe,
-        else => |err| return unexpectedErrno(err),
-    }
+fn inheritParentFile(userdata: ?*anyopaque, handle: File.Handle, flags: File.Flags) Io.InheritParentHandleError!File {
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    const fallback = ev.threaded.io();
+    return fallback.vtable.inheritParentFile(fallback.userdata, handle, flags);
 }
 
 fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitError!process.Child.Term {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    defer ev.childCleanup(child);
     const pid = child.id.?;
-    const source = c.dispatch.source_create(
-        .PROC,
-        @bitCast(@as(isize, pid)),
-        .{ .PROC = .{ .EXIT = true } },
-        ev.queue,
-    ) orelse return error.Unexpected;
-    source.as_object().set_context(Thread.current().currentFiber());
-    source.set_event_handler(&Fiber.@"resume");
-    ev.yield(.{ .activate = source.as_object() });
-    source.as_object().release();
+    waitReady(ev, pid, .PROC) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.SystemResources => return error.Unexpected,
+    };
+    // Cancellation leaves the process and its streams owned by the caller.
+    // Only an observed exit permits reaping and releasing those resources.
+    defer ev.childCleanup(child);
     var status: c_int = undefined;
     var ru: c.rusage = undefined;
     const ru_ptr = if (child.request_resource_usage_statistics) &ru else null;
@@ -5761,7 +5325,7 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     defer ev.childCleanup(child);
     const pid = child.id.?;
-    while (true) switch (c.errno(c.kill(pid, .TERM))) {
+    while (true) switch (c.errno(c.kill(pid, .KILL))) {
         .SUCCESS => break,
         .INTR => {},
         .PERM => return,
@@ -6177,10 +5741,18 @@ fn netWriteFile(
 fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     for (sockets) |socket| {
-        closeFd(socket.handle);
-        if (ev.net_entries.fetchRemove(socket.handle)) |removed| {
+        ev.net_entries_lock.lock();
+        const removed_entry = ev.net_entries.fetchRemove(socket.handle);
+        if (removed_entry) |removed| assert(removed.value.owner == null);
+        ev.net_entries_lock.unlock();
+        if (removed_entry) |removed| {
+            // Closing a socket requires its users to have finished and
+            // released their batches, as it does on every other backend.
             netEntryTeardown(removed.value);
         }
+        // Remove and mark the old cache entry closed before the descriptor
+        // can be reused by a socket opened on another worker.
+        closeFd(socket.handle);
     }
 }
 
@@ -6764,7 +6336,7 @@ fn posixGetSockName(socket_fd: c.fd_t, addr: *posix.sockaddr, addr_len: *posix.s
     }
 }
 
-/// A socket wait owns a serial queue so readiness, timeout, and cancellation
+/// A readiness wait owns a serial queue so readiness, timeout, and cancellation
 /// choose one outcome. The fiber remains parked until every source's cancel
 /// handler has run; no callback may outlive the stack-allocated waiter.
 const WaitReadyWaiter = struct {
@@ -6860,7 +6432,7 @@ fn waitReadyTimeout(
     const source = c.dispatch.source_create(
         source_type,
         @bitCast(@as(isize, handle)),
-        .none,
+        if (source_type == c.dispatch.SOURCE_TYPE_PROC) .{ .PROC = .{ .EXIT = true } } else .none,
         queue,
     ) orelse return error.SystemResources;
     const timer = if (timeout == .none) null else c.dispatch.source_create(.TIMER, 0, .none, queue) orelse {
@@ -6890,16 +6462,29 @@ fn waitReadyTimeout(
 }
 
 /// Performs one nonblocking `readv` attempt on a socket.
-fn netReadOnce(handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || error{WouldBlock})!usize {
+fn netReadOnce(handle: c.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || error{WouldBlock})!net.Stream.ReadResult {
     var iovecs: [max_iovecs_len]iovec = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
     for (data) |buf| addBuf(false, &iovecs, &iovlen, &remaining, buf);
-    if (iovlen == 0) return 0;
+    if (iovlen == 0 and control.len == 0) return .{ .data_len = 0 };
     while (true) {
-        const rc = c.readv(handle, &iovecs, iovlen);
+        var msg: posix.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iovecs,
+            .iovlen = iovlen,
+            .control = if (control.len == 0) null else control.ptr,
+            .controllen = @intCast(control.len),
+            .flags = 0,
+        };
+        const rc = c.recvmsg(handle, &msg, 0);
         switch (c.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => return .{
+                .data_len = @intCast(rc),
+                .control_len = @intCast(msg.controllen),
+                .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+            },
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .INVAL => |err| return errnoBug(err),
@@ -6917,9 +6502,9 @@ fn netReadOnce(handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || erro
     }
 }
 
-fn netRead(ev: *Evented, handle: c.fd_t, data: [][]u8) (Io.Operation.NetRead.Error || Io.Cancelable)!usize {
+fn netRead(ev: *Evented, handle: c.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || Io.Cancelable)!net.Stream.ReadResult {
     try checkCancel(ev);
-    while (true) return netReadOnce(handle, data) catch |err| switch (err) {
+    while (true) return netReadOnce(handle, data, control) catch |err| switch (err) {
         error.WouldBlock => {
             try waitReady(ev, handle, .READ);
             continue;
@@ -6935,6 +6520,7 @@ fn netWriteOnce(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
+    control: []const u8,
 ) (Io.Operation.NetWrite.Error || error{WouldBlock})!usize {
     var iovecs: [max_iovecs_len]iovec_const = undefined;
     var iovlen: iovlen_t = 0;
@@ -6974,8 +6560,8 @@ fn netWriteOnce(
         .namelen = 0,
         .iov = &iovecs,
         .iovlen = @intCast(iovlen),
-        .control = null,
-        .controllen = 0,
+        .control = if (control.len == 0) null else control.ptr,
+        .controllen = @intCast(control.len),
         .flags = 0,
     };
     while (true) {
@@ -7013,9 +6599,10 @@ fn netWrite(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
+    control: []const u8,
 ) (Io.Operation.NetWrite.Error || Io.Cancelable)!usize {
     try checkCancel(ev);
-    while (true) return netWriteOnce(handle, header, data, splat) catch |err| switch (err) {
+    while (true) return netWriteOnce(handle, header, data, splat, control) catch |err| switch (err) {
         error.WouldBlock => {
             try waitReady(ev, handle, .WRITE);
             continue;
@@ -7260,24 +6847,6 @@ fn netReceive(
             else => |e| return .{ e, count },
         };
         return .{ null, count };
-    }
-}
-
-fn readAll(ev: *Evented, file: File, buffer: []u8) File.ReadStreamingError!void {
-    var index: usize = 0;
-    while (buffer.len - index != 0) {
-        const len = try ev.fileReadStreaming(file, &.{buffer[index..]});
-        if (len == 0) return error.EndOfStream;
-        index += len;
-    }
-}
-
-fn writeAll(ev: *Evented, file: File, buffer: []const u8) (File.Writer.Error || error{EndOfStream})!void {
-    var index: usize = 0;
-    while (buffer.len - index != 0) {
-        const len = try ev.fileWriteStreaming(file, &.{}, &.{buffer[index..]}, 1);
-        if (len == 0) return error.EndOfStream;
-        index += len;
     }
 }
 

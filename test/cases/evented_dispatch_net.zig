@@ -46,7 +46,7 @@ fn testTcpEcho(io: Io) !void {
         } });
         try batch.awaitAsync(io);
         const completion = batch.next().?;
-        const n = try completion.result.net_read;
+        const n = (try completion.result.net_read).data_len;
         if (n == 0) break :echo;
         var wbuf: [64]u8 = undefined;
         var writer = conn.writer(io, &wbuf);

@@ -13,8 +13,8 @@ fn idleReceive(io: Io, socket: *const Io.net.Socket) !void {
 }
 
 /// A future parked on a batch-tagged receive must acknowledge cancellation
-/// promptly, rather than waiting for the linked timeout to expire.
-fn testCancelLinkedReceive(io: Io) !void {
+/// promptly, rather than waiting for the receive deadline to expire.
+fn testCancelTimedReceive(io: Io) !void {
     const address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var socket = try address.bind(io, .{ .mode = .dgram });
     defer socket.close(io);
@@ -147,17 +147,92 @@ fn timedBatchRounds(io: Io) anyerror!void {
     }
 }
 
+/// One request races a sub-millisecond deadline at the same stack addresses.
+/// On expiry the datagram must remain available; every successful wait drains
+/// its timer before the next round overwrites the batch and request storage.
+fn singleRequestNearExpiry(io: Io) anyerror!void {
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = try address.bind(io, .{ .mode = .dgram });
+    defer socket.close(io);
+    const sender = try address.bind(io, .{ .mode = .dgram });
+    defer sender.close(io);
+    for (0..200) |round| {
+        var data: [32]u8 = undefined;
+        var messages: [1]Io.net.IncomingMessage = .{.init};
+        var storage: [1]Io.Operation.Storage = undefined;
+        var batch: Io.Batch = .init(&storage);
+        defer batch.cancel(io);
+        // A second operation that completes inline immediately reuses any
+        // request slot which was returned empty by cancellation/interruption.
+        _ = batch.add(.{ .net_receive = .{
+            .socket_handle = socket.handle,
+            .message_buffer = &messages,
+            .data_buffer = &data,
+            .flags = .{},
+        } });
+        const Send = struct {
+            fn run(io_: Io, fd: Io.net.Socket, target: Io.net.IpAddress, delay: i96) !void {
+                try io_.sleep(.fromNanoseconds(delay), .awake);
+                try fd.send(io_, &target, "near");
+            }
+        };
+        var send = try Io.concurrent(io, Send.run, .{ io, sender, socket.address, @as(i96, if (round % 2 == 0) 150000 else 450000) });
+        defer send.cancel(io) catch {};
+        batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromNanoseconds(300000), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+        if (batch.next()) |completion| {
+            const err, const count = completion.result.net_receive;
+            try std.testing.expectEqual(null, err);
+            try std.testing.expectEqual(1, count);
+            try std.testing.expectEqualStrings("near", messages[0].data);
+        } else {
+            batch.cancel(io);
+            try send.await(io);
+            // A result that wins during cancel remains a completion.
+            if (batch.next()) |completion| {
+                const err, const count = completion.result.net_receive;
+                try std.testing.expectEqual(null, err);
+                try std.testing.expectEqual(1, count);
+                try std.testing.expectEqualStrings("near", messages[0].data);
+            } else {
+                const received = try socket.receiveTimeout(io, &data, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+                try std.testing.expectEqualStrings("near", received.data);
+            }
+        }
+        try send.await(io);
+        batch.cancel(io);
+        _ = batch.add(.{ .net_receive = .{
+            .socket_handle = socket.handle,
+            .message_buffer = &messages,
+            .data_buffer = &data,
+            .flags = .{},
+        } });
+        try std.testing.expectError(error.Timeout, batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromNanoseconds(1000), .clock = .awake } }));
+        batch.cancel(io);
+        try std.testing.expectEqual(null, batch.next());
+        // Turn the recycled slot into an unsupported stream operation: no
+        // TCP placeholder may panic, and no previous timer may write to it.
+        _ = batch.add(.{ .net_write = .{ .socket_handle = socket.handle, .data = &.{""} } });
+        try batch.awaitAsync(io);
+        const unsupported = batch.next() orelse return error.MissingCompletion;
+        try std.testing.expectError(error.NetworkDown, unsupported.result.net_write);
+    }
+}
+
 pub fn main() !void {
     for ([_]usize{ 0, 3 }) |thread_limit| {
         var evented: Io.Uring = undefined;
         try evented.init(std.heap.page_allocator, .{ .thread_limit = thread_limit });
         defer evented.deinit();
         const io = evented.io();
-        try testCancelLinkedReceive(io);
+        try testCancelTimedReceive(io);
         try testCancelBatch(io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }, false);
         try testCancelBatch(io, .none, false);
         try testCancelBatch(io, .none, true);
         try testHandledCancel(io);
+        try singleRequestNearExpiry(io);
         var futures: [4]Io.Future(anyerror!void) = undefined;
         for (&futures) |*future| future.* = try Io.concurrent(io, timedBatchRounds, .{io});
         for (&futures) |*future| try future.await(io);

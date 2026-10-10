@@ -103,7 +103,9 @@ fn testProcesses(io: Io, dir: Io.Dir) !void {
     var cwd_before: [std.fs.max_path_bytes]u8 = undefined;
     const before = try std.process.currentPath(io, &cwd_before);
     try dir.symLink(io, "/bin/sh", "adapter-shell", .{});
-    var relative = try std.process.spawnPath(io, dir, .{
+    var relative = try std.process.spawn(io, .{
+        .exe = .{ .path = dir },
+        .cwd = .{ .dir = dir },
         .argv = &.{ "adapter-shell", "-c", "test -f payload" },
     });
     defer relative.kill(io);
@@ -112,7 +114,7 @@ fn testProcesses(io: Io, dir: Io.Dir) !void {
     const after = try std.process.currentPath(io, &cwd_after);
     try expectEqualStrings(cwd_before[0..before], cwd_after[0..after]);
     // A basename must resolve against dir, even if PATH contains that name.
-    try expectError(error.FileNotFound, std.process.spawnPath(io, dir, .{ .argv = &.{"sh"} }));
+    try expectError(error.FileNotFound, std.process.spawn(io, .{ .exe = .{ .path = dir }, .argv = &.{"sh"} }));
 
     var sleeper = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" } });
     sleeper.kill(io);
@@ -123,7 +125,9 @@ fn testProcesses(io: Io, dir: Io.Dir) !void {
     const pid = std.c.fork();
     try expect(pid >= 0);
     if (pid == 0) {
-        const err = std.process.replacePath(io, dir, .{
+        const err = std.process.replace(io, .{
+            .exe = .{ .path = dir },
+            .cwd = .{ .dir = dir },
             .argv = &.{ "adapter-shell", "-c", "test -f payload && exit 23" },
         });
         std.c._exit(if (err == error.FileNotFound) 98 else 99);
