@@ -4866,7 +4866,6 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
             .SUCCESS => {
                 // WAITID has observed a terminal child (and normally reaped
                 // it). Before this point cancellation must preserve ownership.
-                defer ev.childCleanup(child);
                 if (child.request_resource_usage_statistics) {
                     // NOWAIT left this already-terminal child unreaped. Finish
                     // that ownership transfer without a cancellation point.
@@ -4895,6 +4894,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
                         }
                     }
                 }
+                defer ev.childCleanup(child);
                 const status: u32 = @bitCast(info.fields.common.second.sigchld.status);
                 const code: linux.CLD = @fromBackingInt(@intCast(info.code));
                 return switch (code) {
