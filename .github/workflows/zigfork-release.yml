@@ -1,0 +1,96 @@
+# zigfork release workflow.
+# `zigfork assemble <config>` copies this file into build/<config> as
+# .github/workflows/zigfork-release.yml. Edit the copy in the zigfork repo, not
+# the one inside the zig tree.
+name: zigfork release
+
+on:
+  push:
+    branches: ["build/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: zigfork-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            os: macos-15
+          - target: x86_64-linux
+            os: ubuntu-24.04
+            wasm: true
+          - target: aarch64-linux
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0   # `git describe` needs the upstream version tags
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake ninja-build
+
+      - name: Resolve the upstream LLVM bundle
+        id: bundle
+        run: echo "name=$(bash .github/zigfork/build-release.sh --bundle-name ${{ matrix.target }})" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the LLVM bundle
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/deps/${{ steps.bundle.outputs.name }}
+          key: zigfork-bundle-${{ steps.bundle.outputs.name }}
+
+      - name: Build ${{ matrix.target }} release
+        run: bash .github/zigfork/build-release.sh ${{ matrix.target }}
+        env:
+          # The 3-vCPU macOS runners run the timer-heavy Group reuse
+          # regression ~5x slower than a workstation (Debug measured 117s
+          # vs ~26s locally); 120s killed a healthy ReleaseSafe run
+          # (zig release run 38097275401). Give release gates headroom.
+          ZIGFORK_TEST_TIMEOUT: "600"
+
+      - name: Build wasm32-wasi release
+        if: matrix.wasm
+        continue-on-error: true
+        run: bash .github/zigfork/build-wasm.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zig-${{ matrix.target }}
+          path: build-release/out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: publish release
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/zigfork/publish-release.sh dist

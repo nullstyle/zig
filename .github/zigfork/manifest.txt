@@ -1,0 +1,6 @@
+config stable
+base 7647adab80dd088f4de3610fd245915a912eb6ad 0.17.0
+base_ref 0.17.0
+tooling 5b6cefea0645e05487659291809cbf5fe35b6923
+release_version 0.17.0
+branch evented-0.17 ab6fa8873ff7a2d58709a6d0ef444c5115d7eae0 6
