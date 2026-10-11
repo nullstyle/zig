@@ -1636,6 +1636,28 @@ fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
     }
 }
 
+// Test-only injection at the real native timer allocation seam. Production
+// builds retain the direct dispatch_source_create call and no probe state.
+const FutexFailureProbe = struct {
+    const Mode = enum { no_cancel, before_failure, after_failure, pre_requested };
+    var active: ?*FutexFailureProbe = null;
+    ev: *Evented,
+    mode: Mode,
+    creates: usize = 0,
+    wakes: usize = 0,
+};
+
+fn createFutexTimer(waiter: *Futex.Waiter) ?c.dispatch.source_t {
+    if (builtin.is_test) {
+        if (FutexFailureProbe.active) |probe| {
+            probe.creates += 1;
+            if (probe.mode == .before_failure) waiter.sleeper.fiber.requestCancel(probe.ev);
+            return null;
+        }
+    }
+    return c.dispatch.source_create(.TIMER, 0, .none, waiter.futex.queue);
+}
+
 const Futex = struct {
     num_waiters: usize,
     queue: c.dispatch.queue_t,
@@ -1660,8 +1682,8 @@ const Futex = struct {
             _ = @atomicRmw(usize, &futex.num_waiters, .Add, 1, .acquire);
             waiter.tryAdd() catch |err| switch (err) {
                 error.CancelRequested => {
-                    wake(waiter);
                     assert(@atomicRmw(usize, &futex.num_waiters, .Sub, 1, .monotonic) >= 1);
+                    wake(waiter);
                 },
             };
         }
@@ -1671,12 +1693,19 @@ const Futex = struct {
                 return error.CancelRequested;
             try waiter.cancelable.enter(waiter.sleeper.fiber);
             const futex = waiter.futex;
+            // Cancellation may already have queued its callback. Give that
+            // callback a valid node before any subsequent allocation can fail.
+            futex.waiters.append(&waiter.node);
             switch (waiter.timeout) {
                 .FOREVER => {},
                 else => |timeout| {
-                    const timer = c.dispatch.source_create(.TIMER, 0, .none, futex.queue) orelse {
+                    const timer = createFutexTimer(waiter) orelse {
                         log.warn("failed to create timer for futex timeout", .{});
-                        return error.CancelRequested;
+                        // Treat resource failure as a permitted spurious wake.
+                        // If cancellation won, its serial-queue callback owns
+                        // removal and wakeup; do not publish a second wake.
+                        waiter.tryRemove() catch return;
+                        return;
                     };
                     timer.as_object().set_context(waiter);
                     timer.set_event_handler(&timedOut);
@@ -1686,25 +1715,20 @@ const Futex = struct {
                     waiter.timer = timer;
                 },
             }
-            futex.waiters.append(&waiter.node);
         }
 
         fn canceled(context: ?*anyopaque) callconv(.c) void {
             const cancelable: *Cancelable = @ptrCast(@alignCast(context));
             const waiter: *Waiter = @fieldParentPtr("cancelable", cancelable);
             cancelable.requested(waiter.sleeper.fiber);
-            const futex = waiter.futex;
             waiter.remove();
-            assert(@atomicRmw(usize, &futex.num_waiters, .Sub, 1, .monotonic) >= 1);
         }
 
         fn timedOut(context: ?*anyopaque) callconv(.c) void {
             const waiter: *Waiter = @ptrCast(@alignCast(context));
-            const futex = waiter.futex;
             waiter.tryRemove() catch |err| switch (err) {
                 error.CancelRequested => return,
             };
-            assert(@atomicRmw(usize, &futex.num_waiters, .Sub, 1, .monotonic) >= 1);
         }
 
         fn tryRemove(waiter: *Waiter) Cancelable.RequestedError!void {
@@ -1713,12 +1737,21 @@ const Futex = struct {
         }
 
         fn remove(waiter: *Waiter) void {
-            waiter.futex.waiters.remove(&waiter.node);
+            const futex = waiter.futex;
+            futex.waiters.remove(&waiter.node);
+            // Release the waiter count before the fiber can resume/deinit.
+            assert(@atomicRmw(usize, &futex.num_waiters, .Sub, 1, .monotonic) >= 1);
             if (waiter.timer) |timer| timer.cancel() else wake(waiter);
         }
 
         fn wake(context: ?*anyopaque) callconv(.c) void {
             const waiter: *Waiter = @ptrCast(@alignCast(context));
+            if (builtin.is_test) {
+                if (FutexFailureProbe.active) |probe| {
+                    probe.wakes += 1;
+                    if (probe.mode == .after_failure) waiter.sleeper.fiber.requestCancel(probe.ev);
+                }
+            }
             if (waiter.timer) |timer| timer.as_object().release();
             Sleeper.wake(&waiter.sleeper);
         }
@@ -1750,7 +1783,6 @@ const Futex = struct {
                 };
                 num_removed += 1;
             }
-            assert(@atomicRmw(usize, &futex.num_waiters, .Sub, num_removed, .monotonic) >= num_removed);
 
             var sleeper = waker.sleeper;
             waker.* = undefined;
@@ -6983,5 +7015,58 @@ test "Dispatch socket wait timeout and readiness race" {
             error.Timeout => {},
             else => return err,
         };
+    }
+}
+
+test "Dispatch futex timer allocation failure drains cancellation ownership" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const Task = struct {
+        fn run(probe: *FutexFailureProbe) !void {
+            const ev_io = probe.ev.io();
+            const fiber = Thread.current().currentFiber();
+            var word: u32 = 0;
+            if (probe.mode == .pre_requested) fiber.requestCancel(probe.ev);
+            const result = ev_io.futexWaitTimeout(u32, &word, 0, .{
+                .duration = .{ .raw = .fromSeconds(10), .clock = .awake },
+            });
+            if (probe.mode == .no_cancel) {
+                try result;
+            } else if (probe.mode == .after_failure) {
+                try result;
+                try std.testing.expectError(error.Canceled, ev_io.checkCancel());
+            } else try std.testing.expectError(error.Canceled, result);
+            const registered = @atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .acquire).awaiting != .nothing;
+            std.debug.print("futex injection {t}: registered={} creates={d} wakes={d}\n", .{ probe.mode, registered, probe.creates, probe.wakes });
+            try std.testing.expect(!registered);
+            try std.testing.expectEqual(@as(usize, 1), probe.wakes);
+            try std.testing.expectEqual(@as(usize, if (probe.mode == .pre_requested) 0 else 1), probe.creates);
+            const futex = probe.ev.futexForAddress(@intFromPtr(&word));
+            try std.testing.expectEqual(@as(usize, 0), @atomicLoad(usize, &futex.num_waiters, .acquire));
+            try std.testing.expect(futex.waiters.first == null and futex.waiters.last == null);
+            FutexFailureProbe.active = null;
+            try Io.sleep(ev_io, .fromMilliseconds(1), .awake);
+            // Same stack slot, now with a real timer. A timed wake and a value
+            // mismatch must both be usable after the failed registration.
+            try ev_io.futexWaitTimeout(u32, &word, 0, .{
+                .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+            });
+            word = 1;
+            try ev_io.futexWait(u32, &word, 0);
+            var group: Io.Group = .init;
+            try group.concurrent(ev_io, Io.sleep, .{ ev_io, Io.Duration.fromMilliseconds(1), Io.Clock.awake });
+            try group.await(ev_io);
+        }
+    };
+    for (std.enums.values(FutexFailureProbe.Mode)) |mode| {
+        for (0..16) |_| {
+            var ev: Evented = undefined;
+            try ev.init(std.heap.page_allocator, .{ .leeway = .zero });
+            defer ev.deinit();
+            var probe: FutexFailureProbe = .{ .ev = &ev, .mode = mode };
+            FutexFailureProbe.active = &probe;
+            defer FutexFailureProbe.active = null;
+            var task = Io.async(ev.io(), Task.run, .{&probe});
+            try task.await(ev.io());
+        }
     }
 }
