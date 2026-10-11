@@ -880,13 +880,17 @@ pub const UnixAddress = struct {
 
     pub const max_len = switch (native_os) {
         .windows => std.os.windows.PATH_MAX_WIDE,
-        else => 108,
+        else => @sizeOf(@FieldType(std.posix.sockaddr.un, "path")),
     };
 
     pub const InitError = error{NameTooLong};
 
     pub fn init(p: []const u8) InitError!UnixAddress {
         if (p.len > max_len) return error.NameTooLong;
+        // Filesystem names need room for their terminator. Linux abstract
+        // names use all available bytes, including their leading NUL.
+        if (native_os != .windows and p.len == max_len and
+            !(native_os == .linux and p.len > 0 and p[0] == 0)) return error.NameTooLong;
         return .{ .path = p };
     }
 
@@ -1312,9 +1316,10 @@ pub const Stream = struct {
         control_len: usize = 0,
         /// Whether only some of the control data was received.
         ///
-        /// When control data is truncated, the extra data essentially
-        /// disappears into the ether. This is indicative of a design problem,
-        /// such as the control buffer being too small.
+        /// A backend may discard an incomplete control message. Undelivered
+        /// SCM_RIGHTS descriptors are closed; ownership of descriptors in
+        /// complete returned messages transfers to the caller. Received
+        /// descriptors have CLOEXEC set (Darwin sets it after recvmsg).
         control_truncated: bool = false,
     };
 
@@ -1574,7 +1579,10 @@ pub const cmsg = struct {
         pub fn next(it: *Iterator) ?Message {
             if (it.control.len < @sizeOf(cmsghdr)) return null;
             const header: *align(cmsg_align) cmsghdr = @ptrCast(it.control.ptr);
-            if (it.control.len < header.len) return null;
+            if (header.len < len(0) or it.control.len < header.len) {
+                it.control = &.{};
+                return null;
+            }
             const next_header = std.mem.alignForward(usize, header.len, cmsg_align);
             if (it.control.len < next_header) {
                 it.control = &.{};
@@ -1585,6 +1593,23 @@ pub const cmsg = struct {
         }
     };
 };
+
+test "cmsg.Iterator rejects invalid advertised lengths" {
+    if (comptime native_os == .windows or native_os == .wasi) return error.SkipZigTest;
+    var control: [cmsg.space(8)]u8 align(cmsg_align) = @splat(0);
+    const header: *align(cmsg_align) std.posix.cmsghdr = @ptrCast(&control);
+    for ([_]@FieldType(std.posix.cmsghdr, "len"){ 0, 1, cmsg.len(0) - 1, control.len + 1, std.math.maxInt(@FieldType(std.posix.cmsghdr, "len")) }) |length| {
+        header.* = .{ .len = length, .level = 0, .type = 0 };
+        var iterator: cmsg.Iterator = .{ .control = &control };
+        try std.testing.expectEqual(null, iterator.next());
+        try std.testing.expectEqual(null, iterator.next());
+    }
+    header.len = cmsg.len(0);
+    var iterator: cmsg.Iterator = .{ .control = control[0..cmsg.len(0)] };
+    const message = iterator.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), message.data.len);
+    try std.testing.expectEqual(null, iterator.next());
+}
 
 pub const Server = struct {
     socket: Socket,

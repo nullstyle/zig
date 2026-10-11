@@ -34,6 +34,7 @@ const splat_buffer_size = Io.Threaded.splat_buffer_size;
 const statFromPosix = Io.Threaded.statFromPosix;
 const statusToTerm = Io.Threaded.statusToTerm;
 const std = @import("std");
+const PosixControl = @import("PosixControl.zig");
 const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
 const UseSendfile = Io.Threaded.UseSendfile;
@@ -6513,6 +6514,8 @@ fn waitReadyTimeout(
 
 /// Performs one nonblocking `readv` attempt on a socket.
 fn netReadOnce(handle: c.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || error{WouldBlock})!net.Stream.ReadResult {
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(control);
     var iovecs: [max_iovecs_len]iovec = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
@@ -6524,22 +6527,27 @@ fn netReadOnce(handle: c.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRea
             .namelen = 0,
             .iov = &iovecs,
             .iovlen = iovlen,
-            .control = if (control.len == 0) null else control.ptr,
-            .controllen = @intCast(control.len),
+            .control = if (receive_control.len == 0) null else receive_control.ptr,
+            .controllen = @intCast(receive_control.len),
             .flags = 0,
         };
         const rc = c.recvmsg(handle, &msg, 0);
         switch (c.errno(rc)) {
-            .SUCCESS => return .{
-                .data_len = @intCast(rc),
-                .control_len = @intCast(msg.controllen),
-                .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+            .SUCCESS => {
+                const ctl = try PosixControl.Receive.finish(control, receive_control, msg.controllen, msg.flags);
+                return .{
+                    .data_len = @intCast(rc),
+                    .control_len = ctl.len,
+                    .control_truncated = ctl.truncated,
+                };
             },
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .INVAL => |err| return errnoBug(err),
             .FAULT => |err| return errnoBug(err),
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
             .NOBUFS => return error.SystemResources,
             .NOMEM => return error.SystemResources,
             .NOTCONN => return error.SocketUnconnected,
@@ -6572,6 +6580,7 @@ fn netWriteOnce(
     splat: usize,
     control: []const u8,
 ) (Io.Operation.NetWrite.Error || error{WouldBlock})!usize {
+    try PosixControl.checkLength(control.len);
     var iovecs: [max_iovecs_len]iovec_const = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
@@ -6622,6 +6631,7 @@ fn netWriteOnce(
             .AGAIN => return error.WouldBlock,
             .ALREADY => return error.FastOpenAlreadyInProgress,
             .CONNRESET => return error.ConnectionResetByPeer,
+            .MSGSIZE => return error.InvalidControlMessage,
             .NOBUFS => return error.SystemResources,
             .NOMEM => return error.SystemResources,
             .PIPE => return error.SocketUnconnected,
@@ -6631,10 +6641,10 @@ fn netWriteOnce(
             .NOTCONN => return error.SocketUnconnected,
             .TIMEDOUT => return error.ConnectionTimedOut,
             .NETDOWN => return error.NetworkDown,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
             .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+            .INVAL => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // Invalid argument passed.
             .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
             .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| return errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
@@ -6669,6 +6679,7 @@ fn netSendOne(
     message: *net.OutgoingMessage,
     flags: u32,
 ) (Io.Operation.NetSend.Error || error{WouldBlock})!void {
+    try PosixControl.checkLength(message.control.len);
     var addr: Io.Threaded.PosixAddress = undefined;
     var iov: iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
     const msg: posix.msghdr_const = .{
@@ -6703,10 +6714,10 @@ fn netSendOne(
             .NOTCONN => return error.SocketUnconnected,
             .TIMEDOUT => return error.ConnectionTimedOut,
             .NETDOWN => return error.NetworkDown,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
             .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+            .INVAL => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err), // Invalid argument passed.
             .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
             .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| return errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
@@ -6786,11 +6797,14 @@ fn netReceiveOnce(
     flags: net.ReceiveFlags,
 ) (Io.Operation.NetReceive.Error || error{WouldBlock})!void {
     const posix_flags: u32 =
+        @as(u32, if (@hasDecl(posix.MSG, "CMSG_CLOEXEC")) posix.MSG.CMSG_CLOEXEC else 0) |
         @as(u32, if (flags.oob) posix.MSG.OOB else 0) |
         @as(u32, if (flags.peek) posix.MSG.PEEK else 0) |
         @as(u32, if (flags.trunc) posix.MSG.TRUNC else 0) |
         posix.MSG.NOSIGNAL;
 
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(message.control);
     var storage: Io.Threaded.PosixAddress = undefined;
     var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
     var msg: posix.msghdr = .{
@@ -6798,23 +6812,24 @@ fn netReceiveOnce(
         .namelen = @sizeOf(Io.Threaded.PosixAddress),
         .iov = (&iov)[0..1],
         .iovlen = 1,
-        .control = message.control.ptr,
-        .controllen = @intCast(message.control.len),
+        .control = if (receive_control.len == 0) null else receive_control.ptr,
+        .controllen = @intCast(receive_control.len),
         .flags = undefined,
     };
     while (true) {
         const rc = c.recvmsg(handle, &msg, posix_flags);
         switch (c.errno(rc)) {
             .SUCCESS => {
+                const ctl = try PosixControl.Receive.finish(message.control, receive_control, msg.controllen, msg.flags);
                 const data = data_buffer[0..@intCast(rc)];
                 message.* = .{
                     .from = Io.Threaded.addressFromPosix(&storage),
                     .data = data,
-                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .control = message.control[0..ctl.len],
                     .flags = .{
                         .eor = (msg.flags & posix.MSG.EOR) != 0,
                         .trunc = (msg.flags & posix.MSG.TRUNC) != 0,
-                        .ctrunc = (msg.flags & posix.MSG.CTRUNC) != 0,
+                        .ctrunc = ctl.truncated,
                         .oob = (msg.flags & posix.MSG.OOB) != 0,
                         .errqueue = if (@hasDecl(posix.MSG, "ERRQUEUE")) (msg.flags & posix.MSG.ERRQUEUE) != 0 else false,
                     },

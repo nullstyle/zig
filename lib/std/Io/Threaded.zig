@@ -1,3 +1,4 @@
+const PosixControl = @import("PosixControl.zig");
 const Threaded = @This();
 
 const builtin = @import("builtin");
@@ -12921,6 +12922,8 @@ fn netRead(socket_handle: net.Socket.Handle, data: [][]u8, control: []u8) net.St
 }
 
 fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.Reader.Error!net.Stream.ReadResult {
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(control);
     var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
     var i: usize = 0;
     for (data) |buf| {
@@ -12953,6 +12956,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
                         .FAULT => |err| return errnoBug(err),
                         .AGAIN => |err| return errnoBug(err),
                         .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                        .MFILE => return error.ProcessFdQuotaExceeded,
+                        .NFILE => return error.SystemFdQuotaExceeded,
                         .NOBUFS => return error.SystemResources,
                         .NOMEM => return error.SystemResources,
                         .NOTCONN => return error.SocketUnconnected,
@@ -12971,8 +12976,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
         .namelen = 0,
         .iov = dest.ptr,
         .iovlen = @intCast(dest.len),
-        .control = control.ptr,
-        .controllen = @intCast(control.len),
+        .control = if (receive_control.len == 0) null else receive_control.ptr,
+        .controllen = @intCast(receive_control.len),
         .flags = 0,
     };
 
@@ -12986,10 +12991,11 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
+                const ctl = try PosixControl.Receive.finish(control, receive_control, rc_control, msg.flags);
                 return .{
                     .data_len = @intCast(rc),
-                    .control_len = @intCast(rc_control),
-                    .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+                    .control_len = ctl.len,
+                    .control_truncated = ctl.truncated,
                 };
             },
             .INTR => {
@@ -13003,6 +13009,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
                     .FAULT => |err| return errnoBug(err),
                     .AGAIN => |err| return errnoBug(err),
                     .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                    .MFILE => return error.ProcessFdQuotaExceeded,
+                    .NFILE => return error.SystemFdQuotaExceeded,
                     .NOBUFS => return error.SystemResources,
                     .NOMEM => return error.SystemResources,
                     .NOTCONN => return error.SocketUnconnected,
@@ -13135,6 +13143,7 @@ fn netSendOnePosix(
     flags: u32,
 ) (net.Socket.SendError || error{WouldBlock})!void {
     _ = t;
+    try PosixControl.checkLength(message.control.len);
     var addr: PosixAddress = undefined;
     var iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
     const msg: posix.msghdr_const = .{
@@ -13174,10 +13183,10 @@ fn netSendOnePosix(
             .NOTCONN => return syscall.fail(error.SocketUnconnected),
             .TIMEDOUT => return syscall.fail(error.ConnectionTimedOut),
             .NETDOWN => return syscall.fail(error.NetworkDown),
-            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (message.control.len != 0) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return syscall.errnoBug(err),
             .FAULT => |err| return syscall.errnoBug(err),
-            .INVAL => |err| return syscall.errnoBug(err),
+            .INVAL => |err| return if (message.control.len != 0) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err),
             .ISCONN => |err| return syscall.errnoBug(err),
             .NOTSOCK => |err| return syscall.errnoBug(err),
             .OPNOTSUPP => |err| return syscall.errnoBug(err),
@@ -13201,6 +13210,7 @@ fn netSendManyPosix(
     const clamped_iovecs = (&iovecs_buffer)[0..min_len];
 
     for (clamped_messages, clamped_msgs, clamped_addrs, clamped_iovecs) |*message, *msg, *addr, *iovec| {
+        try PosixControl.checkLength(message.control.len);
         iovec.* = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
         msg.* = .{
             .hdr = .{
@@ -13216,6 +13226,9 @@ fn netSendManyPosix(
         };
     }
 
+    const has_control = for (clamped_messages) |message| {
+        if (message.control.len != 0) break true;
+    } else false;
     const syscall: Syscall = try .start();
     while (true) {
         const rc = posix.system.sendmmsg(socket_handle, clamped_msgs.ptr, @intCast(clamped_msgs.len), flags);
@@ -13247,10 +13260,10 @@ fn netSendManyPosix(
             .TIMEDOUT => return syscall.fail(error.ConnectionTimedOut),
             .NETDOWN => return syscall.fail(error.NetworkDown),
 
-            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (has_control) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return syscall.errnoBug(err), // The socket is not connection-mode, and no peer address is set.
             .FAULT => |err| return syscall.errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| return syscall.errnoBug(err), // Invalid argument passed.
+            .INVAL => |err| return if (has_control) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // Invalid argument passed.
             .ISCONN => |err| return syscall.errnoBug(err), // connection-mode socket was connected already but a recipient was specified
             .NOTSOCK => |err| return syscall.errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| return syscall.errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
@@ -13274,11 +13287,14 @@ pub fn netReceivePosix(
     //   the split vectors though because reducing the buffer size might make
     //   some messages unreceivable.
     const posix_flags: u32 =
+        @as(u32, if (@hasDecl(posix.MSG, "CMSG_CLOEXEC")) posix.MSG.CMSG_CLOEXEC else 0) |
         @as(u32, if (flags.oob) posix.MSG.OOB else 0) |
         @as(u32, if (flags.peek) posix.MSG.PEEK else 0) |
         @as(u32, if (flags.trunc) posix.MSG.TRUNC else 0) |
         @as(u32, if (nonblocking) posix.MSG.DONTWAIT else 0);
 
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(message.control);
     var storage: PosixAddress = undefined;
     var iov: posix.iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
     var msg: posix.msghdr = .{
@@ -13286,8 +13302,8 @@ pub fn netReceivePosix(
         .namelen = @sizeOf(PosixAddress),
         .iov = (&iov)[0..1],
         .iovlen = 1,
-        .control = message.control.ptr,
-        .controllen = @intCast(message.control.len),
+        .control = if (receive_control.len == 0) null else receive_control.ptr,
+        .controllen = @intCast(receive_control.len),
         .flags = 0,
     };
 
@@ -13297,15 +13313,16 @@ pub fn netReceivePosix(
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
+                const ctl = try PosixControl.Receive.finish(message.control, receive_control, msg.controllen, msg.flags);
                 const data = data_buffer[0..@intCast(rc)];
                 message.* = .{
                     .from = addressFromPosix(&storage),
                     .data = data,
-                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .control = message.control[0..ctl.len],
                     .flags = .{
                         .eor = (msg.flags & posix.MSG.EOR) != 0,
                         .trunc = (msg.flags & posix.MSG.TRUNC) != 0,
-                        .ctrunc = (msg.flags & posix.MSG.CTRUNC) != 0,
+                        .ctrunc = ctl.truncated,
                         .oob = (msg.flags & posix.MSG.OOB) != 0,
                         .errqueue = if (@hasDecl(posix.MSG, "ERRQUEUE")) (msg.flags & posix.MSG.ERRQUEUE) != 0 else false,
                     },
@@ -13413,6 +13430,7 @@ fn netWritePosix(
 ) net.Stream.Writer.Error!usize {
     if (!have_networking) return error.NetworkDown;
 
+    try PosixControl.checkLength(control.len);
     var iovecs: [max_iovecs_len]posix.iovec_const = undefined;
     var msg: posix.msghdr_const = .{
         .name = null,
@@ -13472,13 +13490,13 @@ fn netWritePosix(
                     .ACCES => |err| return errnoBug(err),
                     .AGAIN => |err| return errnoBug(err),
                     .ALREADY => return error.FastOpenAlreadyInProgress,
-                    .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                    .BADF => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
                     .CONNRESET => return error.ConnectionResetByPeer,
                     .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
                     .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
-                    .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+                    .INVAL => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // Invalid argument passed.
                     .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
-                    .MSGSIZE => |err| return errnoBug(err),
+                    .MSGSIZE => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err),
                     .NOBUFS => return error.SystemResources,
                     .NOMEM => return error.SystemResources,
                     .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
@@ -14419,7 +14437,8 @@ pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posi
     // With the AFD API, `sockaddr.un` is purely informational, so
     // use a suffix which is usually the most relevant part of a path.
     @memcpy(storage.un.path[0..path_len], a.path[a.path.len - path_len ..]);
-    if (storage.un.path.len - path_len > 0) {
+    const abstract = native_os == .linux and a.isAbstract();
+    if (!abstract and storage.un.path.len - path_len > 0) {
         @branchHint(.likely);
         storage.un.path[path_len] = 0;
         path_len += 1;
@@ -14429,7 +14448,11 @@ pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posi
             if (storage.un.path[0] == 0) @memset(storage.un.path[path_len..], 0);
             return @sizeOf(posix.sockaddr.un);
         },
-        else => return @intCast(@offsetOf(posix.sockaddr.un, "path") + path_len),
+        else => {
+            const length: posix.socklen_t = @intCast(@offsetOf(posix.sockaddr.un, "path") + path_len);
+            if (@hasField(posix.sockaddr.un, "len")) storage.un.len = @intCast(length);
+            return length;
+        },
     }
 }
 

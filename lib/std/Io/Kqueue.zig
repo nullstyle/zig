@@ -4,6 +4,7 @@
 //! are unsupported. Finish or cancel socket operations before closing their
 //! sockets through the same Io instance.
 
+const PosixControl = @import("PosixControl.zig");
 const Kqueue = @This();
 const builtin = @import("builtin");
 
@@ -1746,6 +1747,7 @@ fn netSendOne(
     message: *net.OutgoingMessage,
     flags: u32,
 ) net.Socket.SendError!void {
+    try PosixControl.checkLength(message.control.len);
     var addr: Io.Threaded.PosixAddress = undefined;
     var message_iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
     const msg: posix.msghdr_const = .{
@@ -1772,11 +1774,11 @@ fn netSendOne(
 
             .ACCES => return error.AccessDenied,
             .ALREADY => return error.FastOpenAlreadyInProgress,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
             .CONNRESET => return error.ConnectionResetByPeer,
             .DESTADDRREQ => |err| return errnoBug(err),
             .FAULT => |err| return errnoBug(err),
-            .INVAL => |err| return errnoBug(err),
+            .INVAL => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err),
             .ISCONN => |err| return errnoBug(err),
             .MSGSIZE => return error.MessageOversize,
             .NOBUFS => return error.SystemResources,
@@ -1811,6 +1813,7 @@ fn netSendManyNonblocking(
 }
 
 fn netSendOneNonblocking(handle: net.Socket.Handle, message: *net.OutgoingMessage, flags: u32) (net.Socket.SendError || error{WouldBlock})!void {
+    try PosixControl.checkLength(message.control.len);
     var addr: Io.Threaded.PosixAddress = undefined;
     var message_iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
     const msg: posix.msghdr_const = .{
@@ -1834,11 +1837,11 @@ fn netSendOneNonblocking(handle: net.Socket.Handle, message: *net.OutgoingMessag
             .AGAIN => return error.WouldBlock,
             .ACCES => return error.AccessDenied,
             .ALREADY => return error.FastOpenAlreadyInProgress,
-            .BADF => |err| return errnoBug(err),
+            .BADF => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err),
             .CONNRESET => return error.ConnectionResetByPeer,
             .DESTADDRREQ => |err| return errnoBug(err),
             .FAULT => |err| return errnoBug(err),
-            .INVAL => |err| return errnoBug(err),
+            .INVAL => |err| return if (message.control.len != 0) error.InvalidControlMessage else errnoBug(err),
             .ISCONN => |err| return errnoBug(err),
             .MSGSIZE => return error.MessageOversize,
             .NOBUFS => return error.SystemResources,
@@ -2004,6 +2007,8 @@ const splat_buffer_size = Io.Threaded.splat_buffer_size;
 
 /// Performs one nonblocking `recvmsg` attempt, preserving ancillary metadata.
 fn netReadOnce(handle: posix.fd_t, data: [][]u8, control: []u8) (Io.Operation.NetRead.Error || error{WouldBlock})!net.Stream.ReadResult {
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(control);
     var iovecs: [max_iovecs_len]iovec = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
@@ -2015,23 +2020,28 @@ fn netReadOnce(handle: posix.fd_t, data: [][]u8, control: []u8) (Io.Operation.Ne
             .namelen = 0,
             .iov = &iovecs,
             .iovlen = @intCast(iovlen),
-            .control = if (control.len == 0) null else control.ptr,
-            .controllen = @intCast(control.len),
+            .control = if (receive_control.len == 0) null else receive_control.ptr,
+            .controllen = @intCast(receive_control.len),
             .flags = 0,
         };
         const flags = if (@hasDecl(posix.MSG, "CMSG_CLOEXEC")) posix.MSG.CMSG_CLOEXEC else 0;
         const rc = posix.system.recvmsg(handle, &msg, flags);
         switch (posix.errno(rc)) {
-            .SUCCESS => return .{
-                .data_len = @intCast(rc),
-                .control_len = @intCast(msg.controllen),
-                .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+            .SUCCESS => {
+                const ctl = try PosixControl.Receive.finish(control, receive_control, msg.controllen, msg.flags);
+                return .{
+                    .data_len = @intCast(rc),
+                    .control_len = ctl.len,
+                    .control_truncated = ctl.truncated,
+                };
             },
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .INVAL => |err| return errnoBug(err),
             .FAULT => |err| return errnoBug(err),
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
             .NOBUFS => return error.SystemResources,
             .NOMEM => return error.SystemResources,
             .NOTCONN => return error.SocketUnconnected,
@@ -2066,6 +2076,7 @@ fn netWriteOnce(
     splat: usize,
     control: []const u8,
 ) (Io.Operation.NetWrite.Error || error{WouldBlock})!usize {
+    try PosixControl.checkLength(control.len);
     var iovecs: [max_iovecs_len]iovec_const = undefined;
     var iovlen: iovlen_t = 0;
     var remaining: Io.Limit = .unlimited;
@@ -2116,6 +2127,7 @@ fn netWriteOnce(
             .AGAIN => return error.WouldBlock,
             .ALREADY => return error.FastOpenAlreadyInProgress,
             .CONNRESET => return error.ConnectionResetByPeer,
+            .MSGSIZE => return error.InvalidControlMessage,
             .NOBUFS => return error.SystemResources,
             .NOMEM => return error.SystemResources,
             .PIPE => return error.SocketUnconnected,
@@ -2125,10 +2137,10 @@ fn netWriteOnce(
             .NOTCONN => return error.SocketUnconnected,
             .TIMEDOUT => return error.ConnectionTimedOut,
             .NETDOWN => return error.NetworkDown,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
             .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+            .INVAL => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // Invalid argument passed.
             .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
             .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| return errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.

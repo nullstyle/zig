@@ -349,6 +349,8 @@ pub const Operation = union(enum) {
         flags: net.ReceiveFlags,
 
         pub const Error = error{
+            /// The ancillary buffer length or message contents are invalid.
+            InvalidControlMessage,
             /// Insufficient memory or other resource internal to the operating system.
             SystemResources,
             /// Per-process limit on the number of open file descriptors has been reached.
@@ -387,6 +389,8 @@ pub const Operation = union(enum) {
         flags: net.SendFlags,
 
         pub const Error = error{
+            /// The ancillary buffer length or message contents are invalid.
+            InvalidControlMessage,
             /// The socket type requires that message be sent atomically, and the
             /// size of the message to be sent made this impossible. The message
             /// was not transmitted, or was partially transmitted.
@@ -433,7 +437,11 @@ pub const Operation = union(enum) {
         control: []u8 = &.{},
 
         pub const Error = error{
+            /// The ancillary buffer length or message contents are invalid.
+            InvalidControlMessage,
             SystemResources,
+            ProcessFdQuotaExceeded,
+            SystemFdQuotaExceeded,
             ConnectionResetByPeer,
             SocketUnconnected,
             /// File descriptor does not hold the required rights to read from it.
@@ -455,6 +463,8 @@ pub const Operation = union(enum) {
         control: []const u8 = &.{},
 
         pub const Error = error{
+            /// The ancillary buffer length or message contents are invalid.
+            InvalidControlMessage,
             /// Another TCP Fast Open is already in progress.
             FastOpenAlreadyInProgress,
             /// Network session was unexpectedly closed by recipient.

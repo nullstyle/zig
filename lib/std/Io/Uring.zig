@@ -4,6 +4,7 @@
 //! Finish or cancel socket operations before closing their socket with the same Io.
 //! Networking currently supports UDP bind/send/receive; stream/TCP/Unix operations,
 //! socket pairs, file sends, interface lookup, and DNS resolution are unavailable.
+const PosixControl = @import("PosixControl.zig");
 const addressFromPosix = Io.Threaded.addressFromPosix;
 const addressToPosix = Io.Threaded.addressToPosix;
 const Alignment = std.mem.Alignment;
@@ -2834,7 +2835,7 @@ fn batchDrainReady(ev: *Evented, batch: *Io.Batch) Io.Timeout.Error!void {
                     break :result .{ .net_send = switch (completion.errno()) {
                         .SUCCESS => context.complete(@intCast(completion.result)),
                         .CANCELED, .INTR, .AGAIN => break :result null,
-                        else => |err| .{ sendErrno(err), 0 },
+                        else => |err| .{ sendErrno(err, context.messages[0].control.len != 0), 0 },
                     } };
                 },
                 .net_read => unreachable, // Unsupported stream operations complete inline.
@@ -5362,7 +5363,7 @@ fn timeoutSpec(timeout: Io.Timeout) ?TimeoutSpec {
 
 /// Message flags shared by every receive path.
 fn posixReceiveFlags(flags: net.ReceiveFlags) u32 {
-    return linux.MSG.NOSIGNAL |
+    return linux.MSG.NOSIGNAL | linux.MSG.CMSG_CLOEXEC |
         @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
         @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
         @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0);
@@ -5386,7 +5387,7 @@ fn incomingFromMsghdr(
     message.* = .{
         .from = addressFromPosix(storage),
         .data = data,
-        .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+        .control = message.control[0..@min(message.control.len, msg.controllen)],
         .flags = .{
             .eor = msg.flags & linux.MSG.EOR != 0,
             .trunc = msg.flags & linux.MSG.TRUNC != 0,
@@ -5418,7 +5419,7 @@ fn receiveErrno(err: linux.E) Io.Operation.NetReceive.Error {
     };
 }
 
-fn sendErrno(err: linux.E) Io.Operation.NetSend.Error {
+fn sendErrno(err: linux.E, has_control: bool) Io.Operation.NetSend.Error {
     return switch (err) {
         .ACCES => error.AccessDenied,
         .ALREADY => error.FastOpenAlreadyInProgress,
@@ -5433,10 +5434,10 @@ fn sendErrno(err: linux.E) Io.Operation.NetSend.Error {
         .NOTCONN => error.SocketUnconnected,
         .TIMEDOUT => error.ConnectionTimedOut,
         .NETDOWN => error.NetworkDown,
-        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .BADF => |e| if (has_control) error.InvalidControlMessage else errnoBug(e), // File descriptor used after closed.
         .DESTADDRREQ => |e| errnoBug(e), // Not connection-mode and no peer address set.
         .FAULT => |e| errnoBug(e),
-        .INVAL => |e| errnoBug(e),
+        .INVAL => |e| if (has_control) error.InvalidControlMessage else errnoBug(e),
         .ISCONN => |e| errnoBug(e), // Connected socket but a recipient was specified.
         .NOTSOCK => |e| errnoBug(e),
         .OPNOTSUPP => |e| errnoBug(e), // A flag is inappropriate for the socket type.
@@ -5452,6 +5453,7 @@ fn recvmsgNonblocking(
     data_buffer: []u8,
     posix_flags: u32,
 ) (Io.Operation.NetReceive.Error || error{WouldBlock})!void {
+    try PosixControl.checkLength(message.control.len);
     var storage: PosixAddress = undefined;
     var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
     var msg: linux.msghdr = .{
@@ -5513,6 +5515,7 @@ fn sendmsgNonblocking(
     message: *net.OutgoingMessage,
     posix_flags: u32,
 ) (Io.Operation.NetSend.Error || error{WouldBlock})!void {
+    try PosixControl.checkLength(message.control.len);
     var addr: PosixAddress = undefined;
     var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
     const msg: linux.msghdr_const = .{
@@ -5534,7 +5537,7 @@ fn sendmsgNonblocking(
             },
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
-            else => |err| return sendErrno(err),
+            else => |err| return sendErrno(err, message.control.len != 0),
         }
     }
 }
@@ -5708,7 +5711,7 @@ fn netSend(
                     .SUCCESS => message.data_len = @intCast(completion.result),
                     .INTR, .CANCELED => continue, // retry this message
                     .AGAIN => continue,
-                    else => |e| return .{ sendErrno(e), i },
+                    else => |e| return .{ sendErrno(e, message.control.len != 0), i },
                 }
             },
             else => |e| return .{ e, i },
