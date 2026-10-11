@@ -292,6 +292,44 @@ pub const IpAddress = union(enum) {
         /// When not enabled any attempt to send datagrams to a broadcast address
         /// will fail with `error.AccessDenied`
         allow_broadcast: bool = false,
+        /// Sets SO_REUSEPORT before binding, so that several sockets may be
+        /// bound to the same address and port at the same time (for example
+        /// one socket per worker, all serving one UDP port). Each socket that
+        /// joins the group sets this option, the first one included; a plain
+        /// bind to a port held by such a group still fails with
+        /// `error.AddressInUse`.
+        ///
+        /// Multicast and broadcast datagrams reach every socket in the group.
+        /// What happens to unicast datagrams is platform behavior: Linux
+        /// balances them across the sockets by a hash of the 4-tuple (a
+        /// socket joining or leaving re-maps flows) and only lets sockets
+        /// owned by the same user id share the port; the owner is the uid
+        /// the socket was created under (what `fstat` reports), not the
+        /// caller's uid at bind time, so a socket created before dropping
+        /// privileges cannot be joined by one created afterwards. BSD and
+        /// macOS do not balance: one socket of the group receives every
+        /// unicast datagram (the newest when bound to a specific address,
+        /// the oldest when bound to the wildcard address). Only SO_REUSEPORT
+        /// is set: SO_REUSEADDR on a datagram socket would let a process
+        /// under any user id bind the same port on Linux and, as the newest
+        /// socket, receive all of its unicast traffic.
+        ///
+        /// Windows and systems without SO_REUSEPORT return
+        /// `error.OptionUnsupported`.
+        reuse_port: bool = false,
+        /// Allows several sockets to bind the same address and port, with
+        /// unicast flows distributed among them by the kernel. This implies
+        /// port reuse; `reuse_port` need not also be set. Every socket joining
+        /// the group must request load balancing before binding.
+        ///
+        /// Uses SO_REUSEPORT on Linux and SO_REUSEPORT_LB on FreeBSD. Other
+        /// systems return `error.OptionUnsupported`. Distribution is based
+        /// on flow addresses and ports. With unchanged group membership,
+        /// one flow stays on one socket; this does not promise equal traffic
+        /// or round-robin delivery.
+        /// The same-user restriction described by `reuse_port` still applies
+        /// on Linux. Plain `reuse_port` keeps its existing platform behavior.
+        reuse_port_load_balance: bool = false,
         mode: Socket.Mode,
         protocol: ?Protocol = null,
     };
@@ -842,13 +880,17 @@ pub const UnixAddress = struct {
 
     pub const max_len = switch (native_os) {
         .windows => std.os.windows.PATH_MAX_WIDE,
-        else => 108,
+        else => @sizeOf(@FieldType(std.posix.sockaddr.un, "path")),
     };
 
     pub const InitError = error{NameTooLong};
 
     pub fn init(p: []const u8) InitError!UnixAddress {
         if (p.len > max_len) return error.NameTooLong;
+        // Filesystem names need room for their terminator. Linux abstract
+        // names use all available bytes, including their leading NUL.
+        if (native_os != .windows and p.len == max_len and
+            !(native_os == .linux and p.len > 0 and p[0] == 0)) return error.NameTooLong;
         return .{ .path = p };
     }
 
@@ -1274,20 +1316,21 @@ pub const Stream = struct {
         control_len: usize = 0,
         /// Whether only some of the control data was received.
         ///
-        /// When control data is truncated, the extra data essentially
-        /// disappears into the ether. This is indicative of a design problem,
-        /// such as the control buffer being too small.
+        /// A backend may discard an incomplete control message. Undelivered
+        /// SCM_RIGHTS descriptors are closed; ownership of descriptors in
+        /// complete returned messages transfers to the caller. Received
+        /// descriptors have CLOEXEC set (Darwin sets it after recvmsg).
         control_truncated: bool = false,
     };
 
     /// This is a low-level API that calls the `Io` interface function directly.
     /// For a higher level API, see `reader`.
     pub fn read(s: *const Stream, io: Io, data: [][]u8) Reader.Error!usize {
-        const rc, _ = try (try io.operate(.{ .net_read = .{
+        const rc = try (try io.operate(.{ .net_read = .{
             .socket_handle = s.socket.handle,
             .data = data,
         } })).net_read;
-        return rc;
+        return rc.data_len;
     }
 
     /// Read with control data.
@@ -1536,7 +1579,10 @@ pub const cmsg = struct {
         pub fn next(it: *Iterator) ?Message {
             if (it.control.len < @sizeOf(cmsghdr)) return null;
             const header: *align(cmsg_align) cmsghdr = @ptrCast(it.control.ptr);
-            if (it.control.len < header.len) return null;
+            if (header.len < len(0) or it.control.len < header.len) {
+                it.control = &.{};
+                return null;
+            }
             const next_header = std.mem.alignForward(usize, header.len, cmsg_align);
             if (it.control.len < next_header) {
                 it.control = &.{};
@@ -1547,6 +1593,23 @@ pub const cmsg = struct {
         }
     };
 };
+
+test "cmsg.Iterator rejects invalid advertised lengths" {
+    if (comptime native_os == .windows or native_os == .wasi) return error.SkipZigTest;
+    var control: [cmsg.space(8)]u8 align(cmsg_align) = @splat(0);
+    const header: *align(cmsg_align) std.posix.cmsghdr = @ptrCast(&control);
+    for ([_]@FieldType(std.posix.cmsghdr, "len"){ 0, 1, cmsg.len(0) - 1, control.len + 1, std.math.maxInt(@FieldType(std.posix.cmsghdr, "len")) }) |length| {
+        header.* = .{ .len = length, .level = 0, .type = 0 };
+        var iterator: cmsg.Iterator = .{ .control = &control };
+        try std.testing.expectEqual(null, iterator.next());
+        try std.testing.expectEqual(null, iterator.next());
+    }
+    header.len = cmsg.len(0);
+    var iterator: cmsg.Iterator = .{ .control = control[0..cmsg.len(0)] };
+    const message = iterator.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), message.data.len);
+    try std.testing.expectEqual(null, iterator.next());
+}
 
 pub const Server = struct {
     socket: Socket,

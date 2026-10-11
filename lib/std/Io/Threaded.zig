@@ -1,3 +1,4 @@
+const PosixControl = @import("PosixControl.zig");
 const Threaded = @This();
 
 const builtin = @import("builtin");
@@ -2060,7 +2061,7 @@ const use_libc_getrandom = std.c.versionCheck(if (builtin.abi.isAndroid()) .{
 
 const use_dev_urandom = @TypeOf(posix.system.getrandom) == void and native_os == .linux;
 
-fn crashHandler(userdata: ?*anyopaque) void {
+pub fn crashHandler(userdata: ?*anyopaque) void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const thread = Thread.current orelse return;
@@ -2374,7 +2375,7 @@ fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *an
     g.status().raw = .{ .num_running = 0, .have_awaiter = false, .canceled = false };
 }
 
-fn recancel(userdata: ?*anyopaque) void {
+pub fn recancel(userdata: ?*anyopaque) void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     recancelInner();
@@ -2396,7 +2397,7 @@ fn recancelInner() void {
     }
 }
 
-fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+pub fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const thread = Thread.current orelse return .unblocked;
@@ -2405,7 +2406,7 @@ fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.Canc
     return old;
 }
 
-fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
+pub fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     return Thread.checkCancel();
@@ -2509,7 +2510,7 @@ fn cancel(
     future.destroy(t.allocator);
 }
 
-fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+pub fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
     if (builtin.single_threaded) {
         assert(timeout != .none); // Deadlock.
         return;
@@ -2523,21 +2524,21 @@ fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.
     return Thread.futexWait(ptr, expected, timeout_ns);
 }
 
-fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+pub fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
     if (builtin.single_threaded) unreachable; // Deadlock.
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     Thread.futexWaitUncancelable(ptr, expected, null);
 }
 
-fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+pub fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     if (builtin.single_threaded) return; // Nothing to wake up.
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     Thread.futexWake(ptr, max_waiters);
 }
 
-fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+pub fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     switch (operation) {
         .file_read_streaming => |o| return .{
@@ -2600,7 +2601,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
     }
 }
 
-fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+pub fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     if (is_windows) {
         batchDrainSubmittedWindows(t, b, false) catch |err| switch (err) {
@@ -2756,7 +2757,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
     b.submitted = .{ .head = .none, .tail = .none };
 }
 
-fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+pub fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     if (is_windows) {
         const deadline: ?Io.Clock.Timestamp = timeout.toTimestamp(io(t));
@@ -2815,10 +2816,16 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
         }
     } = .{ .gpa = t.allocator, .batch = b, .slice = &poll_buffer, .len = 0 };
     {
+        var prev_index: Io.Operation.OptionalIndex = .none;
         var index = b.submitted.head;
         while (index != .none) {
             const storage = &b.storage[index.toIndex()];
             const submission = storage.submission;
+            const next_index = submission.node.next;
+            // An operation that completes here leaves the `submitted` list
+            // for `completed`; otherwise it stays submitted and pairs with
+            // the poll entry it adds below.
+            var completed_inline = false;
             switch (submission.operation) {
                 .file_read_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.IN | posix.POLL.ERR),
                 .file_write_streaming => |o| try poll_storage.add(o.file.handle, posix.POLL.OUT | posix.POLL.ERR),
@@ -2838,6 +2845,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                         };
                         data_i += msg.data.len;
                     } else .{ null, o.message_buffer.len } };
+                    completed_inline = true;
                     switch (b.completed.tail) {
                         .none => b.completed.head = index,
                         else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
@@ -2867,6 +2875,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                             break :o .{ null, sent };
                         },
                     };
+                    completed_inline = true;
                     switch (b.completed.tail) {
                         .none => b.completed.head = index,
                         else => |tail_index| b.storage[tail_index.toIndex()].completion.node.next = index,
@@ -2877,7 +2886,14 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                 .net_read => |o| try poll_storage.add(o.socket_handle, posix.POLL.IN | posix.POLL.ERR),
                 .net_write => |o| try poll_storage.add(o.socket_handle, posix.POLL.OUT | posix.POLL.ERR),
             }
-            index = submission.node.next;
+            if (completed_inline) {
+                switch (prev_index) {
+                    .none => b.submitted.head = next_index,
+                    else => |p| b.storage[p.toIndex()].submission.node.next = next_index,
+                }
+                if (next_index == .none) b.submitted.tail = prev_index;
+            } else prev_index = index;
+            index = next_index;
         }
     }
     switch (poll_storage.len) {
@@ -2985,7 +3001,7 @@ const WindowsBatchOperationUserdata = extern struct {
     }
 };
 
-fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
+pub fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     if (is_windows) {
         if (b.pending.head == .none) return;
@@ -4743,7 +4759,7 @@ fn dirCreateFileWasi(
     }
 }
 
-fn dirCreateFileAtomic(
+pub fn dirCreateFileAtomic(
     userdata: ?*anyopaque,
     dir: Dir,
     dest_path: []const u8,
@@ -6905,7 +6921,7 @@ pub const WindowsPathSpace = struct {
     }
 };
 
-fn dirRealPathFilePosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, out_buffer: []u8) Dir.RealPathFileError!usize {
+pub fn dirRealPathFilePosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, out_buffer: []u8) Dir.RealPathFileError!usize {
     if (native_os == .wasi) return error.OperationUnsupported;
 
     const t: *Threaded = @ptrCast(@alignCast(userdata));
@@ -7003,7 +7019,7 @@ const dirRealPath = switch (native_os) {
     else => dirRealPathPosix,
 };
 
-fn dirRealPathPosix(userdata: ?*anyopaque, dir: Dir, out_buffer: []u8) Dir.RealPathError!usize {
+pub fn dirRealPathPosix(userdata: ?*anyopaque, dir: Dir, out_buffer: []u8) Dir.RealPathError!usize {
     if (native_os == .wasi) return error.OperationUnsupported;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -7028,7 +7044,7 @@ fn fileRealPathWindows(userdata: ?*anyopaque, file: File, out_buffer: []u8) File
     return realPathWindows(file.handle, out_buffer);
 }
 
-fn fileRealPathPosix(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPathError!usize {
+pub fn fileRealPathPosix(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPathError!usize {
     if (native_os == .wasi) return error.OperationUnsupported;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -7144,7 +7160,7 @@ fn realPathPosix(fd: posix.fd_t, out_buffer: []u8) File.RealPathError!usize {
     comptime unreachable;
 }
 
-fn fileHardLink(
+pub fn fileHardLink(
     userdata: ?*anyopaque,
     file: File,
     new_dir: Dir,
@@ -7291,7 +7307,7 @@ fn dirDeleteFileWasi(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.
     }
 }
 
-fn dirDeleteFilePosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
+pub fn dirDeleteFilePosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
 
@@ -7564,7 +7580,7 @@ fn dirDeleteDirWasi(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.D
     }
 }
 
-fn dirDeleteDirPosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteDirError!void {
+pub fn dirDeleteDirPosix(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteDirError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
 
@@ -7854,7 +7870,7 @@ fn dirRenameWasi(
     }
 }
 
-fn dirRenamePosix(
+pub fn dirRenamePosix(
     userdata: ?*anyopaque,
     old_dir: Dir,
     old_sub_path: []const u8,
@@ -8197,7 +8213,7 @@ fn dirSymLinkWasi(
     }
 }
 
-fn dirSymLinkPosix(
+pub fn dirSymLinkPosix(
     userdata: ?*anyopaque,
     dir: Dir,
     target_path: []const u8,
@@ -8247,7 +8263,7 @@ fn dirSymLinkPosix(
     }
 }
 
-fn dirReadLink(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, buffer: []u8) Dir.ReadLinkError!usize {
+pub fn dirReadLink(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, buffer: []u8) Dir.ReadLinkError!usize {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     switch (native_os) {
@@ -8488,7 +8504,7 @@ fn dirSetPermissionsWindows(userdata: ?*anyopaque, dir: Dir, permissions: Dir.Pe
     @panic("TODO implement dirSetPermissionsWindows");
 }
 
-fn dirSetPermissionsPosix(userdata: ?*anyopaque, dir: Dir, permissions: Dir.Permissions) Dir.SetPermissionsError!void {
+pub fn dirSetPermissionsPosix(userdata: ?*anyopaque, dir: Dir, permissions: Dir.Permissions) Dir.SetPermissionsError!void {
     if (@sizeOf(Dir.Permissions) == 0) return;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -8728,7 +8744,7 @@ fn dirSetOwnerUnsupported(userdata: ?*anyopaque, dir: Dir, owner: ?File.Uid, gro
     return error.Unexpected;
 }
 
-fn dirSetOwnerPosix(userdata: ?*anyopaque, dir: Dir, owner: ?File.Uid, group: ?File.Gid) Dir.SetOwnerError!void {
+pub fn dirSetOwnerPosix(userdata: ?*anyopaque, dir: Dir, owner: ?File.Uid, group: ?File.Gid) Dir.SetOwnerError!void {
     if (!have_fchown) return error.Unexpected; // Unsupported OS, don't call this function.
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -8768,7 +8784,7 @@ fn posixFchown(fd: posix.fd_t, uid: posix.uid_t, gid: posix.gid_t) File.SetOwner
     }
 }
 
-fn dirSetFileOwner(
+pub fn dirSetFileOwner(
     userdata: ?*anyopaque,
     dir: Dir,
     sub_path: []const u8,
@@ -8818,7 +8834,7 @@ fn fileSyncWindows(userdata: ?*anyopaque, file: File) File.SyncError!void {
     }
 }
 
-fn fileSyncPosix(userdata: ?*anyopaque, file: File) File.SyncError!void {
+pub fn fileSyncPosix(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const syscall: Syscall = try .start();
@@ -9133,7 +9149,7 @@ fn isCygwinPty(file: File) Io.Cancelable!bool {
         std.mem.find(u16, name_wide, &[_]u16{ '-', 'p', 't', 'y' }) != null;
 }
 
-fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
+pub fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
 
@@ -9226,7 +9242,7 @@ fn fileSetOwner(userdata: ?*anyopaque, file: File, owner: ?File.Uid, group: ?Fil
     return posixFchown(file.handle, uid, gid);
 }
 
-fn fileSetPermissions(userdata: ?*anyopaque, file: File, permissions: File.Permissions) File.SetPermissionsError!void {
+pub fn fileSetPermissions(userdata: ?*anyopaque, file: File, permissions: File.Permissions) File.SetPermissionsError!void {
     if (@sizeOf(File.Permissions) == 0) return;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -9294,7 +9310,7 @@ fn setPermissionsPosix(fd: posix.fd_t, mode: posix.mode_t) File.SetPermissionsEr
     }
 }
 
-fn dirSetTimestamps(
+pub fn dirSetTimestamps(
     userdata: ?*anyopaque,
     dir: Dir,
     sub_path: []const u8,
@@ -9342,7 +9358,7 @@ fn dirSetTimestamps(
     };
 }
 
-fn fileSetTimestamps(
+pub fn fileSetTimestamps(
     userdata: ?*anyopaque,
     file: File,
     options: File.SetTimestampsOptions,
@@ -9454,7 +9470,7 @@ fn fileSetTimestamps(
 const windows_lock_range_off: windows.LARGE_INTEGER = 0;
 const windows_lock_range_len: windows.LARGE_INTEGER = 1;
 
-fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!void {
+pub fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!void {
     if (native_os == .wasi) return error.FileLocksUnsupported;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -9535,7 +9551,7 @@ fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!v
     }
 }
 
-fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!bool {
+pub fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!bool {
     if (native_os == .wasi) return error.FileLocksUnsupported;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -9628,7 +9644,7 @@ fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockErro
     }
 }
 
-fn fileUnlock(userdata: ?*anyopaque, file: File) void {
+pub fn fileUnlock(userdata: ?*anyopaque, file: File) void {
     if (native_os == .wasi) return;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -9664,7 +9680,7 @@ fn fileUnlock(userdata: ?*anyopaque, file: File) void {
     }
 }
 
-fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
+pub fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
     if (native_os == .wasi) return;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -9816,7 +9832,7 @@ fn dirOpenDirWasi(
     }
 }
 
-fn dirHardLink(
+pub fn dirHardLink(
     userdata: ?*anyopaque,
     old_dir: Dir,
     old_sub_path: []const u8,
@@ -11757,7 +11773,7 @@ fn fileWriteFilePositional(
     return error.Unimplemented;
 }
 
-fn nowPosix(clock: Io.Clock) Io.Timestamp {
+pub fn nowPosix(clock: Io.Clock) Io.Timestamp {
     const clock_id: posix.clockid_t = clockToPosix(clock);
     var timespec: posix.timespec = undefined;
     switch (posix.errno(posix.system.clock_gettime(clock_id, &timespec))) {
@@ -12534,6 +12550,17 @@ fn netBindIpPosix(
     const family = posixAddressFamily(address);
     const socket_fd = try openSocketPosix(family, options);
     errdefer closeFd(socket_fd);
+    if (options.reuse_port_load_balance) {
+        const option = switch (native_os) {
+            .linux => posix.SO.REUSEPORT,
+            .freebsd => posix.SO.REUSEPORT_LB,
+            else => return error.OptionUnsupported,
+        };
+        try setSocketOptionPosix(socket_fd, posix.SOL.SOCKET, option, 1);
+    } else if (options.reuse_port) {
+        if (comptime !@hasDecl(posix.SO, "REUSEPORT")) return error.OptionUnsupported;
+        try setSocketOptionPosix(socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1);
+    }
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try posixBind(socket_fd, &storage.any, addr_len);
@@ -12550,6 +12577,10 @@ fn netBindIpWindows(
     if (!have_networking) return error.NetworkDown;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
+    // Windows has no SO_REUSEPORT. SO_REUSEADDR is not a substitute for a
+    // datagram socket: it allows the shared bind but promises nothing about
+    // which socket receives.
+    if (options.reuse_port or options.reuse_port_load_balance) return error.OptionUnsupported;
     const family = posixAddressFamily(address);
     const socket_handle = try openSocketAfd(family, options);
     errdefer windows.CloseHandle(socket_handle);
@@ -12891,6 +12922,8 @@ fn netRead(socket_handle: net.Socket.Handle, data: [][]u8, control: []u8) net.St
 }
 
 fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.Reader.Error!net.Stream.ReadResult {
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(control);
     var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
     var i: usize = 0;
     for (data) |buf| {
@@ -12923,6 +12956,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
                         .FAULT => |err| return errnoBug(err),
                         .AGAIN => |err| return errnoBug(err),
                         .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                        .MFILE => return error.ProcessFdQuotaExceeded,
+                        .NFILE => return error.SystemFdQuotaExceeded,
                         .NOBUFS => return error.SystemResources,
                         .NOMEM => return error.SystemResources,
                         .NOTCONN => return error.SocketUnconnected,
@@ -12941,8 +12976,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
         .namelen = 0,
         .iov = dest.ptr,
         .iovlen = @intCast(dest.len),
-        .control = control.ptr,
-        .controllen = @intCast(control.len),
+        .control = if (receive_control.len == 0) null else receive_control.ptr,
+        .controllen = @intCast(receive_control.len),
         .flags = 0,
     };
 
@@ -12956,10 +12991,11 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
+                const ctl = try PosixControl.Receive.finish(control, receive_control, rc_control, msg.flags);
                 return .{
                     .data_len = @intCast(rc),
-                    .control_len = @intCast(rc_control),
-                    .control_truncated = (msg.flags & posix.MSG.CTRUNC) != 0,
+                    .control_len = ctl.len,
+                    .control_truncated = ctl.truncated,
                 };
             },
             .INTR => {
@@ -12973,6 +13009,8 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
                     .FAULT => |err| return errnoBug(err),
                     .AGAIN => |err| return errnoBug(err),
                     .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                    .MFILE => return error.ProcessFdQuotaExceeded,
+                    .NFILE => return error.SystemFdQuotaExceeded,
                     .NOBUFS => return error.SystemResources,
                     .NOMEM => return error.SystemResources,
                     .NOTCONN => return error.SocketUnconnected,
@@ -13105,6 +13143,7 @@ fn netSendOnePosix(
     flags: u32,
 ) (net.Socket.SendError || error{WouldBlock})!void {
     _ = t;
+    try PosixControl.checkLength(message.control.len);
     var addr: PosixAddress = undefined;
     var iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
     const msg: posix.msghdr_const = .{
@@ -13144,10 +13183,10 @@ fn netSendOnePosix(
             .NOTCONN => return syscall.fail(error.SocketUnconnected),
             .TIMEDOUT => return syscall.fail(error.ConnectionTimedOut),
             .NETDOWN => return syscall.fail(error.NetworkDown),
-            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (message.control.len != 0) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return syscall.errnoBug(err),
             .FAULT => |err| return syscall.errnoBug(err),
-            .INVAL => |err| return syscall.errnoBug(err),
+            .INVAL => |err| return if (message.control.len != 0) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err),
             .ISCONN => |err| return syscall.errnoBug(err),
             .NOTSOCK => |err| return syscall.errnoBug(err),
             .OPNOTSUPP => |err| return syscall.errnoBug(err),
@@ -13171,6 +13210,7 @@ fn netSendManyPosix(
     const clamped_iovecs = (&iovecs_buffer)[0..min_len];
 
     for (clamped_messages, clamped_msgs, clamped_addrs, clamped_iovecs) |*message, *msg, *addr, *iovec| {
+        try PosixControl.checkLength(message.control.len);
         iovec.* = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
         msg.* = .{
             .hdr = .{
@@ -13186,6 +13226,9 @@ fn netSendManyPosix(
         };
     }
 
+    const has_control = for (clamped_messages) |message| {
+        if (message.control.len != 0) break true;
+    } else false;
     const syscall: Syscall = try .start();
     while (true) {
         const rc = posix.system.sendmmsg(socket_handle, clamped_msgs.ptr, @intCast(clamped_msgs.len), flags);
@@ -13217,10 +13260,10 @@ fn netSendManyPosix(
             .TIMEDOUT => return syscall.fail(error.ConnectionTimedOut),
             .NETDOWN => return syscall.fail(error.NetworkDown),
 
-            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            .BADF => |err| return if (has_control) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // File descriptor used after closed.
             .DESTADDRREQ => |err| return syscall.errnoBug(err), // The socket is not connection-mode, and no peer address is set.
             .FAULT => |err| return syscall.errnoBug(err), // An invalid user space address was specified for an argument.
-            .INVAL => |err| return syscall.errnoBug(err), // Invalid argument passed.
+            .INVAL => |err| return if (has_control) syscall.fail(error.InvalidControlMessage) else syscall.errnoBug(err), // Invalid argument passed.
             .ISCONN => |err| return syscall.errnoBug(err), // connection-mode socket was connected already but a recipient was specified
             .NOTSOCK => |err| return syscall.errnoBug(err), // The file descriptor sockfd does not refer to a socket.
             .OPNOTSUPP => |err| return syscall.errnoBug(err), // Some bit in the flags argument is inappropriate for the socket type.
@@ -13230,7 +13273,7 @@ fn netSendManyPosix(
     }
 }
 
-fn netReceivePosix(
+pub fn netReceivePosix(
     socket_handle: net.Socket.Handle,
     message: *net.IncomingMessage,
     data_buffer: []u8,
@@ -13244,11 +13287,14 @@ fn netReceivePosix(
     //   the split vectors though because reducing the buffer size might make
     //   some messages unreceivable.
     const posix_flags: u32 =
+        @as(u32, if (@hasDecl(posix.MSG, "CMSG_CLOEXEC")) posix.MSG.CMSG_CLOEXEC else 0) |
         @as(u32, if (flags.oob) posix.MSG.OOB else 0) |
         @as(u32, if (flags.peek) posix.MSG.PEEK else 0) |
         @as(u32, if (flags.trunc) posix.MSG.TRUNC else 0) |
         @as(u32, if (nonblocking) posix.MSG.DONTWAIT else 0);
 
+    var ancillary: PosixControl.Receive = .{};
+    const receive_control = try ancillary.buffer(message.control);
     var storage: PosixAddress = undefined;
     var iov: posix.iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
     var msg: posix.msghdr = .{
@@ -13256,8 +13302,8 @@ fn netReceivePosix(
         .namelen = @sizeOf(PosixAddress),
         .iov = (&iov)[0..1],
         .iovlen = 1,
-        .control = message.control.ptr,
-        .controllen = @intCast(message.control.len),
+        .control = if (receive_control.len == 0) null else receive_control.ptr,
+        .controllen = @intCast(receive_control.len),
         .flags = 0,
     };
 
@@ -13267,15 +13313,16 @@ fn netReceivePosix(
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
+                const ctl = try PosixControl.Receive.finish(message.control, receive_control, msg.controllen, msg.flags);
                 const data = data_buffer[0..@intCast(rc)];
                 message.* = .{
                     .from = addressFromPosix(&storage),
                     .data = data,
-                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .control = message.control[0..ctl.len],
                     .flags = .{
                         .eor = (msg.flags & posix.MSG.EOR) != 0,
                         .trunc = (msg.flags & posix.MSG.TRUNC) != 0,
-                        .ctrunc = (msg.flags & posix.MSG.CTRUNC) != 0,
+                        .ctrunc = ctl.truncated,
                         .oob = (msg.flags & posix.MSG.OOB) != 0,
                         .errqueue = if (@hasDecl(posix.MSG, "ERRQUEUE")) (msg.flags & posix.MSG.ERRQUEUE) != 0 else false,
                     },
@@ -13383,6 +13430,7 @@ fn netWritePosix(
 ) net.Stream.Writer.Error!usize {
     if (!have_networking) return error.NetworkDown;
 
+    try PosixControl.checkLength(control.len);
     var iovecs: [max_iovecs_len]posix.iovec_const = undefined;
     var msg: posix.msghdr_const = .{
         .name = null,
@@ -13442,13 +13490,13 @@ fn netWritePosix(
                     .ACCES => |err| return errnoBug(err),
                     .AGAIN => |err| return errnoBug(err),
                     .ALREADY => return error.FastOpenAlreadyInProgress,
-                    .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+                    .BADF => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // File descriptor used after closed.
                     .CONNRESET => return error.ConnectionResetByPeer,
                     .DESTADDRREQ => |err| return errnoBug(err), // The socket is not connection-mode, and no peer address is set.
                     .FAULT => |err| return errnoBug(err), // An invalid user space address was specified for an argument.
-                    .INVAL => |err| return errnoBug(err), // Invalid argument passed.
+                    .INVAL => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err), // Invalid argument passed.
                     .ISCONN => |err| return errnoBug(err), // connection-mode socket was connected already but a recipient was specified
-                    .MSGSIZE => |err| return errnoBug(err),
+                    .MSGSIZE => |err| return if (control.len != 0) error.InvalidControlMessage else errnoBug(err),
                     .NOBUFS => return error.SystemResources,
                     .NOMEM => return error.SystemResources,
                     .NOTSOCK => |err| return errnoBug(err), // The file descriptor sockfd does not refer to a socket.
@@ -14273,7 +14321,7 @@ fn processCurrentPathPosix(buffer: []u8) process.CurrentPathError!usize {
     }
 }
 
-fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirError!void {
+pub fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
 
@@ -14304,7 +14352,7 @@ fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirEr
     return fchdir(dir.handle);
 }
 
-fn processSetCurrentPath(userdata: ?*anyopaque, path: []const u8) process.SetCurrentPathError!void {
+pub fn processSetCurrentPath(userdata: ?*anyopaque, path: []const u8) process.SetCurrentPathError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
 
@@ -14347,7 +14395,7 @@ pub const PosixAddress = extern union {
     in6: posix.sockaddr.in6,
 };
 
-const UnixAddress = extern union {
+pub const UnixAddress = extern union {
     any: posix.sockaddr,
     un: posix.sockaddr.un,
 };
@@ -14380,7 +14428,7 @@ pub fn addressToPosix(a: *const IpAddress, storage: *PosixAddress) posix.socklen
     };
 }
 
-fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
+pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
     storage.un.family = posix.AF.UNIX;
     var path_len = switch (native_os) {
         .windows => @min(a.path.len, storage.un.path.len),
@@ -14389,7 +14437,8 @@ fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.so
     // With the AFD API, `sockaddr.un` is purely informational, so
     // use a suffix which is usually the most relevant part of a path.
     @memcpy(storage.un.path[0..path_len], a.path[a.path.len - path_len ..]);
-    if (storage.un.path.len - path_len > 0) {
+    const abstract = native_os == .linux and a.isAbstract();
+    if (!abstract and storage.un.path.len - path_len > 0) {
         @branchHint(.likely);
         storage.un.path[path_len] = 0;
         path_len += 1;
@@ -14399,7 +14448,11 @@ fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.so
             if (storage.un.path[0] == 0) @memset(storage.un.path[path_len..], 0);
             return @sizeOf(posix.sockaddr.un);
         },
-        else => return @intCast(@offsetOf(posix.sockaddr.un, "path") + path_len),
+        else => {
+            const length: posix.socklen_t = @intCast(@offsetOf(posix.sockaddr.un, "path") + path_len);
+            if (@hasField(posix.sockaddr.un, "len")) storage.un.len = @intCast(length);
+            return length;
+        },
     }
 }
 
@@ -15120,7 +15173,7 @@ const LookupDnsWindows = struct {
     }
 };
 
-fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
+pub fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
     const buf = canonical_name_buffer orelse return null;
     const dest = buf[0..name.len];
     @memcpy(dest, name);
@@ -15519,7 +15572,7 @@ fn getDevNullFd(t: *Threaded) !posix.fd_t {
     }
 }
 
-fn processSpawnPosix(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
+pub fn processSpawnPosix(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const spawned = try spawnPosix(t, options);
     defer closeFd(spawned.err_fd);
@@ -15550,7 +15603,7 @@ fn processSpawnPosix(userdata: ?*anyopaque, options: process.SpawnOptions) proce
     };
 }
 
-fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitError!process.Child.Term {
+pub fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitError!process.Child.Term {
     if (native_os == .wasi) unreachable;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
@@ -17952,7 +18005,7 @@ fn fallbackSeedWasi(seed: *[Csprng.seed_len]u8) void {
     }
 }
 
-fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+pub fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
 
     if (is_windows) {
@@ -19340,14 +19393,14 @@ fn fileMemoryMapSetLength(
     }
 }
 
-fn fileMemoryMapRead(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
+pub fn fileMemoryMapRead(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const section = mm.section orelse return mmSyncRead(mm.file, mm.memory, mm.offset);
     _ = section;
 }
 
-fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
+pub fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const section = mm.section orelse return mmSyncWrite(mm.file, mm.memory, mm.offset);
