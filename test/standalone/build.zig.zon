@@ -45,6 +45,9 @@
         .glibc_compat = .{
             .path = "glibc_compat",
         },
+        .translate_c_signedness = .{
+            .path = "translate_c_signedness",
+        },
         .install_raw_hex = .{
             .path = "install_raw_hex",
         },

@@ -1,3 +1,9 @@
+//! Experimental evented backend for Linux. Calls must run in this backend's
+//! managed fibers, with one active backend context per participating OS thread.
+//! Calls from foreign threads and nested active backend instances are unsupported.
+//! Finish or cancel socket operations before closing their socket with the same Io.
+//! Networking currently supports UDP bind/send/receive; stream/TCP/Unix operations,
+//! socket pairs, file sends, interface lookup, and DNS resolution are unavailable.
 const addressFromPosix = Io.Threaded.addressFromPosix;
 const addressToPosix = Io.Threaded.addressToPosix;
 const Alignment = std.mem.Alignment;
@@ -61,7 +67,7 @@ const max_steal_ready_search = 2;
 const max_steal_free_search = 4;
 
 backing_allocator_needs_mutex: bool,
-backing_allocator_mutex: Io.Mutex,
+backing_allocator_lock: SpinLock,
 /// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
 main_fiber_buffer: [
@@ -70,6 +76,8 @@ main_fiber_buffer: [
 log2_ring_entries: u4,
 threads: Thread.List,
 sync_limit: ?Io.Semaphore,
+/// Owns the synchronous process/parent-handle fallback; never receives Uring userdata.
+threaded: Io.Threaded,
 
 stderr_writer_initialized: bool = false,
 stderr_mutex: Io.Mutex,
@@ -91,6 +99,23 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
+/// Guards `backing_allocator` when it is not thread-safe. A spinlock rather
+/// than the fiber-aware `Io.Mutex`: an allocation never parks, so a fiber that
+/// allocates between capturing its thread's ring and enqueuing on it (the
+/// batched network paths do) cannot migrate to another thread in between and
+/// submit into a ring whose owner is asleep in `io_uring_enter`.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *SpinLock) void {
+        while (l.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(l: *SpinLock) void {
+        l.locked.store(false, .release);
+    }
+};
+
 const Thread = struct {
     required_align: void align(4),
     thread: std.Thread,
@@ -107,8 +132,15 @@ const Thread = struct {
 
     threadlocal var self: ?*Thread = null;
 
+    /// A fiber can be parked on one OS thread and resumed on another, so the
+    /// thread must be re-read after every context switch. Routing the
+    /// pointer through a volatile asm operand makes it an opaque runtime
+    /// value, so a caller cannot reuse a lookup made before a switch.
     noinline fn current() *Thread {
-        return self.?;
+        return asm volatile (""
+            : [ret] "=r" (-> *Thread),
+            : [in] "0" (self.?),
+            : .{ .memory = true });
     }
 
     fn deinit(thread: *Thread, gpa: Allocator) void {
@@ -160,6 +192,11 @@ const Fiber = struct {
     },
     cancel_status: CancelStatus,
     cancel_protection: CancelProtection,
+    /// A batch wait has several tagged requests rather than one request
+    /// identified by this fiber. Protect the registration's stack lifetime
+    /// while another thread requests cancellation.
+    batch_wait_mutex: SpinLock = .{},
+    cancel_batch: ?*Io.Batch = null,
     name: if (tracy.enable) [*:0]const u8 else void,
 
     var next_name: u64 = 0;
@@ -363,6 +400,14 @@ const Fiber = struct {
             .acquire,
         );
         assert(!cancel_status.requested);
+        fiber.batch_wait_mutex.lock();
+        if (fiber.cancel_batch) |batch| {
+            const ready = signalBatch(batch);
+            fiber.batch_wait_mutex.unlock();
+            if (ready) |f| _ = ev.schedule(.current(), .{ .head = f, .tail = f });
+            return;
+        }
+        fiber.batch_wait_mutex.unlock();
         switch (cancel_status.awaiting) {
             .nothing => {},
             .group => {
@@ -376,37 +421,7 @@ const Fiber = struct {
             _ => |awaiting| {
                 const awaiting_io_uring_fd = awaiting.toIoUringFd();
                 const thread: *Thread = .current();
-                thread.enqueue().* = if (thread.io_uring.fd == awaiting_io_uring_fd) .{
-                    .opcode = .ASYNC_CANCEL,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = 0,
-                    .off = 0,
-                    .addr = @intFromPtr(fiber),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.wakeup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                } else .{
-                    .opcode = .MSG_RING,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = awaiting_io_uring_fd,
-                    .off = @intFromPtr(fiber) | 0b01,
-                    .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.cleanup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
+                cancelRequest(thread, awaiting_io_uring_fd, @intFromPtr(fiber), false);
             },
         }
     }
@@ -452,6 +467,10 @@ const CancelRegion = struct {
             status.awaiting,
         )) {
             @branchHint(.unlikely);
+            // Registration installed the new wait source even when a request
+            // was already pending. No operation will be submitted on this
+            // path, so release that source before disabling region cleanup.
+            _ = cancel_region.fiber.cancel_status.changeAwaiting(status.awaiting, .nothing);
             cancel_region.fiber.cancel_protection.acknowledge();
             cancel_region.status = .unrequested;
             return error.Canceled;
@@ -619,9 +638,8 @@ pub fn allocator(ev: *Evented) std.mem.Allocator {
 
 fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
 }
 
@@ -633,9 +651,8 @@ fn resize(
     ret_addr: usize,
 ) bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
 }
 
@@ -647,17 +664,15 @@ fn remap(
     ret_addr: usize,
 ) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const ev_io = ev.io();
-    ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    defer ev.backing_allocator_mutex.unlock(ev_io);
+    ev.backing_allocator_lock.lock();
+    defer ev.backing_allocator_lock.unlock();
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
 
@@ -756,13 +771,13 @@ pub fn io(ev: *Evented) Io {
             .processSetCurrentDir = processSetCurrentDir,
             .processSetCurrentPath = processSetCurrentPath,
             .processReplace = processReplace,
-            .processReplacePath = processReplacePath,
             .processSpawn = processSpawn,
-            .processSpawnPath = processSpawnPath,
             .childWait = childWait,
             .childKill = childKill,
 
             .progressParentFile = progressParentFile,
+            .inheritParentDir = inheritParentDir,
+            .inheritParentFile = inheritParentFile,
 
             .now = now,
             .clockResolution = clockResolution,
@@ -804,7 +819,7 @@ pub const InitOptions = struct {
     argv0: Argv0 = .empty,
     /// Affects the following operations:
     /// * `fileIsTty`
-    /// * `processSpawn`, `processSpawnPath`, `processReplace`, `processReplacePath`
+    /// * `processSpawn`, `processReplace`
     environ: process.Environ = .empty,
 };
 
@@ -819,7 +834,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     errdefer backing_allocator.free(allocated_slice);
     ev.* = .{
         .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
-        .backing_allocator_mutex = .init,
+        .backing_allocator_lock = .{},
         .backing_allocator = backing_allocator,
         .main_fiber_buffer = undefined,
         .log2_ring_entries = options.log2_ring_entries,
@@ -829,6 +844,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
             .active = 1,
         },
         .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
+        .threaded = .init_single_threaded,
 
         .stderr_writer_initialized = false,
         .stderr_mutex = .init,
@@ -850,6 +866,11 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng_mutex = .init,
         .csprng = .uninitialized,
     };
+    ev.threaded.allocator = ev.allocator();
+    ev.threaded.argv0 = options.argv0;
+    ev.threaded.environ = .{ .process_environ = options.environ };
+    ev.threaded.environ_initialized = options.environ.block.isEmpty();
+    errdefer ev.threaded.deinit();
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     main_fiber.* = .{
         .required_align = {},
@@ -862,6 +883,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
     };
     const main_thread = &ev.threads.allocated[0];
     Thread.self = main_thread;
+    errdefer Thread.self = null;
     main_thread.* = .{
         .required_align = {},
         .thread = undefined,
@@ -903,12 +925,41 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 pub fn deinit(ev: *Evented) void {
     const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
     assert(Thread.current().currentFiber() == main_fiber);
+    // A wake or handoff may move the main fiber to a worker. Return it to
+    // the original OS thread before joining workers or releasing idle
+    // stacks; otherwise teardown can join itself or race the original
+    // thread's idle loop. The completion handoff happens only after park.
+    if (Thread.current() != &ev.threads.allocated[0])
+        ev.yield(null, .return_main);
+    const current_thread: *Thread = .current();
+    assert(current_thread == &ev.threads.allocated[0]);
     const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
     for (ev.threads.allocated[0..active_threads]) |*thread| {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
     }
-    ev.yield(null, .exit);
+    // Submit exit events from the running main fiber, then join every
+    // worker before touching scheduler state. Do not park on the main idle
+    // stack during cleanup: this fiber owns the remainder of teardown.
+    for (ev.threads.allocated[1..active_threads]) |*thread| {
+        current_thread.enqueue().* = .{
+            .opcode = .MSG_RING,
+            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+            .ioprio = 0,
+            .fd = thread.io_uring.fd,
+            .off = @backingInt(Completion.Userdata.exit),
+            .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @backingInt(Completion.Userdata.cleanup),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+    }
+    current_thread.submit();
     ev.null_fd.close();
     ev.random_fd.close();
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(ev.threads.allocated.ptr));
@@ -920,7 +971,9 @@ pub fn deinit(ev: *Evented) void {
     for (ev.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
     for (ev.threads.allocated[0..active_threads]) |*thread| thread.deinit(ev.backing_allocator);
     assert(active_threads == ev.threads.active); // spawned threads while there was no pending async?
+    ev.threaded.deinit();
     ev.backing_allocator.free(allocated_ptr[0..idle_stack_end_offset]);
+    Thread.self = null;
     ev.* = undefined;
 }
 
@@ -1063,14 +1116,18 @@ fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) bool {
         return false;
     }
     // nobody wanted it, so just queue it on ourselves
-    while (true) ready_queue.tail.status.queue_next = @cmpxchgWeak(
+    while (@cmpxchgWeak(
         ?*Fiber,
         &thread.ready_queue,
         ready_queue.tail.status.queue_next,
         ready_queue.head,
         .acq_rel,
         .acquire,
-    ) orelse break;
+    )) |old_head| {
+        // The owner briefly locks its queue with this sentinel. Never
+        // make it a next pointer or replace the queue while it is locked.
+        if (old_head != Fiber.finished) ready_queue.tail.status.queue_next = old_head;
+    }
     return false;
 }
 
@@ -1081,6 +1138,11 @@ fn threadEntry(ev: *Evented, index: u32) void {
         .SUCCESS => ev.idle(thread),
         else => |err| @panic(@tagName(err)),
     }
+    // A scheduler may still have loaded this Thread before its exit CQE.
+    // Keep the struct and ring alive until the main fiber joins us, but
+    // permanently retire the queue so new work cannot be pushed here.
+    if (@cmpxchgStrong(?*Fiber, &thread.ready_queue, null, Fiber.finished, .release, .monotonic)) |stray|
+        assert(stray == Fiber.finished); // pending async
 }
 
 const Completion = struct {
@@ -1094,6 +1156,7 @@ const Completion = struct {
         close,
         cleanup,
         exit,
+        return_main,
         /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
         /// If bits 0 and 1 are 0, a `*Fiber`.
         _,
@@ -1138,8 +1201,7 @@ fn mainIdle(
     const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
     message.handle(ev);
     ev.idle(&ev.threads.allocated[0]);
-    ev.yield(@ptrCast(&ev.main_fiber_buffer), .nothing);
-    unreachable; // switched to dead fiber
+    unreachable; // teardown keeps the main fiber on this OS thread
 }
 
 fn idle(ev: *Evented, thread: *Thread) void {
@@ -1184,6 +1246,11 @@ fn idle(ev: *Evented, thread: *Thread) void {
                     assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
                     return;
                 },
+                .return_main => {
+                    assert(thread == &ev.threads.allocated[0]);
+                    assert(maybe_ready_fiber == null and maybe_ready_queue == null);
+                    maybe_ready_fiber = @ptrCast(&ev.main_fiber_buffer);
+                },
                 _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
                     0b00 => {
                         const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
@@ -1194,22 +1261,12 @@ fn idle(ev: *Evented, thread: *Thread) void {
                         break :ready_fiber ready_fiber;
                     },
                     0b01 => {
-                        thread.enqueue().* = .{
-                            .opcode = .ASYNC_CANCEL,
-                            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                            .ioprio = 0,
-                            .fd = 0,
-                            .off = 0,
-                            .addr = cqe.user_data & ~@as(usize, 0b11),
-                            .len = 0,
-                            .rw_flags = 0,
-                            .user_data = @backingInt(Completion.Userdata.wakeup),
-                            .buf_index = 0,
-                            .personality = 0,
-                            .splice_fd_in = 0,
-                            .addr3 = 0,
-                            .resv = 0,
-                        };
+                        // A cancel request forwarded from another thread via
+                        // MSG_RING. Its result carries the original two tag
+                        // bits, preserving every pointer bit in user_data.
+                        const flags: u32 = @bitCast(cqe.res);
+                        const target = (cqe.user_data & ~@as(usize, 0b11)) | (flags & 0b11);
+                        cancelRequest(thread, thread.io_uring.fd, target, flags & 0b100 != 0);
                         break :ready_fiber null;
                     },
                     0b10 => {
@@ -1230,23 +1287,23 @@ fn idle(ev: *Evented, thread: *Thread) void {
                             batch_userdata[0] = next;
                         }
                         break :ready_fiber switch (@as(u2, @truncate(next))) {
-                            0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                            // A parked fiber: wake it.
+                            0b00 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                            // The timer already fired and woke the fiber
+                            // (`0b11` below tags the slot `0b01`); it will
+                            // find this completion when it drains. Waking it
+                            // again would schedule a fiber that is already
+                            // queued or running.
+                            0b01 => null,
                             0b10, 0b11 => null,
                         };
                     },
-                    0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                        .SUCCESS => unreachable, // no event count specified
-                        .TIME => {
-                            const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
-                            break :ready_fiber switch (@as(u2, @truncate(fiber))) {
-                                else => unreachable, // timeout completed multiple times
-                                0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
-                                0b10 => null,
-                            };
-                        },
-                        .CANCELED => null, // user data may have been invalidated
-                        else => |err| unexpectedErrno(err) catch null,
+                    0b11 => timer: {
+                        const timer: *BatchTimeout = @ptrFromInt(cqe.user_data & ~@as(usize, 0b111));
+                        break :timer timer.complete(cqe.user_data & 0b100 == 0, .{
+                            .result = cqe.res,
+                            .flags = cqe.flags,
+                        });
                     },
                 })) |ready_fiber| {
                     assert(ready_fiber.status.queue_next == null);
@@ -1274,8 +1331,10 @@ const SwitchMessage = struct {
         group_await: Group,
         group_cancel: Group,
         batch_await: *Io.Batch,
+        finished: *Fiber,
+        group_finished: struct { fiber: *Fiber, group: Group },
         destroy,
-        exit,
+        return_main,
     };
 
     fn handle(message: *const SwitchMessage, ev: *Evented) void {
@@ -1324,19 +1383,32 @@ const SwitchMessage = struct {
                     _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
                 }
             },
+            .finished => |fiber| {
+                // An awaiter may immediately recycle this stack on another
+                // CPU. Publish completion only after it has stopped running.
+                if (@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel)) |awaiter|
+                    _ = ev.schedule(thread, .{ .head = awaiter, .tail = awaiter });
+            },
+            .group_finished => |finished| {
+                // Removing the last member lets an awaiter tear down both
+                // the group and backend. The member must already be parked.
+                const awaiter = finished.group.removeFiber(ev, finished.fiber);
+                finished.fiber.destroy();
+                if (awaiter) |fiber| _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
+            },
             .destroy => {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 fiber.destroy();
             },
-            .exit => for (
-                ev.threads.allocated[0..@atomicLoad(u32, &ev.threads.active, .acquire)],
-            ) |*each_thread| {
+            .return_main => {
+                // The main fiber is now parked. Deliver it as a ring-local
+                // completion rather than a stealable scheduler queue entry.
                 thread.enqueue().* = .{
                     .opcode = .MSG_RING,
                     .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
                     .ioprio = 0,
-                    .fd = each_thread.io_uring.fd,
-                    .off = @backingInt(Completion.Userdata.exit),
+                    .fd = ev.threads.allocated[0].io_uring.fd,
+                    .off = @backingInt(Completion.Userdata.return_main),
                     .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
                     .len = 0,
                     .rw_flags = 0,
@@ -1347,6 +1419,7 @@ const SwitchMessage = struct {
                     .addr3 = 0,
                     .resv = 0,
                 };
+                thread.submit();
             },
         }
     }
@@ -1420,7 +1493,7 @@ const AsyncClosure = struct {
         const fiber = closure.fiber;
         message.handle(ev);
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        ev.yield(@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel), .nothing);
+        ev.yield(null, .{ .finished = fiber });
         unreachable; // switched to dead fiber
     }
 };
@@ -1541,6 +1614,20 @@ const Group = struct {
         cancel_requested: bool,
         awaiter_delayed: bool,
         fibers: Fiber.PackedPtr,
+
+        // A completed group retains resources until its caller releases the
+        // marker after the final member has unlocked the group. The reserved
+        // marker distinguishes that release from a concurrent add-and-finish.
+        const completed: List = .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .all_ones };
+        const releasing: List = .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .all_ones };
+        const empty: List = .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null };
+
+        fn head(list: List) ?*Fiber {
+            return switch (list.fibers) {
+                .null, .all_ones => null,
+                else => list.fibers.unpack(),
+            };
+        }
     };
     fn listPtr(group: Group) *List {
         return @ptrCast(&group.ptr.token);
@@ -1548,7 +1635,7 @@ const Group = struct {
 
     const Mutex = packed struct(u32) {
         locked: bool,
-        contended: bool,
+        cancel_callback_absent: bool,
         shared2: u30,
     };
     fn mutexPtr(group: Group) *Mutex {
@@ -1562,7 +1649,7 @@ const Group = struct {
 
     const Awaiter = packed struct(usize) {
         locked: bool,
-        contended: bool,
+        cancel_callback_absent: bool,
         awaiter: Fiber.PackedPtr,
     };
     fn awaiterPtr(group: Group) *Awaiter {
@@ -1570,51 +1657,63 @@ const Group = struct {
     }
 
     fn lock(group: Group, ev: *Evented) void {
+        _ = ev;
         const mutex = group.mutexPtr();
-        {
+        // These short critical sections also run after a context switch on an
+        // idle context, where managed-fiber futex waits cannot be used.
+        while (true) {
             const old_state = @atomicRmw(
                 Mutex,
                 mutex,
                 .Or,
-                .{ .locked = true, .contended = false, .shared2 = 0 },
+                .{ .locked = true, .cancel_callback_absent = false, .shared2 = 0 },
                 .acquire,
             );
             if (!old_state.locked) {
                 @branchHint(.likely);
                 return;
             }
-            if (old_state.contended) {
-                futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-            }
-        }
-        while (true) {
-            var old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = true, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            old_state.contended = true;
-            futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
+            std.atomic.spinLoopHint();
         }
     }
 
     fn unlock(group: Group, ev: *Evented) void {
+        _ = ev;
         const mutex = group.mutexPtr();
         const old_state = @atomicRmw(
             Mutex,
             mutex,
             .And,
-            .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
+            .{ .locked = false, .cancel_callback_absent = true, .shared2 = std.math.maxInt(u30) },
             .release,
         );
         assert(old_state.locked);
-        if (old_state.contended) futexWake(ev, @ptrCast(mutex), 1);
+    }
+
+    /// Assumes the mutex is held.
+    fn clearAwaiter(group: Group) void {
+        _ = @atomicRmw(Awaiter, group.awaiterPtr(), .And, .{
+            .locked = true,
+            .cancel_callback_absent = false,
+            .awaiter = .null,
+        }, .monotonic);
+    }
+
+    fn complete(group: Group, ev: *Evented) bool {
+        group.lock(ev);
+        const list_ptr = group.listPtr();
+        const list = @atomicLoad(List, list_ptr, .monotonic);
+        if (list.head() != null) {
+            group.unlock(ev);
+            return false;
+        }
+        assert(!list.awaiter_delayed);
+        assert(@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter == .null);
+        @atomicStore(List, list_ptr, List.releasing, .monotonic);
+        group.unlock(ev);
+        // Publishing null is the last access to the group: the caller can now
+        // release its storage. A concurrent add changes the reserved marker.
+        return @cmpxchgStrong(List, list_ptr, List.releasing, List.empty, .acq_rel, .acquire) == null;
     }
 
     fn addFiber(group: Group, ev: *Evented, fiber: *Fiber) void {
@@ -1622,13 +1721,20 @@ const Group = struct {
         defer group.unlock(ev);
         const list_ptr = group.listPtr();
         const list = @atomicLoad(List, list_ptr, .monotonic);
-        if (list.cancel_requested) fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
-        const old_head = list.fibers.unpack();
+        const old_head = list.head();
+        if (old_head != null and list.cancel_requested)
+            fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
+        if (old_head == null and list.awaiter_delayed) {
+            // A new member arrived before a racing cancellation consumed the
+            // delayed waiter. Restore the registration for its next completion.
+            const awaiter = @atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack().?;
+            _ = awaiter.cancel_status.changeAwaiting(.nothing, .group);
+        }
         if (old_head) |head| head.link.group.prev = fiber;
         fiber.link.group.next = old_head;
         @atomicStore(List, list_ptr, .{
-            .cancel_requested = list.cancel_requested,
-            .awaiter_delayed = list.awaiter_delayed,
+            .cancel_requested = old_head != null and list.cancel_requested,
+            .awaiter_delayed = false,
             .fibers = .pack(fiber),
         }, .monotonic);
     }
@@ -1648,12 +1754,17 @@ const Group = struct {
                 .fibers = .pack(new_head),
             }, .monotonic);
         } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-            if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
-                @atomicStore(List, list_ptr, .{
-                    .cancel_requested = false,
-                    .awaiter_delayed = false,
-                    .fibers = .null,
-                }, .release);
+            const cancel_callback_absent = @atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).cancel_callback_absent;
+            const cancellation_raced = if (cancel_callback_absent) blk: {
+                const awaiting = @atomicLoad(Fiber.CancelStatus, &awaiter.cancel_status, .monotonic).awaiting;
+                if (awaiting == .group) {
+                    _ = awaiter.cancel_status.changeAwaiting(.group, .nothing);
+                } else assert(awaiting == .nothing);
+                break :blk false;
+            } else awaiter.cancel_status.changeAwaiting(.group, .nothing);
+            if (!cancellation_raced or list.cancel_requested) {
+                group.clearAwaiter();
+                @atomicStore(List, list_ptr, List.completed, .monotonic);
                 assert(awaiter.status.awaiting_group.ptr == group.ptr);
                 awaiter.status = .{ .queue_next = null };
                 return awaiter;
@@ -1662,21 +1773,17 @@ const Group = struct {
             @atomicStore(List, list_ptr, .{
                 .cancel_requested = false,
                 .awaiter_delayed = true,
-                .fibers = .null,
+                .fibers = .all_ones,
             }, .monotonic);
-        } else @atomicStore(List, list_ptr, .{
-            .cancel_requested = false,
-            .awaiter_delayed = false,
-            .fibers = .null,
-        }, .release);
+        } else @atomicStore(List, list_ptr, List.completed, .monotonic);
         return null;
     }
 
     fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
         group.lock(ev);
         defer group.unlock(ev);
-        if (@atomicLoad(List, group.listPtr(), .monotonic).fibers.unpack()) |_| {
-            if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
+        if (@atomicLoad(List, group.listPtr(), .monotonic).head()) |_| {
+            if (group.registerAwaiter(awaiter, awaiter.cancel_protection.check() == .unblocked)) {
                 // The awaiter already had an unacknowledged cancelation request before
                 // attempting to await a group, so propagate the cancelation to the group.
                 assert(!group.cancelLocked(ev, null));
@@ -1695,44 +1802,55 @@ const Group = struct {
     /// Assumes the mutex is held.
     fn cancelLocked(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
         const list_ptr = group.listPtr();
-        const list = @atomicRmw(
-            List,
-            list_ptr,
-            .Add,
-            .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
-            .monotonic,
-        );
-        assert(!list.cancel_requested);
-        if (list.fibers.unpack()) |head| {
-            var maybe_fiber: ?*Fiber = head;
-            while (maybe_fiber) |fiber| {
-                fiber.requestCancel(ev);
-                maybe_fiber = fiber.link.group.next;
+        const list = @atomicLoad(List, list_ptr, .monotonic);
+        if (list.head()) |head| {
+            @atomicStore(List, list_ptr, .{
+                .cancel_requested = true,
+                .awaiter_delayed = list.awaiter_delayed,
+                .fibers = list.fibers,
+            }, .monotonic);
+            if (!list.cancel_requested) {
+                var maybe_fiber: ?*Fiber = head;
+                while (maybe_fiber) |fiber| {
+                    fiber.requestCancel(ev);
+                    maybe_fiber = fiber.link.group.next;
+                }
             }
-            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
+            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter, false);
             return false;
         }
-        @atomicStore(
-            List,
-            list_ptr,
-            .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
-            .release,
-        );
+        if (list.awaiter_delayed) group.clearAwaiter();
+        @atomicStore(List, list_ptr, List.completed, .monotonic);
         return if (maybe_awaiter) |_| true else list.awaiter_delayed;
     }
 
     /// Assumes the mutex is held.
-    fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
+    fn registerAwaiter(group: Group, awaiter: *Fiber, cancelable: bool) bool {
         assert(awaiter.status.queue_next == null);
         awaiter.status = .{ .awaiting_group = group };
         assert(@atomicRmw(
             Awaiter,
             group.awaiterPtr(),
             .Add,
-            .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
+            .{ .locked = false, .cancel_callback_absent = false, .awaiter = .pack(awaiter) },
             .monotonic,
         ).awaiter == .null);
-        return awaiter.cancel_status.changeAwaiting(.nothing, .group);
+        const requested = if (cancelable)
+            awaiter.cancel_status.changeAwaiting(.nothing, .group)
+        else blk: {
+            assert(@atomicLoad(Fiber.CancelStatus, &awaiter.cancel_status, .monotonic).awaiting == .nothing);
+            break :blk false;
+        };
+        if (!cancelable or requested) {
+            // An uncancelable waiter has no group callback. A request that
+            // preceded registration likewise owns no group handoff.
+            _ = @atomicRmw(Awaiter, group.awaiterPtr(), .Or, .{
+                .locked = false,
+                .cancel_callback_absent = true,
+                .awaiter = .null,
+            }, .monotonic);
+        }
+        return requested;
     }
 
     const AsyncClosure = struct {
@@ -1787,7 +1905,7 @@ const Group = struct {
             message.handle(ev);
             assert(fiber.status.queue_next == null);
             closure.start(closure.contextPointer());
-            ev.yield(closure.group.removeFiber(ev, fiber), .destroy);
+            ev.yield(null, .{ .group_finished = .{ .fiber = fiber, .group = closure.group } });
             unreachable; // switched to dead fiber
         }
     };
@@ -1878,13 +1996,22 @@ fn groupAwait(
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
-    ev.yield(null, .{ .group_await = .{ .ptr = type_erased } });
+    const group: Group = .{ .ptr = type_erased };
+    while (true) {
+        ev.yield(null, .{ .group_await = group });
+        if (group.complete(ev)) break;
+    }
+    try checkCancel(ev);
 }
 
 fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
-    ev.yield(null, .{ .group_cancel = .{ .ptr = type_erased } });
+    const group: Group = .{ .ptr = type_erased };
+    while (true) {
+        ev.yield(null, .{ .group_cancel = group });
+        if (group.complete(ev)) break;
+    }
 }
 
 fn recancel(userdata: ?*anyopaque) void {
@@ -2107,8 +2234,21 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .net_send => |o| .{
             .net_send = r: {
-                _ = o;
-                break :r .{ error.NetworkDown, 0 }; // TODO
+                const opt_err, const n = ev.netSend(&maybe_sync.cancel_region, o.socket_handle, o.messages, o.flags);
+                break :r .{
+                    if (opt_err) |err| switch (err) {
+                        error.Canceled => |e| if (n == 0) {
+                            return e;
+                        } else {
+                            // Messages already went out; report them and leave
+                            // the cancelation for the next cancel point.
+                            recancel(ev);
+                            break :r .{ null, n };
+                        },
+                        else => |e| e,
+                    } else null,
+                    n,
+                };
             },
         },
         .net_read => |o| .{
@@ -2117,7 +2257,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
                 break :r error.NetworkDown; // TODO
             },
         },
-        .net_write => @panic("TODO implement net_write operation"),
+        .net_write => .{ .net_write = error.NetworkDown },
     };
 }
 
@@ -2201,21 +2341,142 @@ fn deviceIoControl(
     }
 }
 
+/// Cancel on the request's owning ring. MSG_RING's result preserves the
+/// target's low tag bits; stealing another pointer bit loses 4-aligned
+/// fiber addresses and cannot represent standalone batch timers.
+fn cancelRequest(thread: *Thread, ring_fd: fd_t, target: usize, acknowledge: bool) void {
+    // Only batch timers request acknowledgments. Give the cancel SQE its own
+    // tag so even a failed timer or cancel is attributed to the right owner.
+    assert(!acknowledge or target & 0b111 == 0b111);
+    const local = ring_fd == thread.io_uring.fd;
+    thread.enqueue().* = .{
+        .opcode = if (local) .ASYNC_CANCEL else .MSG_RING,
+        .flags = if (local and acknowledge) 0 else linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = if (local) 0 else ring_fd,
+        .off = if (local) 0 else (target & ~@as(usize, 0b11)) | 0b01,
+        .addr = if (local) target else @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+        .len = if (local) 0 else @as(u32, @intCast(target & 0b11)) | (if (acknowledge) @as(u32, 0b100) else 0),
+        .rw_flags = 0,
+        .user_data = if (local and acknowledge) target ^ 0b100 else @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+}
+
+/// The marker is idempotent: readiness, cancellation and a timeout may all
+/// arrive for one park, but only the first one schedules the waiting fiber.
+fn signalBatch(batch: *Io.Batch) ?*Fiber {
+    const previous = @atomicRmw(usize, @as(*usize, @ptrCast(&batch.userdata)), .Or, 0b01, .acq_rel);
+    return if (previous & 0b11 == 0) @ptrFromInt(previous) else null;
+}
+
+fn awaitBatch(ev: *Evented, batch: *Io.Batch, cancel_region: *CancelRegion) Io.Cancelable!void {
+    try cancel_region.await(.nothing);
+    const fiber = cancel_region.fiber;
+    if (cancel_region.status.requested) {
+        fiber.batch_wait_mutex.lock();
+        fiber.cancel_batch = batch;
+        if (@atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .acquire).requested) {
+            assert(signalBatch(batch) == null); // not parked yet
+        }
+        fiber.batch_wait_mutex.unlock();
+    }
+    ev.yield(null, .{ .batch_await = batch });
+    fiber.batch_wait_mutex.lock();
+    fiber.cancel_batch = null;
+    fiber.batch_wait_mutex.unlock();
+    cancel_region.await(.nothing) catch |err| {
+        // Consume the cancellation wake while retaining any real results.
+        // A caller may handle Canceled and await this same batch again.
+        batchDrainReady(ev, batch) catch {};
+        return err;
+    };
+}
+
+/// Unlike a linked timeout, this independent request must be quiescent
+/// before batchAwaitConcurrent returns. Wait for its cancel acknowledgment
+/// too, so a late cancel cannot match a later timer at the same address.
+const BatchTimeout = struct {
+    batch: *Io.Batch,
+    timespec: linux.kernel_timespec,
+    ring_fd: fd_t,
+    done: std.atomic.Value(u8) = .init(0),
+
+    const timer_done = 1;
+    const cancel_done = 2;
+    const timer_failed = 4;
+    const cancel_failed = 8;
+
+    fn userData(timer: *BatchTimeout) usize {
+        comptime assert(@alignOf(BatchTimeout) >= 8);
+        return @intFromPtr(timer) | 0b111;
+    }
+
+    fn complete(timer: *BatchTimeout, cancel_completion: bool, completion: Completion) ?*Fiber {
+        const failed: u8 = if (cancel_completion) switch (completion.errno()) {
+            .SUCCESS, .NOENT, .ALREADY => 0,
+            else => cancel_failed,
+        } else switch (completion.errno()) {
+            .TIME, .CANCELED => 0,
+            else => timer_failed,
+        };
+        // Publish failure before the wake marker: a fiber already running
+        // can consume the marker before the terminal ownership bit is set.
+        if (failed != 0) _ = timer.done.fetchOr(failed, .release);
+        const ready = signalBatch(timer.batch);
+        // Every terminal CQE releases its own ownership, regardless of errno.
+        // Last context access: the waiting fiber may now destroy this timer.
+        _ = timer.done.fetchOr(if (cancel_completion) cancel_done else timer_done, .release);
+        return ready;
+    }
+
+    fn checkFailure(timer: *BatchTimeout) Io.ConcurrentError!void {
+        const state = timer.done.load(.acquire);
+        if (state & cancel_failed != 0)
+            @panic("Uring failed to cancel a batch timeout");
+        if (state & timer_failed != 0) return error.ConcurrencyUnavailable;
+    }
+
+    fn deinit(timer: *BatchTimeout, ev: *Evented) void {
+        var required: u8 = timer_done;
+        if (timer.done.load(.acquire) & timer_done == 0) {
+            required |= cancel_done;
+            cancelRequest(.current(), timer.ring_fd, timer.userData(), true);
+        }
+        while (timer.done.load(.acquire) & required != required) {
+            // A failed cancel did not disarm the timer. Returning would leave
+            // a kernel pointer into this stack; waiting could take forever.
+            if (timer.done.load(.acquire) & cancel_failed != 0)
+                @panic("Uring failed to cancel a batch timeout");
+            batchDrainReady(ev, timer.batch) catch {};
+            if (timer.done.load(.acquire) & required == required) break;
+            ev.yield(null, .{ .batch_await = timer.batch });
+        }
+        batchDrainReady(ev, timer.batch) catch {};
+        if (timer.done.load(.acquire) & cancel_failed != 0)
+            @panic("Uring failed to cancel a batch timeout");
+    }
+};
+
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    ev.batchDrainSubmitted(&maybe_sync, batch, false) catch |err| switch (err) {
+    ev.batchDrainSubmitted(&maybe_sync, batch, false, .none) catch |err| switch (err) {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         error.Canceled => |e| return e,
     };
     maybe_sync.leaveSync(ev);
     while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
+        batchDrainReady(ev, batch) catch |err| switch (err) {
             error.Timeout => unreachable, // no timeout
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
-        ev.yield(null, .{ .batch_await = batch });
+        try awaitBatch(ev, batch, &maybe_sync.cancel_region);
     }
 }
 
@@ -2227,97 +2488,53 @@ fn batchAwaitConcurrent(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    try ev.batchDrainSubmitted(&maybe_sync, batch, true);
+    try ev.batchDrainSubmitted(&maybe_sync, batch, true, timeout);
     maybe_sync.leaveSync(ev);
-    const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => unreachable, // no timeout
-        };
-        if (batch.completed.head != .none or batch.pending.head == .none) return;
-        switch (timeout) {
-            .none => ev.yield(null, .{ .batch_await = batch }),
-            .duration => |duration| {
-                const ns = duration.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    duration.clock,
-                    0,
-                };
-            },
-            .deadline => |deadline| {
-                const ns = deadline.raw.toNanoseconds();
-                break .{
-                    .{
-                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                    },
-                    deadline.clock,
-                    linux.IORING_TIMEOUT_ABS,
-                };
-            },
+    if (timeout == .none) {
+        while (true) {
+            batchDrainReady(ev, batch) catch |err| switch (err) {
+                error.Timeout => |e| return if (batch.completed.head == .none) e,
+            };
+            if (batch.completed.head != .none or batch.pending.head == .none) return;
+            try awaitBatch(ev, batch, &maybe_sync.cancel_region);
         }
-    };
-    {
-        const thread = try maybe_sync.cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .TIMEOUT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&timespec),
-            .len = 1,
-            .rw_flags = timeout_flags | @as(u32, switch (clock) {
-                .real => linux.IORING_TIMEOUT_REALTIME,
-                else => 0,
-                .boot => linux.IORING_TIMEOUT_BOOTTIME,
-            }),
-            .user_data = @intFromPtr(&batch.userdata) | 0b11,
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
     }
-    while (batch.completed.head == .none and batch.pending.head != .none) {
-        ev.yield(null, .{ .batch_await = batch });
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => |e| return if (batch.completed.head == .none and
-                batch.pending.head != .none) e,
-        };
-    }
+    batchDrainReady(ev, batch) catch unreachable; // no timer armed yet
+    if (batch.completed.head != .none or batch.pending.head == .none) return;
+    const spec = timeoutSpec(timeout).?;
     const thread = try maybe_sync.cancel_region.awaitIoUring();
+    var timer: BatchTimeout = .{
+        .batch = batch,
+        .timespec = spec.ts,
+        .ring_fd = thread.io_uring.fd,
+    };
     thread.enqueue().* = .{
-        .opcode = .TIMEOUT_REMOVE,
+        .opcode = .TIMEOUT,
         .flags = 0,
         .ioprio = 0,
         .fd = 0,
         .off = 0,
-        .addr = @intFromPtr(&batch.userdata) | 0b11,
-        .len = 0,
-        .rw_flags = 0,
-        .user_data = @intFromPtr(maybe_sync.cancel_region.fiber),
+        .addr = @intFromPtr(&timer.timespec),
+        .len = 1,
+        .rw_flags = spec.rw_flags,
+        .user_data = timer.userData(),
         .buf_index = 0,
         .personality = 0,
         .splice_fd_in = 0,
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
-    switch (maybe_sync.cancel_region.errno()) {
-        .SUCCESS => return,
-        .BUSY, .NOENT => {},
-        else => |err| unexpectedErrno(err) catch {},
-    }
+    defer timer.deinit(ev);
     while (true) {
-        batchDrainReady(batch) catch |err| switch (err) {
-            error.Timeout => return,
+        batchDrainReady(ev, batch) catch |err| switch (err) {
+            error.Timeout => |e| if (batch.completed.head == .none) {
+                try timer.checkFailure();
+                return e;
+            },
         };
-        ev.yield(null, .{ .batch_await = batch });
+        if (batch.completed.head != .none or batch.pending.head == .none) return;
+        try timer.checkFailure();
+        try awaitBatch(ev, batch, &maybe_sync.cancel_region);
     }
 }
 
@@ -2327,11 +2544,16 @@ fn batchDrainSubmitted(
     maybe_sync: *CancelRegion.Sync.Maybe,
     batch: *Io.Batch,
     concurrency: bool,
+    timeout: Io.Timeout,
 ) (Io.ConcurrentError || Io.Cancelable)!void {
     var index = batch.submitted.head;
     if (index == .none) return;
     const thread = try maybe_sync.cancelRegion().awaitIoUring();
     errdefer batch.submitted.head = index;
+    // Every finite wait owns an independent BatchTimeout with a two-CQE
+    // completion barrier. A LINK_TIMEOUT cannot release request storage after
+    // the operation CQE alone: its later ETIME would retain a dangling batch.
+    _ = timeout;
     while (index != .none) {
         const storage = &batch.storage[index.toIndex()];
         const next_index = storage.submission.node.next;
@@ -2402,20 +2624,80 @@ fn batchDrainSubmitted(
             else
                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
             .net_receive => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_receive");
+                // Take what is already queued without blocking; only an empty
+                // queue costs a ring submission.
+                const opt_err, const count = netReceiveNonblocking(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| break :result .{ .net_receive = .{ e, count } },
+                } else break :result .{ .net_receive = .{ null, count } };
+                const context = ev.allocator().create(RecvContext) catch
+                    break :result .{ .net_receive = .{ error.SystemResources, 0 } };
+                context.init(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
+                storage.* = .{ .pending = .{
+                    .node = .{ .prev = batch.pending.tail, .next = .none },
+                    .tag = .net_receive,
+                    .userdata = undefined,
+                } };
+                storage.pending.userdata[3] = @intFromPtr(context);
+                thread.enqueue().* = .{
+                    .opcode = .RECVMSG,
+                    .flags = 0,
+                    .ioprio = 0,
+                    .fd = o.socket_handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&context.msg),
+                    .len = 0,
+                    .rw_flags = posixReceiveFlags(o.flags),
+                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                break :result null;
             },
             .net_send => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_send");
+                const opt_err, const sent = netSendNonblocking(o.socket_handle, o.messages, o.flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| break :result .{ .net_send = .{ e, sent } },
+                } else break :result .{ .net_send = .{ null, sent } };
+                const context = ev.allocator().create(SendContext) catch
+                    break :result .{ .net_send = .{ error.SystemResources, 0 } };
+                context.init(o.socket_handle, o.messages, o.flags);
+                storage.* = .{ .pending = .{
+                    .node = .{ .prev = batch.pending.tail, .next = .none },
+                    .tag = .net_send,
+                    .userdata = undefined,
+                } };
+                storage.pending.userdata[3] = @intFromPtr(context);
+                thread.enqueue().* = .{
+                    .opcode = .SENDMSG,
+                    .flags = 0,
+                    .ioprio = 0,
+                    .fd = o.socket_handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&context.msg),
+                    .len = 0,
+                    .rw_flags = posixSendFlags(o.flags),
+                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                break :result null;
             },
             .net_read => |o| {
                 _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_read");
+                break :result .{ .net_read = error.NetworkDown };
             },
             .net_write => |o| {
                 _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_write");
+                break :result .{ .net_write = error.NetworkDown };
             },
         })) |result| {
             switch (batch.completed.tail) {
@@ -2431,25 +2713,26 @@ fn batchDrainSubmitted(
             }
             batch.pending.tail = index;
             storage.pending.userdata[0] = @intFromPtr(batch);
+            // The ring this operation was submitted on. A fiber woken by the
+            // timer is often rescheduled on another thread, and a cancel must
+            // reach the ring that holds the request (see `batchCancel`).
+            storage.pending.userdata[4] = @as(u32, @bitCast(thread.io_uring.fd));
+            storage.pending.userdata[5] = 0;
         }
         index = next_index;
     }
     batch.submitted = .{ .head = .none, .tail = .none };
 }
 
-fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
+fn batchDrainReady(ev: *Evented, batch: *Io.Batch) Io.Timeout.Error!void {
     while (@atomicRmw(?*anyopaque, &batch.userdata, .Xchg, null, .acquire)) |head| {
         var next: usize = @intFromPtr(head);
         var timeout = false;
         while (cond: switch (@as(u2, @truncate(next))) {
             0b00 => if (timeout) return error.Timeout else false,
-            0b01 => {
-                assert(!timeout);
-                return error.Timeout;
-            },
+            0b01 => return error.Timeout,
             0b10 => true,
             0b11 => {
-                assert(!timeout);
                 timeout = true;
                 break :cond true;
             },
@@ -2517,10 +2800,45 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                     },
                 },
                 .device_io_control => unreachable,
-                .net_receive => @panic("TODO"),
-                .net_send => @panic("TODO"),
-                .net_read => @panic("TODO"),
-                .net_write => @panic("TODO"),
+                .net_receive => {
+                    const context: *RecvContext = @ptrFromInt(operation_userdata[3]);
+                    defer ev.allocator().destroy(context);
+                    break :result .{
+                        .net_receive = switch (completion.errno()) {
+                            .SUCCESS => context.complete(@intCast(completion.result)),
+                            // Nothing was received; `Io.operateTimeout` arms again
+                            // when the slot comes back without a result.
+                            .CANCELED, .INTR, .AGAIN => break :result null,
+                            .BADF => |err| .{ errnoBug(err), 0 },
+                            .NFILE => .{ error.SystemFdQuotaExceeded, 0 },
+                            .MFILE => .{ error.ProcessFdQuotaExceeded, 0 },
+                            .FAULT => |err| .{ errnoBug(err), 0 },
+                            .INVAL => |err| .{ errnoBug(err), 0 },
+                            .NOBUFS => .{ error.SystemResources, 0 },
+                            .NOMEM => .{ error.SystemResources, 0 },
+                            .NOTCONN => .{ error.SocketUnconnected, 0 },
+                            .NOTSOCK => |err| .{ errnoBug(err), 0 },
+                            .MSGSIZE => .{ error.MessageOversize, 0 },
+                            .PIPE => .{ error.SocketUnconnected, 0 },
+                            .OPNOTSUPP => |err| .{ errnoBug(err), 0 },
+                            .CONNRESET => .{ error.ConnectionResetByPeer, 0 },
+                            .TIMEDOUT => .{ error.ConnectionTimedOut, 0 },
+                            .NETDOWN => .{ error.NetworkDown, 0 },
+                            else => |err| .{ unexpectedErrno(err), 0 },
+                        },
+                    };
+                },
+                .net_send => {
+                    const context: *SendContext = @ptrFromInt(operation_userdata[3]);
+                    defer ev.allocator().destroy(context);
+                    break :result .{ .net_send = switch (completion.errno()) {
+                        .SUCCESS => context.complete(@intCast(completion.result)),
+                        .CANCELED, .INTR, .AGAIN => break :result null,
+                        else => |err| .{ sendErrno(err), 0 },
+                    } };
+                },
+                .net_read => unreachable, // Unsupported stream operations complete inline.
+                .net_write => unreachable, // Unsupported stream operations complete inline.
             })) |result| {
                 switch (batch.completed.tail) {
                     .none => batch.completed.head = index,
@@ -2543,9 +2861,10 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
+    // A timer armed by an earlier `batchAwaitConcurrent` may still fire while
+    // the batch is being torn down; its marker is simply consumed here.
+    batchDrainReady(ev, batch) catch |err| switch (err) {
+        error.Timeout => {},
     };
     var index = batch.pending.head;
     if (index == .none) return;
@@ -2556,27 +2875,18 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     };
     while (index != .none) {
         const pending = &batch.storage[index.toIndex()].pending;
-        thread.enqueue().* = .{
-            .opcode = .ASYNC_CANCEL,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
-            .fd = 0,
-            .off = 0,
-            .addr = @intFromPtr(&pending.userdata) | 0b10,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @backingInt(Completion.Userdata.wakeup),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
+        const ring_fd: fd_t = @bitCast(@as(u32, @intCast(pending.userdata[4])));
+        cancelRequest(thread, ring_fd, @intFromPtr(&pending.userdata) | 0b10, false);
         index = pending.node.next;
     }
-    while (batch.pending.head != .none) batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
-    };
+    // The cancel completions land on this thread's ring, which is only
+    // drained while this fiber is parked, so park until they arrive.
+    while (batch.pending.head != .none) {
+        ev.yield(null, .{ .batch_await = batch });
+        batchDrainReady(ev, batch) catch |err| switch (err) {
+            error.Timeout => {},
+        };
+    }
 }
 
 fn dirCreateDir(
@@ -4235,90 +4545,32 @@ fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.Se
     return chdir(&sync, dir_path_posix);
 }
 
+/// Process option resolution is shared with Threaded, including .path/.file and
+/// explicit executable names. These synchronous calls block the current worker.
 fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-
-    try ev.scanEnviron(); // for PATH
-    const PATH = ev.environ.string.PATH orelse default_PATH;
-
-    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
-    defer arena_allocator.deinit();
-    const arena = arena_allocator.allocator();
-
-    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
-    for (options.argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
-
-    const env_block = env_block: {
-        const prog_fd: i32 = -1;
-        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
-            .zig_progress_fd = prog_fd,
-        });
-    };
-
-    var sync: CancelRegion.Sync = try .init(ev);
-    defer sync.deinit(ev);
-    return execv(&sync, options.expand_arg0, argv_buf.ptr[0].?, argv_buf.ptr, env_block, PATH);
-}
-
-fn processReplacePath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.ReplaceOptions,
-) process.ReplaceError {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processReplacePath");
+    try checkCancel(ev);
+    const fallback = ev.threaded.io();
+    return fallback.vtable.processReplace(fallback.userdata, options);
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const spawned = try ev.spawn(options);
-    var cancel_region: CancelRegion = .initBlocked();
-    defer cancel_region.deinit();
-    defer ev.closeAsync(spawned.err_fd);
-
-    // Wait for the child to report any errors in or before `execvpe`.
-    var child_err: ForkBailError = undefined;
-    ev.readAll(&cancel_region, spawned.err_fd, @ptrCast(&child_err)) catch |read_err| {
-        switch (read_err) {
-            error.Canceled => unreachable, // blocked
-            error.EndOfStream => {
-                // Write end closed by CLOEXEC at the time of the `execvpe` call,
-                // indicating success.
-            },
-            else => {
-                // Problem reading the error from the error reporting pipe. We
-                // don't know if the child is alive or dead. Better to assume it is
-                // alive so the resource does not risk being leaked.
-            },
-        }
-        return .{
-            .id = spawned.pid,
-            .thread_handle = {},
-            .stdin = spawned.stdin,
-            .stdout = spawned.stdout,
-            .stderr = spawned.stderr,
-            .request_resource_usage_statistics = options.request_resource_usage_statistics,
-        };
-    };
-    return child_err;
+    try checkCancel(ev);
+    const fallback = ev.threaded.io();
+    return fallback.vtable.processSpawn(fallback.userdata, options);
 }
 
-fn processSpawnPath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    options: process.SpawnOptions,
-) process.SpawnError!process.Child {
+fn inheritParentDir(userdata: ?*anyopaque, handle: Dir.Handle) Io.InheritParentHandleError!Dir {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processSpawnPath");
+    const fallback = ev.threaded.io();
+    return fallback.vtable.inheritParentDir(fallback.userdata, handle);
+}
+
+fn inheritParentFile(userdata: ?*anyopaque, handle: File.Handle, flags: File.Flags) Io.InheritParentHandleError!File {
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    const fallback = ev.threaded.io();
+    return fallback.vtable.inheritParentFile(fallback.userdata, handle, flags);
 }
 
 const prog_fileno = @max(linux.STDIN_FILENO, linux.STDOUT_FILENO, linux.STDERR_FILENO);
@@ -4706,7 +4958,6 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    defer ev.childCleanup(child);
 
     const pid = child.id.?;
     var info: linux.siginfo_t = undefined;
@@ -4732,10 +4983,18 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
         ev.yield(null, .nothing);
         switch (maybe_sync.cancel_region.errno()) {
             .SUCCESS => {
+                // WAITID has observed a terminal child (and normally reaped
+                // it). Before this point cancellation must preserve ownership.
                 if (child.request_resource_usage_statistics) {
-                    const sync = try maybe_sync.enterSync(ev);
+                    // NOWAIT left this already-terminal child unreaped. Finish
+                    // that ownership transfer without a cancellation point.
+                    const previous = swapCancelProtection(ev, .blocked);
+                    defer _ = swapCancelProtection(ev, previous);
+                    maybe_sync.cancelRegion().deinit();
+                    maybe_sync = .{ .sync = .initBlocked(ev) };
+                    const sync = &maybe_sync.sync;
                     while (true) {
-                        try sync.cancel_region.await(.nothing);
+                        sync.cancel_region.await(.nothing) catch unreachable;
                         var rusage: linux.rusage = undefined;
                         switch (linux.errno(linux.waitid(
                             .PID,
@@ -4754,6 +5013,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
                         }
                     }
                 }
+                defer ev.childCleanup(child);
                 const status: u32 = @bitCast(info.fields.common.second.sigchld.status);
                 const code: linux.CLD = @fromBackingInt(@intCast(info.code));
                 return switch (code) {
@@ -4778,7 +5038,7 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
     defer ev.childCleanup(child);
 
     const pid = child.id.?;
-    while (true) switch (linux.errno(linux.kill(pid, .TERM))) {
+    while (true) switch (linux.errno(linux.kill(pid, .KILL))) {
         .SUCCESS => break,
         .INTR => {},
         .PERM => return,
@@ -4935,6 +5195,13 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .resv = 0,
     };
     ev.yield(null, .nothing);
+    if (cancel_region.errno() == .CANCELED) {
+        // Protected waits never register a cancelable ring source. A canceled
+        // timer therefore belongs to this region's cancellation request.
+        assert(cancel_region.status.requested);
+        cancel_region.fiber.cancel_protection.acknowledge();
+        return error.Canceled;
+    }
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
     // getting here, which would have reported 0, making this a legal
@@ -5018,6 +5285,8 @@ fn netBindIp(
     defer maybe_sync.deinit(ev);
     const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, options);
     errdefer ev.closeAsync(socket_fd);
+    if (options.reuse_port or options.reuse_port_load_balance)
+        try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1);
     var storage: PosixAddress = undefined;
     var addr_len = addressToPosix(address, &storage);
     try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
@@ -5069,6 +5338,386 @@ fn netSocketCreatePairUnavailable(
     return error.OperationUnsupported;
 }
 
+const TimeoutSpec = struct { ts: linux.kernel_timespec, rw_flags: u32 };
+
+/// The timespec and `TIMEOUT` flags for an `Io.Timeout`; null for `.none`.
+fn timeoutSpec(timeout: Io.Timeout) ?TimeoutSpec {
+    const ns, const clock, const abs = switch (timeout) {
+        .none => return null,
+        .duration => |d| .{ d.raw.toNanoseconds(), d.clock, @as(u32, 0) },
+        .deadline => |d| .{ d.raw.toNanoseconds(), d.clock, @as(u32, linux.IORING_TIMEOUT_ABS) },
+    };
+    return .{
+        .ts = .{
+            .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+            .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+        },
+        .rw_flags = abs | @as(u32, switch (clock) {
+            .real => linux.IORING_TIMEOUT_REALTIME,
+            .boot => linux.IORING_TIMEOUT_BOOTTIME,
+            else => 0,
+        }),
+    };
+}
+
+/// Message flags shared by every receive path.
+fn posixReceiveFlags(flags: net.ReceiveFlags) u32 {
+    return linux.MSG.NOSIGNAL |
+        @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
+        @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0);
+}
+
+fn posixSendFlags(flags: net.SendFlags) u32 {
+    return @as(u32, if (flags.confirm) linux.MSG.CONFIRM else 0) |
+        @as(u32, if (flags.dont_route) linux.MSG.DONTROUTE else 0) |
+        @as(u32, if (flags.eor) linux.MSG.EOR else 0) |
+        @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (flags.fastopen) linux.MSG.FASTOPEN else 0) |
+        linux.MSG.NOSIGNAL;
+}
+
+fn incomingFromMsghdr(
+    message: *net.IncomingMessage,
+    storage: *const PosixAddress,
+    data: []u8,
+    msg: *const linux.msghdr,
+) void {
+    message.* = .{
+        .from = addressFromPosix(storage),
+        .data = data,
+        .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+        .flags = .{
+            .eor = msg.flags & linux.MSG.EOR != 0,
+            .trunc = msg.flags & linux.MSG.TRUNC != 0,
+            .ctrunc = msg.flags & linux.MSG.CTRUNC != 0,
+            .oob = msg.flags & linux.MSG.OOB != 0,
+            .errqueue = msg.flags & linux.MSG.ERRQUEUE != 0,
+        },
+    };
+}
+
+fn receiveErrno(err: linux.E) Io.Operation.NetReceive.Error {
+    return switch (err) {
+        .BADF => |e| errnoBug(e),
+        .NFILE => error.SystemFdQuotaExceeded,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .NOTSOCK => |e| errnoBug(e),
+        .MSGSIZE => error.MessageOversize,
+        .PIPE => error.SocketUnconnected,
+        .OPNOTSUPP => |e| errnoBug(e),
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+fn sendErrno(err: linux.E) Io.Operation.NetSend.Error {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .MSGSIZE => error.MessageOversize,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .PIPE => error.SocketUnconnected,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketUnconnected,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .DESTADDRREQ => |e| errnoBug(e), // Not connection-mode and no peer address set.
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        .ISCONN => |e| errnoBug(e), // Connected socket but a recipient was specified.
+        .NOTSOCK => |e| errnoBug(e),
+        .OPNOTSUPP => |e| errnoBug(e), // A flag is inappropriate for the socket type.
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+/// One `recvmsg(2)` with `MSG_DONTWAIT`. Sockets made by this backend are in
+/// blocking mode, so the flag is what keeps a drain from parking the thread.
+fn recvmsgNonblocking(
+    handle: net.Socket.Handle,
+    message: *net.IncomingMessage,
+    data_buffer: []u8,
+    posix_flags: u32,
+) (Io.Operation.NetReceive.Error || error{WouldBlock})!void {
+    var storage: PosixAddress = undefined;
+    var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+    var msg: linux.msghdr = .{
+        .name = &storage.any,
+        .namelen = @sizeOf(PosixAddress),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        .control = message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = undefined,
+    };
+    while (true) {
+        const rc = linux.recvmsg(handle, &msg, posix_flags | linux.MSG.DONTWAIT);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                // With `MSG_TRUNC` the kernel reports the full datagram length.
+                incomingFromMsghdr(message, &storage, data_buffer[0..@min(rc, data_buffer.len)], &msg);
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return receiveErrno(err),
+        }
+    }
+}
+
+/// Receives as many messages as are immediately available, carving
+/// `data_buffer` sequentially (each message's `data` is a slice of it).
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN`, a full `message_buffer`, or an exhausted `data_buffer`
+/// ends the batch normally with the count received so far. Any other error
+/// is reported together with the number of messages already received, which
+/// the caller must still process.
+fn netReceiveNonblocking(
+    handle: net.Socket.Handle,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) struct { ?(Io.Operation.NetReceive.Error || error{WouldBlock}), usize } {
+    const posix_flags = posixReceiveFlags(flags);
+    var data_i: usize = 0;
+    for (message_buffer, 0..) |*message, message_i| {
+        const remaining = data_buffer[data_i..];
+        // No room left for another datagram: stop rather than let `recvmsg`
+        // consume one into a zero-length buffer.
+        if (remaining.len == 0 and message_i != 0) return .{ null, message_i };
+        recvmsgNonblocking(handle, message, remaining, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => return if (message_i == 0) .{ error.WouldBlock, 0 } else .{ null, message_i },
+            else => |e| return .{ e, message_i },
+        };
+        data_i += message.data.len;
+    }
+    return .{ null, message_buffer.len };
+}
+
+/// One `sendmsg(2)` with `MSG_DONTWAIT`.
+fn sendmsgNonblocking(
+    handle: net.Socket.Handle,
+    message: *net.OutgoingMessage,
+    posix_flags: u32,
+) (Io.Operation.NetSend.Error || error{WouldBlock})!void {
+    var addr: PosixAddress = undefined;
+    var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
+    const msg: linux.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = addressToPosix(message.address, &addr),
+        .iov = (&iov)[0..1],
+        .iovlen = 1,
+        // The kernel rejects a non-null control pointer with a zero length.
+        .control = if (message.control.len == 0) null else message.control.ptr,
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    while (true) {
+        const rc = linux.sendmsg(handle, &msg, posix_flags | linux.MSG.DONTWAIT);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                message.data_len = rc;
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return sendErrno(err),
+        }
+    }
+}
+
+/// Sends as many of `messages` as the socket accepts right now, in order.
+/// Returns `error.WouldBlock` only when the first message would block; a
+/// later `EAGAIN` ends the batch normally with the count sent so far.
+fn netSendNonblocking(
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?(Io.Operation.NetSend.Error || error{WouldBlock}), usize } {
+    const posix_flags = posixSendFlags(flags);
+    for (messages, 0..) |*message, i| {
+        sendmsgNonblocking(handle, message, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => return if (i == 0) .{ error.WouldBlock, 0 } else .{ null, i },
+            else => |e| return .{ e, i },
+        };
+    }
+    return .{ null, messages.len };
+}
+
+/// Storage for a batched `net_receive` that had to wait in the ring. The
+/// kernel reads the `msghdr`, the `iovec` and the address through pointers,
+/// so they must outlive the submission; the struct is heap-allocated by
+/// `batchDrainSubmitted` and freed by `batchDrainReady`.
+const RecvContext = struct {
+    msg: linux.msghdr,
+    iov: iovec,
+    addr: PosixAddress,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+    handle: net.Socket.Handle,
+
+    fn init(
+        context: *RecvContext,
+        handle: net.Socket.Handle,
+        message_buffer: []net.IncomingMessage,
+        data_buffer: []u8,
+        flags: net.ReceiveFlags,
+    ) void {
+        context.handle = handle;
+        context.message_buffer = message_buffer;
+        context.data_buffer = data_buffer;
+        context.flags = flags;
+        context.iov = .{ .base = data_buffer.ptr, .len = data_buffer.len };
+        context.msg = .{
+            .name = &context.addr.any,
+            .namelen = @sizeOf(PosixAddress),
+            .iov = (&context.iov)[0..1],
+            .iovlen = 1,
+            .control = message_buffer[0].control.ptr,
+            .controllen = @intCast(message_buffer[0].control.len),
+            .flags = undefined,
+        };
+    }
+
+    /// The ring delivered the first message; take whatever else is queued
+    /// without blocking, as the poll-based backends do on a wake.
+    fn complete(context: *RecvContext, received_len: usize) struct { ?Io.Operation.NetReceive.Error, usize } {
+        const first = &context.message_buffer[0];
+        const first_len = @min(received_len, context.data_buffer.len);
+        incomingFromMsghdr(first, &context.addr, context.data_buffer[0..first_len], &context.msg);
+        // The first datagram already exhausted the data buffer, including a
+        // caller-supplied empty buffer. Starting a fresh drain would consume
+        // the next datagram into a zero-length buffer.
+        if (first_len == context.data_buffer.len) return .{ null, 1 };
+        const opt_err, const more = netReceiveNonblocking(
+            context.handle,
+            context.message_buffer[1..],
+            context.data_buffer[first_len..],
+            context.flags,
+        );
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, 1 + more },
+        };
+        return .{ null, 1 + more };
+    }
+};
+
+/// Storage for a batched `net_send` whose first message had to wait in the
+/// ring. Same lifetime rules as `RecvContext`.
+const SendContext = struct {
+    msg: linux.msghdr_const,
+    iov: iovec_const,
+    addr: PosixAddress,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+    handle: net.Socket.Handle,
+
+    fn init(
+        context: *SendContext,
+        handle: net.Socket.Handle,
+        messages: []net.OutgoingMessage,
+        flags: net.SendFlags,
+    ) void {
+        const first = &messages[0];
+        context.handle = handle;
+        context.messages = messages;
+        context.flags = flags;
+        context.iov = .{ .base = first.data_ptr, .len = first.data_len };
+        context.msg = .{
+            .name = &context.addr.any,
+            .namelen = addressToPosix(first.address, &context.addr),
+            .iov = (&context.iov)[0..1],
+            .iovlen = 1,
+            .control = if (first.control.len == 0) null else first.control.ptr,
+            .controllen = @intCast(first.control.len),
+            .flags = 0,
+        };
+    }
+
+    fn complete(context: *SendContext, sent_len: usize) struct { ?Io.Operation.NetSend.Error, usize } {
+        context.messages[0].data_len = sent_len;
+        const opt_err, const more = netSendNonblocking(context.handle, context.messages[1..], context.flags);
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, 1 + more },
+        };
+        return .{ null, 1 + more };
+    }
+};
+
+fn netSend(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?net.Socket.SendError, usize } {
+    const posix_flags = posixSendFlags(flags);
+    var i: usize = 0;
+    while (i < messages.len) {
+        const message = &messages[i];
+        sendmsgNonblocking(handle, message, posix_flags) catch |err| switch (err) {
+            error.WouldBlock => {
+                // Send buffer full: let the ring wait for room on this one.
+                var addr: PosixAddress = undefined;
+                var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
+                const msg: linux.msghdr_const = .{
+                    .name = &addr.any,
+                    .namelen = addressToPosix(message.address, &addr),
+                    .iov = (&iov)[0..1],
+                    .iovlen = 1,
+                    .control = if (message.control.len == 0) null else message.control.ptr,
+                    .controllen = @intCast(message.control.len),
+                    .flags = 0,
+                };
+                const thread = cancel_region.awaitIoUring() catch |e| return .{ e, i };
+                thread.enqueue().* = .{
+                    .opcode = .SENDMSG,
+                    .flags = 0,
+                    .ioprio = 0,
+                    .fd = handle,
+                    .off = 0,
+                    .addr = @intFromPtr(&msg),
+                    .len = 0,
+                    .rw_flags = posix_flags,
+                    .user_data = @intFromPtr(cancel_region.fiber),
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                ev.yield(null, .nothing);
+                const completion = cancel_region.completion();
+                switch (completion.errno()) {
+                    .SUCCESS => message.data_len = @intCast(completion.result),
+                    .INTR, .CANCELED => continue, // retry this message
+                    .AGAIN => continue,
+                    else => |e| return .{ sendErrno(e), i },
+                }
+            },
+            else => |e| return .{ e, i },
+        };
+        i += 1;
+    }
+    return .{ null, messages.len };
+}
+
 fn netReceive(
     ev: *Evented,
     cancel_region: *CancelRegion,
@@ -5077,15 +5726,21 @@ fn netReceive(
     data_buffer: []u8,
     flags: net.ReceiveFlags,
 ) struct { ?net.Socket.ReceiveError, usize } {
-    var message_i: usize = 0;
-    var data_i: usize = 0;
-
+    assert(message_buffer.len >= 1);
+    // Take what is queued without blocking.
+    {
+        const opt_err, const count = netReceiveNonblocking(handle, message_buffer, data_buffer, flags);
+        if (opt_err) |err| switch (err) {
+            error.WouldBlock => {},
+            else => |e| return .{ e, count },
+        } else return .{ null, count };
+    }
+    // Nothing queued: wait for the first message in the ring, then drain the
+    // rest without blocking, as the poll-based backends do on a wake.
+    const message = &message_buffer[0];
     while (true) {
-        if (message_buffer.len - message_i == 0) return .{ null, message_i };
-        const message = &message_buffer[message_i];
-        const remaining_data_buffer = data_buffer[data_i..];
         var storage: PosixAddress = undefined;
-        var iov: iovec = .{ .base = remaining_data_buffer.ptr, .len = remaining_data_buffer.len };
+        var iov: iovec = .{ .base = data_buffer.ptr, .len = data_buffer.len };
         var msg: linux.msghdr = .{
             .name = &storage.any,
             .namelen = @sizeOf(PosixAddress),
@@ -5096,7 +5751,7 @@ fn netReceive(
             .flags = undefined,
         };
 
-        const thread = cancel_region.awaitIoUring() catch |err| return .{ err, message_i };
+        const thread = cancel_region.awaitIoUring() catch |err| return .{ err, 0 };
         thread.enqueue().* = .{
             .opcode = .RECVMSG,
             .flags = 0,
@@ -5105,10 +5760,7 @@ fn netReceive(
             .off = 0,
             .addr = @intFromPtr(&msg),
             .len = 0,
-            .rw_flags = linux.MSG.NOSIGNAL |
-                @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
-                @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
-                @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0),
+            .rw_flags = posixReceiveFlags(flags),
             .user_data = @intFromPtr(cancel_region.fiber),
             .buf_index = 0,
             .personality = 0,
@@ -5120,41 +5772,21 @@ fn netReceive(
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => {
-                const data = remaining_data_buffer[0..@intCast(completion.result)];
-                data_i += data.len;
-                message.* = .{
-                    .from = addressFromPosix(&storage),
-                    .data = data,
-                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
-                    .flags = .{
-                        .eor = msg.flags & linux.MSG.EOR != 0,
-                        .trunc = msg.flags & linux.MSG.TRUNC != 0,
-                        .ctrunc = msg.flags & linux.MSG.CTRUNC != 0,
-                        .oob = msg.flags & linux.MSG.OOB != 0,
-                        .errqueue = msg.flags & linux.MSG.ERRQUEUE != 0,
-                    },
+                const data = data_buffer[0..@min(@as(usize, @intCast(completion.result)), data_buffer.len)];
+                incomingFromMsghdr(message, &storage, data, &msg);
+                // Keep the next datagram queued when the first one filled
+                // the caller's buffer (also when its capacity is zero).
+                if (data.len == data_buffer.len) return .{ null, 1 };
+                const opt_err, const more = netReceiveNonblocking(handle, message_buffer[1..], data_buffer[data.len..], flags);
+                if (opt_err) |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => |e| return .{ e, 1 + more },
                 };
-                message_i += 1;
-                continue;
+                return .{ null, 1 + more };
             },
-            .AGAIN => unreachable,
+            .AGAIN => continue, // a foreign nonblocking socket; wait again
             .INTR, .CANCELED => {},
-            .BADF => |err| return .{ errnoBug(err), message_i },
-            .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
-            .MFILE => return .{ error.ProcessFdQuotaExceeded, message_i },
-            .FAULT => |err| return .{ errnoBug(err), message_i },
-            .INVAL => |err| return .{ errnoBug(err), message_i },
-            .NOBUFS => return .{ error.SystemResources, message_i },
-            .NOMEM => return .{ error.SystemResources, message_i },
-            .NOTCONN => return .{ error.SocketUnconnected, message_i },
-            .NOTSOCK => |err| return .{ errnoBug(err), message_i },
-            .MSGSIZE => return .{ error.MessageOversize, message_i },
-            .PIPE => return .{ error.SocketUnconnected, message_i },
-            .OPNOTSUPP => |err| return .{ errnoBug(err), message_i },
-            .CONNRESET => return .{ error.ConnectionResetByPeer, message_i },
-            .TIMEDOUT => return .{ error.ConnectionTimedOut, message_i },
-            .NETDOWN => return .{ error.NetworkDown, message_i },
-            else => |err| return .{ unexpectedErrno(err), message_i },
+            else => |err| return .{ receiveErrno(err), 0 },
         }
     }
 }
@@ -5287,11 +5919,33 @@ fn bind(
             .ACCES => return error.AccessDenied,
             .ADDRINUSE => return error.AddressInUse,
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .INVAL => |err| return errnoBug(err), // invalid parameters
+            // Kernels before 6.11 have no `IORING_OP_BIND` and reject the
+            // opcode with EINVAL. `bind(2)` never blocks, so fall back to it;
+            // a genuine EINVAL surfaces from the syscall instead.
+            .INVAL, .OPNOTSUPP => return bindSync(socket_fd, addr, addr_len),
             .NOTSOCK => |err| return errnoBug(err), // invalid `sockfd`
             .AFNOSUPPORT => return error.AddressFamilyUnsupported,
             .ADDRNOTAVAIL => return error.AddressUnavailable,
             .FAULT => |err| return errnoBug(err), // invalid `addr` pointer
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn bindSync(socket_fd: fd_t, addr: *const linux.sockaddr, addr_len: linux.socklen_t) !void {
+    while (true) {
+        switch (linux.errno(linux.bind(socket_fd, addr, addr_len))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .FAULT => |err| return errnoBug(err),
             .NOMEM => return error.SystemResources,
             else => |err| return unexpectedErrno(err),
         }
@@ -6107,4 +6761,60 @@ fn writeSync(sync: *CancelRegion.Sync, fd: fd_t, buffer: []const u8) File.Writer
 
 test {
     _ = Fiber.CancelProtection;
+}
+
+test "Uring batch timeout terminal errors release their request ownership" {
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    inline for (.{ linux.E.INVAL, linux.E.NOMEM, linux.E.NOSYS, linux.E.FAULT, linux.E.INTR }) |err| {
+        var timer: BatchTimeout = .{
+            .batch = &batch,
+            .timespec = .{ .sec = 0, .nsec = 0 },
+            .ring_fd = -1,
+        };
+        batch.userdata = null;
+        try std.testing.expectEqual(null, timer.complete(false, .{
+            .result = -@as(i32, @intCast(@backingInt(err))),
+            .flags = 0,
+        }));
+        try std.testing.expectEqual(BatchTimeout.timer_done | BatchTimeout.timer_failed, timer.done.load(.acquire));
+        try std.testing.expectError(error.ConcurrencyUnavailable, timer.checkFailure());
+        // A setup error still wakes the batch, but is distinguished from
+        // expiry before reporting the marker to the caller.
+        try std.testing.expectEqual(@as(usize, 0b01), @intFromPtr(batch.userdata.?));
+        batch.userdata = null;
+
+        // An identical errno on the cancel SQE releases the other ownership
+        // bit. It cannot be mistaken for the timer's completion.
+        timer.done.store(0, .monotonic);
+        try std.testing.expectEqual(null, timer.complete(true, .{
+            .result = -@as(i32, @intCast(@backingInt(err))),
+            .flags = 0,
+        }));
+        try std.testing.expectEqual(BatchTimeout.cancel_done | BatchTimeout.cancel_failed, timer.done.load(.acquire));
+        batch.userdata = null;
+    }
+}
+
+test "Uring batch timeout acknowledgments preserve both completion orders" {
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    const parked: *Fiber = @ptrFromInt(0x1000);
+    inline for (.{ false, true }) |cancel_first| {
+        inline for (.{ linux.E.SUCCESS, linux.E.NOENT, linux.E.ALREADY }) |cancel_errno| {
+            var timer: BatchTimeout = .{
+                .batch = &batch,
+                .timespec = .{ .sec = 0, .nsec = 0 },
+                .ring_fd = -1,
+            };
+            const timer_result: Completion = .{ .result = -@as(i32, @intCast(@backingInt(linux.E.CANCELED))), .flags = 0 };
+            const cancel_result: Completion = .{ .result = -@as(i32, @intCast(@backingInt(cancel_errno))), .flags = 0 };
+            batch.userdata = parked;
+            try std.testing.expectEqual(parked, timer.complete(cancel_first, if (cancel_first) cancel_result else timer_result).?);
+            try std.testing.expectEqual(null, timer.complete(!cancel_first, if (cancel_first) timer_result else cancel_result));
+            try std.testing.expectEqual(BatchTimeout.timer_done | BatchTimeout.cancel_done, timer.done.load(.acquire));
+            try timer.checkFailure();
+            try std.testing.expectEqual(timer.userData() ^ 0b100, @intFromPtr(&timer) | 0b011);
+        }
+    }
 }
